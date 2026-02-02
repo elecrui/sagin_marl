@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+import os
+from typing import Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from .policy import ActorNet, batch_flatten_obs
+from .critic import CriticNet
+from .buffer import RolloutBuffer
+from .action_assembler import assemble_actions
+
+
+def compute_gae(rewards, values, dones, gamma, lam):
+    T = len(rewards)
+    advantages = np.zeros(T, dtype=np.float32)
+    last_adv = 0.0
+    last_value = 0.0
+    for t in reversed(range(T)):
+        mask = 1.0 - dones[t]
+        delta = rewards[t] + gamma * last_value * mask - values[t]
+        last_adv = delta + gamma * lam * mask * last_adv
+        advantages[t] = last_adv
+        last_value = values[t]
+    returns = advantages + values
+    return advantages, returns
+
+
+def train(env, cfg, log_dir: str, total_updates: int = 50):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Determine observation and state dimensions
+    obs_sample, _ = env.reset()
+    obs_dim = batch_flatten_obs(list(obs_sample.values()), cfg).shape[1]
+    global_state = env.get_global_state()
+    state_dim = global_state.shape[0]
+
+    actor = ActorNet(obs_dim, cfg).to(device)
+    critic = CriticNet(state_dim, cfg).to(device)
+
+    actor_optim = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr)
+    critic_optim = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
+
+    from ..utils.logging import MetricLogger
+
+    logger = MetricLogger(log_dir)
+
+    obs, _ = env.reset()
+
+    for update in range(total_updates):
+        buffer = RolloutBuffer()
+        ep_reward = 0.0
+
+        for step in range(cfg.buffer_size):
+            obs_list = list(obs.values())
+            obs_batch = batch_flatten_obs(obs_list, cfg)
+            obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
+
+            state_np = env.get_global_state()
+            with torch.no_grad():
+                policy_out = actor.act(obs_tensor)
+                value = critic(torch.tensor(state_np, dtype=torch.float32, device=device))
+
+            accel_actions = policy_out.accel.cpu().numpy()
+            bw_logits = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
+            sat_logits = policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
+
+            # Apply action masks before execution/storage
+            users_mask = np.stack([o["users_mask"] for o in obs_list], axis=0)
+            sats_mask = np.stack([o["sats_mask"] for o in obs_list], axis=0)
+            if cfg.doppler_enabled:
+                nu_norm = np.stack([o["sats"][:, 6] for o in obs_list], axis=0)
+                doppler_ok = (np.abs(nu_norm) <= 1.0).astype(np.float32)
+                sats_mask = sats_mask * doppler_ok
+
+            bw_exec = None
+            if bw_logits is not None:
+                bw_exec = bw_logits * users_mask
+            elif cfg.enable_bw_action:
+                bw_exec = np.zeros((len(obs_list), cfg.users_obs_max), dtype=np.float32)
+
+            sat_exec = None
+            if sat_logits is not None:
+                sat_exec = sat_logits * sats_mask
+            elif not cfg.fixed_satellite_strategy:
+                sat_exec = np.zeros((len(obs_list), cfg.sats_obs_max), dtype=np.float32)
+
+            action_parts = [accel_actions]
+            if cfg.enable_bw_action and bw_exec is not None:
+                action_parts.append(bw_exec)
+            if not cfg.fixed_satellite_strategy and sat_exec is not None:
+                action_parts.append(sat_exec)
+            action_vec = np.concatenate(action_parts, axis=1)
+
+            action_dict = assemble_actions(cfg, env.agents, accel_actions, bw_logits=bw_exec, sat_logits=sat_exec)
+            next_obs, rewards, terms, truncs, _ = env.step(action_dict)
+
+            accel_exec = getattr(env, "last_exec_accel", accel_actions)
+            exec_parts = [accel_exec]
+            if cfg.enable_bw_action and bw_exec is not None:
+                exec_parts.append(bw_exec)
+            if not cfg.fixed_satellite_strategy and sat_exec is not None:
+                exec_parts.append(sat_exec)
+            action_vec_exec = np.concatenate(exec_parts, axis=1)
+            with torch.no_grad():
+                logprobs = actor.evaluate_actions(
+                    obs_tensor, torch.tensor(action_vec_exec, dtype=torch.float32, device=device)
+                )[0].cpu().numpy()
+
+            reward_scalar = list(rewards.values())[0]
+            done_scalar = list(terms.values())[0] or list(truncs.values())[0]
+            ep_reward += reward_scalar
+
+            buffer.add(
+                obs_batch,
+                action_vec_exec,
+                logprobs,
+                reward_scalar,
+                float(value.item()),
+                done_scalar,
+                state_np,
+            )
+
+            obs = next_obs
+            if done_scalar:
+                obs, _ = env.reset()
+
+        # Prepare batches
+        obs_arr, act_arr, logp_arr, rewards, values, dones, state_arr = buffer.as_arrays()
+        adv, rets = compute_gae(rewards, values, dones, cfg.gamma, cfg.gae_lambda)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+        T, N, _ = obs_arr.shape
+        obs_flat = obs_arr.reshape(T * N, -1)
+        act_flat = act_arr.reshape(T * N, -1)
+        logp_flat = logp_arr.reshape(T * N)
+        adv_flat = np.repeat(adv, N)
+        ret_flat = np.repeat(rets, N)
+
+        # Convert to torch
+        obs_flat_t = torch.tensor(obs_flat, dtype=torch.float32, device=device)
+        act_flat_t = torch.tensor(act_flat, dtype=torch.float32, device=device)
+        logp_flat_t = torch.tensor(logp_flat, dtype=torch.float32, device=device)
+        adv_flat_t = torch.tensor(adv_flat, dtype=torch.float32, device=device)
+        ret_flat_t = torch.tensor(ret_flat, dtype=torch.float32, device=device)
+
+        state_t = torch.tensor(state_arr, dtype=torch.float32, device=device)
+        ret_t = torch.tensor(rets, dtype=torch.float32, device=device)
+
+        batch_size = len(obs_flat)
+        minibatch_size = max(1, batch_size // cfg.num_mini_batch)
+        indices = np.arange(batch_size)
+
+        policy_losses = []
+        value_losses = []
+        entropies = []
+
+        for _ in range(cfg.ppo_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, batch_size, minibatch_size):
+                mb_idx = indices[start : start + minibatch_size]
+                new_logp, entropy = actor.evaluate_actions(obs_flat_t[mb_idx], act_flat_t[mb_idx])
+
+                ratio = torch.exp(new_logp - logp_flat_t[mb_idx])
+                surr1 = ratio * adv_flat_t[mb_idx]
+                surr2 = torch.clamp(ratio, 1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * adv_flat_t[mb_idx]
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                actor_optim.zero_grad()
+                (policy_loss - cfg.entropy_coef * entropy.mean()).backward()
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), cfg.max_grad_norm)
+                actor_optim.step()
+
+                policy_losses.append(policy_loss.item())
+                entropies.append(entropy.mean().item())
+
+            # critic update (full batch for simplicity)
+            value_pred = critic(state_t)
+            value_loss = F.mse_loss(value_pred, ret_t)
+            critic_optim.zero_grad()
+            (cfg.value_coef * value_loss).backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
+            critic_optim.step()
+            value_losses.append(value_loss.item())
+
+        logger.log(
+            update,
+            {
+                "episode_reward": ep_reward / max(1, cfg.buffer_size),
+                "policy_loss": float(np.mean(policy_losses)),
+                "value_loss": float(np.mean(value_losses)),
+                "entropy": float(np.mean(entropies)),
+            },
+        )
+
+    # Save checkpoints
+    os.makedirs(log_dir, exist_ok=True)
+    torch.save(actor.state_dict(), os.path.join(log_dir, "actor.pt"))
+    torch.save(critic.state_dict(), os.path.join(log_dir, "critic.pt"))
+
+    logger.close()
+    return actor, critic

@@ -1,0 +1,36 @@
+seed: 42
+map_size: 1000.0
+tau0: 1.0
+T_steps: 200
+
+num_uav: 3
+num_gu: 20
+num_sat: 9
+
+users_obs_max: 20
+sats_obs_max: 3
+visible_sats_max: 3
+visible_sats_min: 2
+nbrs_obs_max: 4
+
+uav_height: 100.0
+sat_height: 500000.0
+v_max: 30.0
+a_max: 5.0
+d_safe: 20.0
+
+task_arrival_rate: 200000.0
+task_arrival_poisson: false
+
+doppler_observed: true
+doppler_enabled: false
+energy_enabled: false
+fading_enabled: false
+interference_enabled: false
+enable_bw_action: false
+fixed_satellite_strategy: true
+N_RF: 1
+
+buffer_size: 4000
+num_mini_batch: 32
+ppo_epochs: 4

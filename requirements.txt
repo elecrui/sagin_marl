@@ -1,0 +1,9 @@
+numpy
+torch
+gymnasium
+pettingzoo
+pyyaml
+matplotlib
+tensorboard
+imageio
+pytest

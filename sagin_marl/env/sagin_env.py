@@ -1,0 +1,733 @@
+from __future__ import annotations
+
+import math
+from typing import Dict, List, Tuple
+
+import numpy as np
+import gymnasium as gym
+from pettingzoo.utils.env import ParallelEnv
+
+from .config import SaginConfig
+from .topology import thomas_cluster_process
+from .orbit import WalkerDeltaOrbitModel
+from . import channel
+
+
+class SaginParallelEnv(ParallelEnv):
+    metadata = {"render_modes": ["human", "rgb_array"], "name": "sagin_parallel_v1"}
+
+    def __init__(self, cfg: SaginConfig):
+        self.cfg = cfg
+        self.rng = np.random.default_rng(cfg.seed)
+        self.orbit = WalkerDeltaOrbitModel(
+            cfg.num_sat,
+            cfg.r_earth,
+            cfg.sat_height,
+            num_planes=cfg.walker_num_planes,
+            inclination_deg=cfg.walker_inclination_deg,
+            phase_factor=cfg.walker_phase_factor,
+            earth_rotation_rate=cfg.earth_rotation_rate,
+        )
+
+        self.agents = [f"uav_{i}" for i in range(cfg.num_uav)]
+        self.possible_agents = list(self.agents)
+
+        # Dimensions
+        self.own_dim = 7
+        self.user_dim = 5
+        self.sat_dim = 9
+        self.nbr_dim = 4
+
+        self._build_spaces()
+        self._init_state()
+
+    def _build_spaces(self) -> None:
+        cfg = self.cfg
+        self._obs_space = gym.spaces.Dict(
+            {
+                "own": gym.spaces.Box(-np.inf, np.inf, shape=(self.own_dim,), dtype=np.float32),
+                "users": gym.spaces.Box(-np.inf, np.inf, shape=(cfg.users_obs_max, self.user_dim), dtype=np.float32),
+                "users_mask": gym.spaces.Box(0.0, 1.0, shape=(cfg.users_obs_max,), dtype=np.float32),
+                "sats": gym.spaces.Box(-np.inf, np.inf, shape=(cfg.sats_obs_max, self.sat_dim), dtype=np.float32),
+                "sats_mask": gym.spaces.Box(0.0, 1.0, shape=(cfg.sats_obs_max,), dtype=np.float32),
+                "nbrs": gym.spaces.Box(-np.inf, np.inf, shape=(cfg.nbrs_obs_max, self.nbr_dim), dtype=np.float32),
+                "nbrs_mask": gym.spaces.Box(0.0, 1.0, shape=(cfg.nbrs_obs_max,), dtype=np.float32),
+            }
+        )
+
+        self._act_space = gym.spaces.Dict(
+            {
+                "accel": gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32),
+                "bw_logits": gym.spaces.Box(
+                    -cfg.bw_logit_scale, cfg.bw_logit_scale, shape=(cfg.users_obs_max,), dtype=np.float32
+                ),
+                "sat_logits": gym.spaces.Box(
+                    -cfg.sat_logit_scale, cfg.sat_logit_scale, shape=(cfg.sats_obs_max,), dtype=np.float32
+                ),
+            }
+        )
+
+    def observation_space(self, agent):
+        return self._obs_space
+
+    def action_space(self, agent):
+        return self._act_space
+
+    def _init_state(self) -> None:
+        cfg = self.cfg
+        self.t = 0
+        self.gu_pos = thomas_cluster_process(
+            cfg.num_gu,
+            cfg.map_size,
+            num_clusters=max(1, cfg.num_gu // 5),
+            cluster_std=80.0,
+            rng=self.rng,
+        )
+        self.uav_pos = self.rng.uniform(0.0, cfg.map_size, size=(cfg.num_uav, 2))
+        self.uav_vel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
+        self.uav_energy = np.full((cfg.num_uav,), cfg.uav_energy_init, dtype=np.float32)
+        self.last_exec_accel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
+
+        self.gu_queue = np.zeros((cfg.num_gu,), dtype=np.float32)
+        self.uav_queue = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.sat_queue = np.zeros((cfg.num_sat,), dtype=np.float32)
+        self.gu_drop = np.zeros((cfg.num_gu,), dtype=np.float32)
+        self.uav_drop = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_energy_cost = np.zeros((cfg.num_uav,), dtype=np.float32)
+
+        self.last_association = np.full((cfg.num_gu,), -1, dtype=np.int32)
+        self.prev_association = self.last_association.copy()
+        self._cached_candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        self._cached_eta = np.zeros((cfg.num_uav, cfg.users_obs_max), dtype=np.float32)
+        self._cached_sat_obs = np.zeros((cfg.num_uav, cfg.sats_obs_max, self.sat_dim), dtype=np.float32)
+        self._cached_sat_mask = np.zeros((cfg.num_uav, cfg.sats_obs_max), dtype=np.float32)
+
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+        self._init_state()
+        # Prime candidates and eta for initial observations
+        assoc = self._associate_users()
+        self._cached_candidates = self._build_candidate_users(assoc)
+        dummy_actions = {
+            agent: {
+                "accel": np.zeros(2, dtype=np.float32),
+                "bw_logits": np.zeros(self.cfg.users_obs_max, dtype=np.float32),
+                "sat_logits": np.zeros(self.cfg.sats_obs_max, dtype=np.float32),
+            }
+            for agent in self.agents
+        }
+        _, self._cached_eta = self._compute_access_rates(assoc, self._cached_candidates, dummy_actions)
+        sat_pos, sat_vel = self.orbit.get_states(self.t * self.cfg.tau0)
+        visible = self._visible_sats_sorted(sat_pos)
+        self._cache_sat_obs(sat_pos, sat_vel, visible)
+        obs = {agent: self._get_obs(idx) for idx, agent in enumerate(self.agents)}
+        infos = {agent: {} for agent in self.agents}
+        return obs, infos
+
+    def step(self, actions: Dict[str, Dict]):
+        cfg = self.cfg
+        self._apply_uav_dynamics(actions)
+
+        self.prev_association = self.last_association.copy()
+        # Satellite states
+        sat_pos, sat_vel = self.orbit.get_states(self.t * cfg.tau0)
+        visible = self._visible_sats_sorted(sat_pos)
+
+        # Compute associations and rates
+        assoc = self._associate_users()
+        candidate_lists = self._build_candidate_users(assoc)
+
+        access_rates, eta = self._compute_access_rates(assoc, candidate_lists, actions)
+
+        # Update GU queues
+        gu_outflow = self._update_gu_queues(access_rates, assoc)
+
+        # Backhaul selection and rates
+        sat_selection = self._select_satellites(sat_pos, sat_vel, actions, visible)
+        self._update_energy(sat_selection)
+        rate_matrix, sat_loads = self._compute_backhaul_rates(sat_pos, sat_vel, sat_selection)
+
+        # Update UAV queues and satellite queues
+        outflow_matrix = self._update_uav_queues(gu_outflow, rate_matrix)
+        self._update_sat_queues(outflow_matrix)
+
+        # Cache for obs
+        self._cached_candidates = candidate_lists
+        self._cache_sat_obs(sat_pos, sat_vel, visible)
+        self._cached_eta = eta
+
+        # Rewards and done
+        reward = self._compute_reward()
+        collision = self._check_collision()
+        energy_depleted = cfg.energy_enabled and np.any(self.uav_energy <= 0.0)
+        terminated = collision or energy_depleted
+        truncated = self.t >= (cfg.T_steps - 1)
+
+        self.t += 1
+
+        obs = {agent: self._get_obs(idx) for idx, agent in enumerate(self.agents)}
+        rewards = {agent: reward for agent in self.agents}
+        terminations = {agent: terminated for agent in self.agents}
+        truncations = {agent: truncated for agent in self.agents}
+        infos = {agent: {} for agent in self.agents}
+        return obs, rewards, terminations, truncations, infos
+
+    def _apply_uav_dynamics(self, actions: Dict[str, Dict]) -> None:
+        cfg = self.cfg
+        accel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
+        for i, agent in enumerate(self.agents):
+            a = np.array(actions[agent]["accel"], dtype=np.float32)
+            a = np.clip(a, -1.0, 1.0) * cfg.a_max
+            if cfg.energy_enabled and cfg.energy_safety_enabled:
+                v_next = self.uav_vel[i] + a * cfg.tau0
+                speed_next = float(np.linalg.norm(v_next))
+                est_energy = self.uav_energy[i] - float(self._fly_power(speed_next)) * cfg.tau0
+                safe_threshold = cfg.energy_safe_threshold * cfg.uav_energy_init
+                if est_energy < safe_threshold:
+                    cur_speed = float(np.linalg.norm(self.uav_vel[i]))
+                    if cur_speed > 1e-6:
+                        direction = self.uav_vel[i] / cur_speed
+                    else:
+                        a_norm = float(np.linalg.norm(a))
+                        if a_norm > 1e-6:
+                            direction = a / a_norm
+                        else:
+                            direction = np.zeros(2, dtype=np.float32)
+                    target_delta = cfg.uav_opt_speed - cur_speed
+                    a = direction * np.clip(target_delta / max(cfg.tau0, 1e-6), -cfg.a_max, cfg.a_max)
+            accel[i] = a
+        self.last_exec_accel = accel.copy()
+        self.uav_vel = np.clip(self.uav_vel + accel * cfg.tau0, -cfg.v_max, cfg.v_max)
+        self.uav_pos = self.uav_pos + self.uav_vel * cfg.tau0
+        self.uav_pos = np.clip(self.uav_pos, 0.0, cfg.map_size)
+
+    def _associate_users(self) -> np.ndarray:
+        cfg = self.cfg
+        K = cfg.num_gu
+        U = cfg.num_uav
+        assoc = np.full((K,), -1, dtype=np.int32)
+
+        for k in range(K):
+            dists = np.linalg.norm(self.uav_pos - self.gu_pos[k], axis=1)
+            d3d = np.sqrt(dists ** 2 + cfg.uav_height ** 2)
+            phi = np.arcsin(cfg.uav_height / (d3d + 1e-9))
+            pl = channel.pathloss_db(d3d, phi, cfg)
+            best = int(np.argmin(pl))
+            if pl[best] <= cfg.pl_threshold_db:
+                assoc[k] = best
+
+        return assoc
+
+    def _build_candidate_users(self, assoc: np.ndarray) -> List[List[int]]:
+        cfg = self.cfg
+        candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        for k, u in enumerate(assoc):
+            if u >= 0:
+                candidates[u].append(k)
+
+        # Limit to users_obs_max by queue (descending)
+        for u in range(cfg.num_uav):
+            if len(candidates[u]) > cfg.users_obs_max:
+                qs = [(k, self.gu_queue[k]) for k in candidates[u]]
+                qs.sort(key=lambda x: x[1], reverse=True)
+                candidates[u] = [k for k, _ in qs[: cfg.users_obs_max]]
+        return candidates
+
+    def _compute_access_rates(
+        self,
+        assoc: np.ndarray,
+        candidates: List[List[int]],
+        actions: Dict[str, Dict],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        cfg = self.cfg
+        rates = np.zeros((cfg.num_gu,), dtype=np.float32)
+        eta = np.zeros((cfg.num_uav, cfg.users_obs_max), dtype=np.float32)
+
+        for u in range(cfg.num_uav):
+            cand = candidates[u]
+            if not cand:
+                continue
+            if cfg.enable_bw_action:
+                logits = np.array(actions[self.agents[u]]["bw_logits"], dtype=np.float32)
+                mask = np.zeros((cfg.users_obs_max,), dtype=np.float32)
+                mask[: len(cand)] = 1.0
+                logits = logits[: cfg.users_obs_max]
+                logits = logits - np.max(logits)
+                weights = np.exp(logits) * mask
+                weights = weights / (np.sum(weights) + 1e-9)
+                betas = weights[: len(cand)]
+            else:
+                betas = np.full((len(cand),), 1.0 / len(cand), dtype=np.float32)
+
+            for i, k in enumerate(cand):
+                d2d = np.linalg.norm(self.uav_pos[u] - self.gu_pos[k])
+                d3d = math.sqrt(d2d ** 2 + cfg.uav_height ** 2)
+                phi = math.asin(cfg.uav_height / (d3d + 1e-9))
+                pl = channel.pathloss_db(np.array([d3d]), np.array([phi]), cfg)[0]
+                gain = 10 ** (-pl / 10.0)
+                if cfg.fading_enabled:
+                    gain *= channel.rician_power_gain(cfg.rician_K, size=1, rng=self.rng)[0]
+
+                interference = 0.0
+                if cfg.interference_enabled:
+                    for j in range(cfg.num_gu):
+                        if assoc[j] >= 0 and assoc[j] != u:
+                            d2d_j = np.linalg.norm(self.uav_pos[u] - self.gu_pos[j])
+                            d3d_j = math.sqrt(d2d_j ** 2 + cfg.uav_height ** 2)
+                            phi_j = math.asin(cfg.uav_height / (d3d_j + 1e-9))
+                            pl_j = channel.pathloss_db(np.array([d3d_j]), np.array([phi_j]), cfg)[0]
+                            gain_j = 10 ** (-pl_j / 10.0)
+                            if cfg.fading_enabled:
+                                gain_j *= channel.rician_power_gain(cfg.rician_K, size=1, rng=self.rng)[0]
+                            interference += cfg.gu_tx_power * gain_j
+
+                snr = channel.snr_linear(cfg.gu_tx_power, gain, cfg.noise_density, cfg.b_acc, interference)
+                se = channel.spectral_efficiency(snr)
+                rate = betas[i] * cfg.b_acc * se
+                rates[k] = rate
+                eta[u, i] = se
+
+        return rates, eta
+
+    def _update_gu_queues(self, access_rates: np.ndarray, assoc: np.ndarray) -> np.ndarray:
+        cfg = self.cfg
+        gu_outflow = np.zeros((cfg.num_gu,), dtype=np.float32)
+        self.gu_drop = np.zeros((cfg.num_gu,), dtype=np.float32)
+        for k in range(cfg.num_gu):
+            if cfg.task_arrival_poisson:
+                arrival = self.rng.poisson(cfg.task_arrival_rate)
+            else:
+                arrival = cfg.task_arrival_rate
+            q_before = self.gu_queue[k] + arrival
+            outflow = min(q_before, access_rates[k] * cfg.tau0)
+            q_after = q_before - outflow
+            if q_after > cfg.queue_max_gu:
+                self.gu_drop[k] = q_after - cfg.queue_max_gu
+                q_after = cfg.queue_max_gu
+            self.gu_queue[k] = q_after
+            gu_outflow[k] = outflow
+
+        self.last_association = assoc.copy()
+        return gu_outflow
+
+    def _select_satellites(
+        self,
+        sat_pos: np.ndarray,
+        sat_vel: np.ndarray,
+        actions: Dict[str, Dict],
+        visible: List[List[int]],
+    ) -> List[List[int]]:
+        cfg = self.cfg
+        selections: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        for u in range(cfg.num_uav):
+            vis = visible[u]
+            if not vis:
+                continue
+            if cfg.fixed_satellite_strategy:
+                # pick nearest visible
+                dists = [np.linalg.norm(sat_pos[l] - self._uav_ecef(u)) for l in vis]
+                sel = vis[int(np.argmin(dists))]
+                selections[u] = [sel]
+            else:
+                logits = np.array(actions[self.agents[u]]["sat_logits"], dtype=np.float32)
+                cand = vis[: cfg.sats_obs_max]
+                if not cand:
+                    continue
+                valid_logits = logits[: len(cand)].copy()
+                if cfg.doppler_enabled:
+                    for i, l in enumerate(cand):
+                        nu = self._doppler(u, l, sat_pos, sat_vel)
+                        if abs(nu) > cfg.nu_max:
+                            valid_logits[i] = -1e9
+
+                if np.all(valid_logits <= -1e8):
+                    continue
+
+                if cfg.sat_select_mode == "sample":
+                    probs = np.exp(valid_logits - np.max(valid_logits))
+                    probs = probs / (np.sum(probs) + 1e-9)
+                    chosen = []
+                    probs = probs.copy()
+                    for _ in range(min(cfg.N_RF, len(cand))):
+                        if probs.sum() <= 0:
+                            break
+                        idx = self.rng.choice(len(cand), p=probs)
+                        chosen.append(cand[idx])
+                        probs[idx] = 0.0
+                        probs = probs / (np.sum(probs) + 1e-9)
+                    selections[u] = chosen
+                else:
+                    order = np.argsort(valid_logits)[::-1]
+                    chosen = []
+                    for idx in order:
+                        if valid_logits[idx] <= -1e8:
+                            continue
+                        chosen.append(cand[idx])
+                        if len(chosen) >= cfg.N_RF:
+                            break
+                    selections[u] = chosen
+        return selections
+
+    def _compute_backhaul_rates(self, sat_pos: np.ndarray, sat_vel: np.ndarray, selections: List[List[int]]) -> Tuple[np.ndarray, np.ndarray]:
+        cfg = self.cfg
+        U = cfg.num_uav
+        L = cfg.num_sat
+        rate_matrix = np.zeros((U, L), dtype=np.float32)
+
+        # count connections per sat
+        counts = np.zeros((L,), dtype=np.int32)
+        for u in range(U):
+            for l in selections[u]:
+                counts[l] += 1
+
+        for u in range(U):
+            for l in selections[u]:
+                if counts[l] == 0:
+                    continue
+                b_ul = cfg.b_sat_total / counts[l]
+                d = np.linalg.norm(sat_pos[l] - self._uav_ecef(u))
+                gain = (cfg.speed_of_light / (4.0 * math.pi * cfg.carrier_freq * d)) ** 2
+                if cfg.atm_loss_enabled:
+                    theta = self._elevation_angle(u, l, sat_pos)
+                    atm_loss = channel.atmospheric_loss_db(theta, cfg.atm_loss_db)
+                    gain *= 10 ** (-atm_loss / 10.0)
+                gain *= cfg.uav_tx_gain * cfg.sat_rx_gain
+
+                snr = channel.snr_linear(cfg.uav_tx_power, gain, cfg.noise_density, b_ul)
+                nu = 0.0
+                if cfg.doppler_enabled or cfg.doppler_atten_enabled:
+                    nu = self._doppler(u, l, sat_pos, sat_vel)
+                if cfg.doppler_atten_enabled:
+                    chi = channel.doppler_attenuation(np.array([nu]), cfg.subcarrier_spacing)[0]
+                    snr = snr * chi
+
+                se = channel.spectral_efficiency(snr)
+                rate = b_ul * se
+
+                if cfg.doppler_enabled and abs(nu) > cfg.nu_max:
+                    rate = 0.0
+                rate_matrix[u, l] = rate
+
+        return rate_matrix, counts
+
+    def _update_uav_queues(self, gu_outflow: np.ndarray, rate_matrix: np.ndarray) -> np.ndarray:
+        cfg = self.cfg
+        outflow_matrix = np.zeros((cfg.num_uav, cfg.num_sat), dtype=np.float32)
+        self.uav_drop = np.zeros((cfg.num_uav,), dtype=np.float32)
+        for u in range(cfg.num_uav):
+            inflow = np.sum(gu_outflow[self.last_association == u])
+            q_before = self.uav_queue[u] + inflow
+            total_rate = float(np.sum(rate_matrix[u]))
+            outflow = min(q_before, total_rate * cfg.tau0)
+            q_after = q_before - outflow
+            if q_after > cfg.queue_max_uav:
+                self.uav_drop[u] = q_after - cfg.queue_max_uav
+                q_after = cfg.queue_max_uav
+            self.uav_queue[u] = q_after
+            if total_rate > 0:
+                outflow_matrix[u] = (rate_matrix[u] / total_rate) * outflow
+        return outflow_matrix
+
+    def _update_sat_queues(self, outflow_matrix: np.ndarray) -> None:
+        cfg = self.cfg
+        incoming = np.sum(outflow_matrix, axis=0)
+        compute_rate = cfg.sat_cpu_freq / cfg.task_cycles_per_bit
+        self.sat_queue = np.maximum(self.sat_queue + incoming - compute_rate * cfg.tau0, 0.0)
+
+    def _update_energy(self, selections: List[List[int]]) -> None:
+        cfg = self.cfg
+        if not cfg.energy_enabled:
+            self.last_energy_cost = np.zeros((cfg.num_uav,), dtype=np.float32)
+            return
+        speeds = np.linalg.norm(self.uav_vel, axis=1)
+        p_fly = self._fly_power(speeds)
+        link_counts = np.array([len(sats) for sats in selections], dtype=np.float32)
+        p_comm = cfg.p_comm_link * link_counts
+        self.last_energy_cost = p_fly + p_comm
+        self.uav_energy = self.uav_energy - self.last_energy_cost * cfg.tau0
+        self.uav_energy = np.maximum(self.uav_energy, 0.0)
+
+    def _compute_reward(self) -> float:
+        cfg = self.cfg
+        r_delay = -(
+            np.mean(self.gu_queue / (cfg.queue_max_gu + 1e-9))
+            + np.mean(self.uav_queue / (cfg.queue_max_uav + 1e-9))
+            + np.mean(self.sat_queue / (cfg.queue_max_sat + 1e-9))
+        )
+
+        if cfg.energy_enabled:
+            p_max = self._energy_scale()
+            r_energy = -np.mean(self.last_energy_cost / (p_max + 1e-9))
+        else:
+            r_energy = 0.0
+
+        # Overflow penalty
+        drop_scale = cfg.queue_max_uav + 1e-9
+        drop_penalty = -cfg.eta_drop * (
+            float(np.sum(self.gu_drop)) / drop_scale + float(np.sum(self.uav_drop)) / drop_scale
+        )
+
+        # Congestion penalty based on soft thresholds
+        th_gu = cfg.queue_th_gu if cfg.queue_th_gu is not None else cfg.queue_max_gu * cfg.queue_th_gu_frac
+        th_uav = cfg.queue_th_uav if cfg.queue_th_uav is not None else cfg.queue_max_uav * cfg.queue_th_uav_frac
+        cong_gu = np.maximum(self.gu_queue - th_gu, 0.0) / (th_gu + 1e-9)
+        cong_uav = np.maximum(self.uav_queue - th_uav, 0.0) / (th_uav + 1e-9)
+        cong_penalty = -cfg.eta_cong * (float(np.mean(cong_gu)) + float(np.mean(cong_uav)))
+
+        reward = cfg.omega_q * r_delay + cfg.omega_e * r_energy + drop_penalty + cong_penalty
+
+        if self._check_collision():
+            reward -= cfg.eta_crash
+        if cfg.energy_enabled and np.any(self.uav_energy <= 0.0):
+            reward -= cfg.eta_batt
+        return float(reward)
+
+    def _check_collision(self) -> bool:
+        cfg = self.cfg
+        for i in range(cfg.num_uav):
+            for j in range(i + 1, cfg.num_uav):
+                if np.linalg.norm(self.uav_pos[i] - self.uav_pos[j]) < cfg.d_safe:
+                    return True
+        return False
+
+    def _local_to_latlon(self, x: float, y: float) -> Tuple[float, float]:
+        cfg = self.cfg
+        lat0 = math.radians(cfg.ref_lat_deg)
+        lon0 = math.radians(cfg.ref_lon_deg)
+        lat = lat0 + y / cfg.r_earth
+        lon = lon0 + x / (cfg.r_earth * math.cos(lat0) + 1e-9)
+        return lat, lon
+
+    def _local_to_ecef(self, x: float, y: float, alt: float) -> np.ndarray:
+        cfg = self.cfg
+        lat, lon = self._local_to_latlon(x, y)
+        r = cfg.r_earth + alt
+        cos_lat = math.cos(lat)
+        sin_lat = math.sin(lat)
+        cos_lon = math.cos(lon)
+        sin_lon = math.sin(lon)
+        return np.array(
+            [
+                r * cos_lat * cos_lon,
+                r * cos_lat * sin_lon,
+                r * sin_lat,
+            ],
+            dtype=np.float32,
+        )
+
+    def _enu_to_ecef(self, east: float, north: float, up: float, lat: float, lon: float) -> np.ndarray:
+        sin_lat = math.sin(lat)
+        cos_lat = math.cos(lat)
+        sin_lon = math.sin(lon)
+        cos_lon = math.cos(lon)
+        t = np.array(
+            [
+                [-sin_lon, -sin_lat * cos_lon, cos_lat * cos_lon],
+                [cos_lon, -sin_lat * sin_lon, cos_lat * sin_lon],
+                [0.0, cos_lat, sin_lat],
+            ],
+            dtype=np.float32,
+        )
+        return t @ np.array([east, north, up], dtype=np.float32)
+
+    def _elevation_angle(self, u: int, l: int, sat_pos: np.ndarray) -> float:
+        cfg = self.cfg
+        r_u = cfg.r_earth + cfg.uav_height
+        r_s = cfg.r_earth + cfg.sat_height
+        q = self._uav_ecef(u)
+        d = np.linalg.norm(sat_pos[l] - q)
+        arg = (r_s ** 2 - r_u ** 2 - d ** 2) / (2.0 * r_u * d + 1e-9)
+        arg = np.clip(arg, -1.0, 1.0)
+        return float(math.asin(arg))
+
+    def _fly_power(self, speed: np.ndarray | float) -> np.ndarray:
+        cfg = self.cfg
+        v = np.asarray(speed, dtype=np.float32)
+        if cfg.energy_model == "rotor":
+            p0 = cfg.rotor_p0
+            pi = cfg.rotor_pi
+            u_tip = cfg.rotor_u_tip
+            v0 = cfg.rotor_v0
+            d0 = cfg.rotor_d0
+            rho = cfg.rotor_rho
+            s = cfg.rotor_s
+            area = cfg.rotor_area
+            term1 = p0 * (1.0 + 3.0 * (v ** 2) / (u_tip ** 2))
+            term2 = pi * np.sqrt(
+                np.sqrt(1.0 + (v ** 4) / (4.0 * (v0 ** 4))) - (v ** 2) / (2.0 * (v0 ** 2))
+            )
+            term3 = 0.5 * d0 * rho * s * area * (v ** 3)
+            return term1 + term2 + term3
+        return cfg.p_fly_base + cfg.p_fly_coeff * (v ** 2)
+
+    def _energy_scale(self) -> float:
+        cfg = self.cfg
+        p_fly = float(self._fly_power(cfg.v_max))
+        p_comm = cfg.p_comm_link * max(1, cfg.N_RF)
+        return p_fly + p_comm
+
+    def _visible_sats_sorted(self, sat_pos: np.ndarray) -> List[List[int]]:
+        cfg = self.cfg
+        visible: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        for u in range(cfg.num_uav):
+            elev_list = []
+            for l in range(cfg.num_sat):
+                theta = self._elevation_angle(u, l, sat_pos)
+                elev_list.append((l, theta))
+            elev_list.sort(key=lambda x: x[1], reverse=True)
+
+            above = [l for l, th in elev_list if th >= cfg.theta_min_rad]
+            min_keep = cfg.visible_sats_min
+            if min_keep is not None and len(above) < min_keep:
+                # Include highest-elevation satellites even if below theta_min to enforce minimum visibility.
+                needed = min_keep - len(above)
+                extra = [l for l, th in elev_list if th < cfg.theta_min_rad][:needed]
+                above.extend(extra)
+
+            max_keep = cfg.visible_sats_max if cfg.visible_sats_max is not None else cfg.sats_obs_max
+            visible[u] = above[: max_keep]
+        return visible
+
+    def _uav_ecef(self, u: int) -> np.ndarray:
+        cfg = self.cfg
+        return self._local_to_ecef(self.uav_pos[u, 0], self.uav_pos[u, 1], cfg.uav_height)
+
+    def _uav_vel_ecef(self, u: int) -> np.ndarray:
+        lat, lon = self._local_to_latlon(self.uav_pos[u, 0], self.uav_pos[u, 1])
+        return self._enu_to_ecef(self.uav_vel[u, 0], self.uav_vel[u, 1], 0.0, lat, lon)
+
+    def _doppler(self, u: int, l: int, sat_pos: np.ndarray, sat_vel: np.ndarray) -> float:
+        cfg = self.cfg
+        r_vec = sat_pos[l] - self._uav_ecef(u)
+        v_rel = sat_vel[l] - self._uav_vel_ecef(u)
+        denom = np.linalg.norm(r_vec) + 1e-9
+        proj = float(np.dot(v_rel, r_vec) / denom)
+        return (cfg.carrier_freq / cfg.speed_of_light) * proj
+
+    def _cache_sat_obs(
+        self,
+        sat_pos: np.ndarray,
+        sat_vel: np.ndarray,
+        visible: List[List[int]],
+    ) -> None:
+        cfg = self.cfg
+        sat_obs = np.zeros((cfg.num_uav, cfg.sats_obs_max, self.sat_dim), dtype=np.float32)
+        sat_mask = np.zeros((cfg.num_uav, cfg.sats_obs_max), dtype=np.float32)
+        for u in range(cfg.num_uav):
+            for i, l in enumerate(visible[u][: cfg.sats_obs_max]):
+                rel_pos = sat_pos[l] - self._uav_ecef(u)
+                rel_vel = sat_vel[l] - self._uav_vel_ecef(u)
+                nu = self._doppler(u, l, sat_pos, sat_vel)
+                d = np.linalg.norm(rel_pos) + 1e-9
+                gain = (cfg.speed_of_light / (4.0 * math.pi * cfg.carrier_freq * d)) ** 2
+                if cfg.atm_loss_enabled:
+                    theta = self._elevation_angle(u, l, sat_pos)
+                    atm_loss = channel.atmospheric_loss_db(theta, cfg.atm_loss_db)
+                    gain *= 10 ** (-atm_loss / 10.0)
+                gain *= cfg.uav_tx_gain * cfg.sat_rx_gain
+                snr = channel.snr_linear(cfg.uav_tx_power, gain, cfg.noise_density, cfg.b_sat_total)
+                if cfg.doppler_observed and cfg.doppler_atten_enabled:
+                    chi = channel.doppler_attenuation(np.array([nu]), cfg.subcarrier_spacing)[0]
+                    snr = snr * chi
+                sat_obs[u, i, 0:3] = rel_pos / (cfg.r_earth + cfg.sat_height)
+                sat_obs[u, i, 3:6] = rel_vel / (cfg.r_earth + cfg.sat_height)
+                sat_obs[u, i, 6] = nu / max(cfg.nu_max, 1.0)
+                sat_obs[u, i, 7] = channel.spectral_efficiency(snr)
+                sat_obs[u, i, 8] = self.sat_queue[l] / cfg.queue_max_sat
+                sat_mask[u, i] = 1.0
+        self._cached_sat_obs = sat_obs
+        self._cached_sat_mask = sat_mask
+
+    def _get_obs(self, u: int) -> Dict[str, np.ndarray]:
+        cfg = self.cfg
+        # own features
+        own = np.array(
+            [
+                self.uav_pos[u, 0] / cfg.map_size,
+                self.uav_pos[u, 1] / cfg.map_size,
+                self.uav_vel[u, 0] / cfg.v_max,
+                self.uav_vel[u, 1] / cfg.v_max,
+                self.uav_energy[u] / max(cfg.uav_energy_init, 1e-9),
+                self.uav_queue[u] / cfg.queue_max_uav,
+                self.t / max(cfg.T_steps, 1),
+            ],
+            dtype=np.float32,
+        )
+
+        # users
+        users = np.zeros((cfg.users_obs_max, self.user_dim), dtype=np.float32)
+        users_mask = np.zeros((cfg.users_obs_max,), dtype=np.float32)
+        cand = self._cached_candidates[u] if self._cached_candidates else []
+        for i, k in enumerate(cand[: cfg.users_obs_max]):
+            rel = self.gu_pos[k] - self.uav_pos[u]
+            users[i, 0:2] = rel / cfg.map_size
+            users[i, 2] = self.gu_queue[k] / cfg.queue_max_gu
+            users[i, 3] = self._cached_eta[u, i]
+            users[i, 4] = 1.0 if self.prev_association[k] == u else 0.0
+            users_mask[i] = 1.0
+
+        # satellites (cached per step)
+        sats = self._cached_sat_obs[u].copy()
+        sats_mask = self._cached_sat_mask[u].copy()
+
+        # neighbors
+        nbrs = np.zeros((cfg.nbrs_obs_max, self.nbr_dim), dtype=np.float32)
+        nbrs_mask = np.zeros((cfg.nbrs_obs_max,), dtype=np.float32)
+        others = [i for i in range(cfg.num_uav) if i != u]
+        dists = [(i, np.linalg.norm(self.uav_pos[i] - self.uav_pos[u])) for i in others]
+        dists.sort(key=lambda x: x[1])
+        for i, (idx, _) in enumerate(dists[: cfg.nbrs_obs_max]):
+            rel_pos = self.uav_pos[idx] - self.uav_pos[u]
+            rel_vel = self.uav_vel[idx] - self.uav_vel[u]
+            nbrs[i, 0:2] = rel_pos / cfg.map_size
+            nbrs[i, 2:4] = rel_vel / cfg.v_max
+            nbrs_mask[i] = 1.0
+
+        return {
+            "own": own,
+            "users": users,
+            "users_mask": users_mask,
+            "sats": sats,
+            "sats_mask": sats_mask,
+            "nbrs": nbrs,
+            "nbrs_mask": nbrs_mask,
+        }
+
+    def get_global_state(self) -> np.ndarray:
+        cfg = self.cfg
+        # Flatten global state for critic
+        sat_pos, sat_vel = self.orbit.get_states(self.t * cfg.tau0)
+        parts = [
+            self.uav_pos.flatten() / cfg.map_size,
+            self.uav_vel.flatten() / cfg.v_max,
+            self.uav_queue / cfg.queue_max_uav,
+            self.uav_energy / max(cfg.uav_energy_init, 1e-9),
+            self.gu_pos.flatten() / cfg.map_size,
+            self.gu_queue / cfg.queue_max_gu,
+            sat_pos.flatten() / (cfg.r_earth + cfg.sat_height),
+            sat_vel.flatten() / (cfg.r_earth + cfg.sat_height),
+            self.sat_queue / cfg.queue_max_sat,
+            np.array([self.t / max(cfg.T_steps, 1)], dtype=np.float32),
+        ]
+        return np.concatenate(parts).astype(np.float32)
+
+    def render(self, mode="rgb_array"):
+        if mode == "human":
+            return None
+        # Lazy import to avoid overhead in training
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.scatter(self.gu_pos[:, 0], self.gu_pos[:, 1], s=10, c="tab:blue", label="GU")
+        ax.scatter(self.uav_pos[:, 0], self.uav_pos[:, 1], s=30, c="tab:red", label="UAV")
+        ax.set_xlim(0, self.cfg.map_size)
+        ax.set_ylim(0, self.cfg.map_size)
+        ax.set_title(f"t={self.t}")
+        ax.legend(loc="upper right")
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+        buf = buf.reshape((h, w, 3))
+        plt.close(fig)
+        return buf
