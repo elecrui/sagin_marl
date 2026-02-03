@@ -12,6 +12,7 @@ if ROOT not in sys.path:
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 
 from sagin_marl.env.config import load_config
 from sagin_marl.env.sagin_env import SaginParallelEnv
@@ -21,12 +22,85 @@ from sagin_marl.rl.policy import ActorNet, batch_flatten_obs
 from sagin_marl.utils.progress import Progress
 
 
+def _init_eval_tb_layout(writer: SummaryWriter, tag_prefix: str) -> None:
+    def t(name: str) -> str:
+        return f"{tag_prefix}/{name}"
+
+    layout = {
+        "Eval/Reward": {
+            "RewardSum": ["Multiline", [t("reward_sum")]],
+            "Steps": ["Multiline", [t("steps")]],
+        },
+        "Eval/Queues": {
+            "QueueMean": ["Multiline", [t("gu_queue_mean"), t("uav_queue_mean"), t("sat_queue_mean")]],
+            "QueueMax": ["Multiline", [t("gu_queue_max"), t("uav_queue_max"), t("sat_queue_max")]],
+        },
+        "Eval/Drops": {
+            "Drops": ["Multiline", [t("gu_drop_sum"), t("uav_drop_sum")]],
+        },
+        "Eval/Satellite": {
+            "SatFlow": ["Multiline", [t("sat_incoming_sum"), t("sat_processed_sum")]],
+        },
+        "Eval/Performance": {
+            "Speed": ["Multiline", [t("steps_per_sec")]],
+            "EpisodeTime": ["Multiline", [t("episode_time_sec")]],
+        },
+        "Eval/Energy": {
+            "EnergyMean": ["Multiline", [t("energy_mean")]],
+        },
+    }
+
+    other = None
+    if tag_prefix == "eval/trained":
+        other = "eval/baseline"
+    elif tag_prefix == "eval/baseline":
+        other = "eval/trained"
+
+    if other is not None:
+        layout["Eval/Compare"] = {
+            "RewardSum": ["Multiline", [f"{tag_prefix}/reward_sum", f"{other}/reward_sum"]],
+            "QueueMean": [
+                "Multiline",
+                [
+                    f"{tag_prefix}/gu_queue_mean",
+                    f"{tag_prefix}/uav_queue_mean",
+                    f"{tag_prefix}/sat_queue_mean",
+                    f"{other}/gu_queue_mean",
+                    f"{other}/uav_queue_mean",
+                    f"{other}/sat_queue_mean",
+                ],
+            ],
+            "Drops": [
+                "Multiline",
+                [f"{tag_prefix}/gu_drop_sum", f"{tag_prefix}/uav_drop_sum", f"{other}/gu_drop_sum", f"{other}/uav_drop_sum"],
+            ],
+            "SatFlow": [
+                "Multiline",
+                [f"{tag_prefix}/sat_incoming_sum", f"{tag_prefix}/sat_processed_sum", f"{other}/sat_incoming_sum", f"{other}/sat_processed_sum"],
+            ],
+        }
+
+    writer.add_custom_scalars(layout)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/phase1.yaml")
     parser.add_argument("--checkpoint", type=str, default="runs/phase1/actor.pt")
-    parser.add_argument("--episodes", type=int, default=5)
-    parser.add_argument("--out", type=str, default="runs/phase1/eval.csv")
+    parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--out", type=str, default="runs/phase1/eval_trained.csv")
+    parser.add_argument(
+        "--tb_dir",
+        type=str,
+        default=None,
+        help="TensorBoard log dir for evaluation. Default: <out_dir>/eval_tb",
+    )
+    parser.add_argument(
+        "--tb_tag",
+        type=str,
+        default=None,
+        help="TensorBoard tag prefix. Default: eval/trained or eval/baseline",
+    )
     parser.add_argument(
         "--baseline",
         type=str,
@@ -40,6 +114,12 @@ def main():
     env = SaginParallelEnv(cfg)
 
     use_baseline = args.baseline != "none"
+    out_dir = os.path.dirname(args.out) or "."
+    tb_dir = args.tb_dir or os.path.join(out_dir, "eval_tb")
+    tb_tag = args.tb_tag or ("eval/baseline" if use_baseline else "eval/trained")
+    os.makedirs(tb_dir, exist_ok=True)
+    tb_writer = SummaryWriter(tb_dir)
+    _init_eval_tb_layout(tb_writer, tb_tag)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     actor = None
@@ -50,7 +130,7 @@ def main():
         actor.load_state_dict(torch.load(args.checkpoint, map_location=device))
         actor.eval()
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     fieldnames = [
         "episode",
         "reward_sum",
@@ -123,28 +203,48 @@ def main():
                     energy_mean_sum += float(np.mean(env.uav_energy))
             ep_time = time.perf_counter() - ep_start
             steps = max(1, steps)
+            metrics = {
+                "reward_sum": reward_sum,
+                "steps": steps,
+                "episode_time_sec": ep_time,
+                "steps_per_sec": steps / max(1e-9, ep_time),
+                "gu_queue_mean": gu_queue_sum / steps,
+                "uav_queue_mean": uav_queue_sum / steps,
+                "sat_queue_mean": sat_queue_sum / steps,
+                "gu_queue_max": gu_queue_max,
+                "uav_queue_max": uav_queue_max,
+                "sat_queue_max": sat_queue_max,
+                "gu_drop_sum": gu_drop_sum,
+                "uav_drop_sum": uav_drop_sum,
+                "sat_processed_sum": sat_processed_sum,
+                "sat_incoming_sum": sat_incoming_sum,
+                "energy_mean": (energy_mean_sum / steps) if cfg.energy_enabled else 0.0,
+            }
             writer.writerow(
                 [
                     ep,
-                    reward_sum,
-                    steps,
-                    ep_time,
-                    steps / max(1e-9, ep_time),
-                    gu_queue_sum / steps,
-                    uav_queue_sum / steps,
-                    sat_queue_sum / steps,
-                    gu_queue_max,
-                    uav_queue_max,
-                    sat_queue_max,
-                    gu_drop_sum,
-                    uav_drop_sum,
-                    sat_processed_sum,
-                    sat_incoming_sum,
-                    (energy_mean_sum / steps) if cfg.energy_enabled else 0.0,
+                    metrics["reward_sum"],
+                    metrics["steps"],
+                    metrics["episode_time_sec"],
+                    metrics["steps_per_sec"],
+                    metrics["gu_queue_mean"],
+                    metrics["uav_queue_mean"],
+                    metrics["sat_queue_mean"],
+                    metrics["gu_queue_max"],
+                    metrics["uav_queue_max"],
+                    metrics["sat_queue_max"],
+                    metrics["gu_drop_sum"],
+                    metrics["uav_drop_sum"],
+                    metrics["sat_processed_sum"],
+                    metrics["sat_incoming_sum"],
+                    metrics["energy_mean"],
                 ]
             )
+            for key, val in metrics.items():
+                tb_writer.add_scalar(f"{tb_tag}/{key}", val, ep)
             progress.update(ep + 1)
     progress.close()
+    tb_writer.close()
     print(f"Saved evaluation metrics to {args.out}")
 
 

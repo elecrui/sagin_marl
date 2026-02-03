@@ -33,37 +33,43 @@ python -m pip install -r requirements.txt
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
+说明：当前默认使用 `configs/phase1.yaml` 的简化阶段一设置（仅距离衰减、固定卫星策略、不开启带宽分配）。
+可选：吞吐估算（判断到达率是否合理）
+```powershell
+python scripts/estimate_throughput.py --config configs/phase1.yaml
+```
 2. 训练（生成模型与训练日志）
 ```powershell
-python scripts/train.py --config configs/phase1.yaml --log_dir runs/phase1 --updates 50
+python scripts/train.py --config configs/phase1.yaml --log_dir runs/phase1 --updates 200
 ```
 3. 评估（训练模型）
 ```powershell
-python scripts/evaluate.py --config configs/phase1.yaml --checkpoint runs/phase1/actor.pt --episodes 5 --out runs/phase1/eval.csv
+python scripts/evaluate.py --config configs/phase1.yaml --checkpoint runs/phase1/actor.pt --episodes 20 --out runs/phase1/eval_trained.csv
 ```
 4. 评估（零加速度基线，用于对照）
 ```powershell
-python scripts/evaluate.py --config configs/phase1.yaml --episodes 5 --out runs/phase1/eval.csv --baseline zero_accel
+python scripts/evaluate.py --config configs/phase1.yaml --episodes 20 --out runs/phase1/eval_baseline.csv --baseline zero_accel
 ```
 5. 查看训练结果
 - 训练指标：`runs/phase1/metrics.csv`
-- TensorBoard：`python -m tensorboard --logdir runs/phase1`
+- TensorBoard（训练 + 评估）：`tensorboard --logdir runs/phase1`
 6. 查看评估结果
-- 评估指标：`runs/phase1/eval.csv`
+- 评估指标：`runs/phase1/eval_trained.csv`, `runs/phase1/eval_baseline.csv`
+- 评估 TensorBoard：`runs/phase1/eval_tb`（tags: `eval/trained`, `eval/baseline`）
 
 训练：
 ```powershell
-python scripts/train.py --config configs/phase1.yaml --log_dir runs/phase1 --updates 50
+python scripts/train.py --config configs/phase1.yaml --log_dir runs/phase1 --updates 200
 ```
 
 评估（输出 CSV）：
 ```powershell
-python scripts/evaluate.py --config configs/phase1.yaml --checkpoint runs/phase1/actor.pt --episodes 5 --out runs/phase1/eval.csv
+python scripts/evaluate.py --config configs/phase1.yaml --checkpoint runs/phase1/actor.pt --episodes 20 --out runs/phase1/eval_trained.csv
 ```
 
 评估（零加速度基线）：
 ```powershell
-python scripts/evaluate.py --config configs/phase1.yaml --episodes 5 --out runs/phase1/eval.csv --baseline zero_accel
+python scripts/evaluate.py --config configs/phase1.yaml --episodes 20 --out runs/phase1/eval_baseline.csv --baseline zero_accel
 ```
 
 渲染一条轨迹（输出 GIF）：
@@ -73,7 +79,13 @@ python scripts/render_episode.py --config configs/phase1.yaml --checkpoint runs/
 
 TensorBoard：
 ```powershell
-python -m tensorboard --logdir runs/phase1
+tensorboard --logdir runs/phase1
+```
+- 分组图在 `Custom Scalars` 标签页（训练 + 评估）。
+
+吞吐估算（判断到达率是否合理）：
+```powershell
+python scripts/estimate_throughput.py --config configs/phase1.yaml
 ```
 
 **训练与评估输出**
@@ -82,7 +94,8 @@ python -m tensorboard --logdir runs/phase1
 - `runs/phase1/metrics.csv`（同时写入 TensorBoard）
 
 评估输出：
-- `runs/phase1/eval.csv`
+- `runs/phase1/eval_trained.csv`、`runs/phase1/eval_baseline.csv`
+- 指标说明文档：`docs/metrics_guide.md`
 
 日志包含关键指标（部分示例）：
 - `episode_reward`、`policy_loss`、`value_loss`、`entropy`
@@ -123,8 +136,8 @@ python -m tensorboard --logdir runs/phase1
 - 规模：`num_uav`、`num_gu`、`num_sat`
 - 时域：`tau0`、`T_steps`
 - 观测截断：`users_obs_max`、`sats_obs_max`、`nbrs_obs_max`
-- 物理约束：`v_max`、`a_max`、`d_safe`
-- 通信与噪声：`b_acc`、`b_sat_total`、`gu_tx_power`、`uav_tx_power`、`noise_density`
+- 物理约束：`v_max`、`a_max`、`d_safe`、`boundary_mode`
+- 通信与噪声：`b_acc`、`b_sat_total`、`gu_tx_power`、`uav_tx_power`、`noise_density`、`pathloss_mode`
 - 天线增益与卫星算力：`uav_tx_gain`、`sat_rx_gain`、`sat_cpu_freq`
 - 机制开关：`enable_bw_action`、`fixed_satellite_strategy`、`doppler_enabled`、`energy_enabled`
 - 训练超参：`buffer_size`、`num_mini_batch`、`ppo_epochs`、`actor_lr`、`critic_lr`

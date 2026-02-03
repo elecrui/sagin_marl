@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/phase1.yaml")
     parser.add_argument("--log_dir", type=str, default="runs/phase1")
-    parser.add_argument("--updates", type=int, default=50)
+    parser.add_argument("--updates", type=int, default=200)
     args = parser.parse_args()
 
     cfg = load_config(args.config)

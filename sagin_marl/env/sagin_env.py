@@ -28,6 +28,12 @@ class SaginParallelEnv(ParallelEnv):
             phase_factor=cfg.walker_phase_factor,
             earth_rotation_rate=cfg.earth_rotation_rate,
         )
+        self._uav_height_sq = cfg.uav_height ** 2
+        self._backhaul_gain_const = (
+            (cfg.speed_of_light / (4.0 * math.pi * cfg.carrier_freq)) ** 2
+            * cfg.uav_tx_gain
+            * cfg.sat_rx_gain
+        )
 
         self.agents = [f"uav_{i}" for i in range(cfg.num_uav)]
         self.possible_agents = list(self.agents)
@@ -202,6 +208,15 @@ class SaginParallelEnv(ParallelEnv):
         self.last_exec_accel = accel.copy()
         self.uav_vel = np.clip(self.uav_vel + accel * cfg.tau0, -cfg.v_max, cfg.v_max)
         self.uav_pos = self.uav_pos + self.uav_vel * cfg.tau0
+        if cfg.boundary_mode == "reflect":
+            for i in range(cfg.num_uav):
+                for axis in range(2):
+                    if self.uav_pos[i, axis] < 0.0:
+                        self.uav_pos[i, axis] = -self.uav_pos[i, axis]
+                        self.uav_vel[i, axis] = -self.uav_vel[i, axis]
+                    elif self.uav_pos[i, axis] > cfg.map_size:
+                        self.uav_pos[i, axis] = 2 * cfg.map_size - self.uav_pos[i, axis]
+                        self.uav_vel[i, axis] = -self.uav_vel[i, axis]
         self.uav_pos = np.clip(self.uav_pos, 0.0, cfg.map_size)
 
     def _associate_users(self) -> np.ndarray:
@@ -262,53 +277,67 @@ class SaginParallelEnv(ParallelEnv):
             else:
                 betas = np.full((len(cand),), 1.0 / len(cand), dtype=np.float32)
 
-            for i, k in enumerate(cand):
-                d2d = np.linalg.norm(self.uav_pos[u] - self.gu_pos[k])
-                d3d = math.sqrt(d2d ** 2 + cfg.uav_height ** 2)
-                phi = math.asin(cfg.uav_height / (d3d + 1e-9))
-                pl = channel.pathloss_db(np.array([d3d]), np.array([phi]), cfg)[0]
-                gain = 10 ** (-pl / 10.0)
-                if cfg.fading_enabled:
-                    gain *= channel.rician_power_gain(cfg.rician_K, size=1, rng=self.rng)[0]
+            # Preserve exact behavior when interference/fading are enabled (RNG order matters)
+            if cfg.interference_enabled or cfg.fading_enabled:
+                for i, k in enumerate(cand):
+                    d2d = np.linalg.norm(self.uav_pos[u] - self.gu_pos[k])
+                    d3d = math.sqrt(d2d**2 + cfg.uav_height**2)
+                    phi = math.asin(cfg.uav_height / (d3d + 1e-9))
+                    pl = channel.pathloss_db(np.array([d3d]), np.array([phi]), cfg)[0]
+                    gain = 10 ** (-pl / 10.0)
+                    if cfg.fading_enabled:
+                        gain *= channel.rician_power_gain(cfg.rician_K, size=1, rng=self.rng)[0]
 
-                interference = 0.0
-                if cfg.interference_enabled:
-                    for j in range(cfg.num_gu):
-                        if assoc[j] >= 0 and assoc[j] != u:
-                            d2d_j = np.linalg.norm(self.uav_pos[u] - self.gu_pos[j])
-                            d3d_j = math.sqrt(d2d_j ** 2 + cfg.uav_height ** 2)
-                            phi_j = math.asin(cfg.uav_height / (d3d_j + 1e-9))
-                            pl_j = channel.pathloss_db(np.array([d3d_j]), np.array([phi_j]), cfg)[0]
-                            gain_j = 10 ** (-pl_j / 10.0)
-                            if cfg.fading_enabled:
-                                gain_j *= channel.rician_power_gain(cfg.rician_K, size=1, rng=self.rng)[0]
-                            interference += cfg.gu_tx_power * gain_j
+                    interference = 0.0
+                    if cfg.interference_enabled:
+                        for j in range(cfg.num_gu):
+                            if assoc[j] >= 0 and assoc[j] != u:
+                                d2d_j = np.linalg.norm(self.uav_pos[u] - self.gu_pos[j])
+                                d3d_j = math.sqrt(d2d_j**2 + cfg.uav_height**2)
+                                phi_j = math.asin(cfg.uav_height / (d3d_j + 1e-9))
+                                pl_j = channel.pathloss_db(np.array([d3d_j]), np.array([phi_j]), cfg)[0]
+                                gain_j = 10 ** (-pl_j / 10.0)
+                                if cfg.fading_enabled:
+                                    gain_j *= channel.rician_power_gain(cfg.rician_K, size=1, rng=self.rng)[0]
+                                interference += cfg.gu_tx_power * gain_j
 
-                snr = channel.snr_linear(cfg.gu_tx_power, gain, cfg.noise_density, cfg.b_acc, interference)
-                se = channel.spectral_efficiency(snr)
-                rate = betas[i] * cfg.b_acc * se
-                rates[k] = rate
-                eta[u, i] = se
+                    snr = channel.snr_linear(cfg.gu_tx_power, gain, cfg.noise_density, cfg.b_acc, interference)
+                    se = channel.spectral_efficiency(snr)
+                    rate = betas[i] * cfg.b_acc * se
+                    rates[k] = rate
+                    eta[u, i] = se
+                continue
+
+            cand_idx = np.asarray(cand, dtype=np.int32)
+            gu_pos = self.gu_pos[cand_idx]
+            uav_pos = self.uav_pos[u]
+            d2d = np.linalg.norm(gu_pos - uav_pos, axis=1)
+            d3d = np.sqrt(d2d * d2d + self._uav_height_sq)
+            phi = np.arcsin(cfg.uav_height / (d3d + 1e-9))
+            pl = channel.pathloss_db(d3d, phi, cfg)
+            gain = 10 ** (-pl / 10.0)
+
+            snr = channel.snr_linear(cfg.gu_tx_power, gain, cfg.noise_density, cfg.b_acc)
+            se = channel.spectral_efficiency(snr)
+            rate = betas * cfg.b_acc * se
+            rates[cand_idx] = rate.astype(np.float32)
+            eta[u, : len(cand)] = se.astype(np.float32)
 
         return rates, eta
 
     def _update_gu_queues(self, access_rates: np.ndarray, assoc: np.ndarray) -> np.ndarray:
         cfg = self.cfg
-        gu_outflow = np.zeros((cfg.num_gu,), dtype=np.float32)
-        self.gu_drop = np.zeros((cfg.num_gu,), dtype=np.float32)
-        for k in range(cfg.num_gu):
-            if cfg.task_arrival_poisson:
-                arrival = self.rng.poisson(cfg.task_arrival_rate)
-            else:
-                arrival = cfg.task_arrival_rate
-            q_before = self.gu_queue[k] + arrival
-            outflow = min(q_before, access_rates[k] * cfg.tau0)
-            q_after = q_before - outflow
-            if q_after > cfg.queue_max_gu:
-                self.gu_drop[k] = q_after - cfg.queue_max_gu
-                q_after = cfg.queue_max_gu
-            self.gu_queue[k] = q_after
-            gu_outflow[k] = outflow
+        if cfg.task_arrival_poisson:
+            arrival = self.rng.poisson(cfg.task_arrival_rate, size=cfg.num_gu).astype(np.float32)
+        else:
+            arrival = np.full((cfg.num_gu,), cfg.task_arrival_rate, dtype=np.float32)
+        q_before = self.gu_queue + arrival
+        outflow = np.minimum(q_before, access_rates * cfg.tau0)
+        q_after = q_before - outflow
+        self.gu_drop = np.maximum(q_after - cfg.queue_max_gu, 0.0).astype(np.float32)
+        q_after = np.minimum(q_after, cfg.queue_max_gu)
+        self.gu_queue = q_after.astype(np.float32)
+        gu_outflow = outflow.astype(np.float32)
 
         self.last_association = assoc.copy()
         return gu_outflow
@@ -389,12 +418,11 @@ class SaginParallelEnv(ParallelEnv):
                     continue
                 b_ul = cfg.b_sat_total / counts[l]
                 d = np.linalg.norm(sat_pos[l] - self._uav_ecef(u))
-                gain = (cfg.speed_of_light / (4.0 * math.pi * cfg.carrier_freq * d)) ** 2
+                gain = self._backhaul_gain_const / (d ** 2)
                 if cfg.atm_loss_enabled:
                     theta = self._elevation_angle(u, l, sat_pos)
                     atm_loss = channel.atmospheric_loss_db(theta, cfg.atm_loss_db)
                     gain *= 10 ** (-atm_loss / 10.0)
-                gain *= cfg.uav_tx_gain * cfg.sat_rx_gain
 
                 snr = channel.snr_linear(cfg.uav_tx_power, gain, cfg.noise_density, b_ul)
                 nu = 0.0
@@ -416,19 +444,25 @@ class SaginParallelEnv(ParallelEnv):
     def _update_uav_queues(self, gu_outflow: np.ndarray, rate_matrix: np.ndarray) -> np.ndarray:
         cfg = self.cfg
         outflow_matrix = np.zeros((cfg.num_uav, cfg.num_sat), dtype=np.float32)
-        self.uav_drop = np.zeros((cfg.num_uav,), dtype=np.float32)
-        for u in range(cfg.num_uav):
-            inflow = np.sum(gu_outflow[self.last_association == u])
-            q_before = self.uav_queue[u] + inflow
-            total_rate = float(np.sum(rate_matrix[u]))
-            outflow = min(q_before, total_rate * cfg.tau0)
-            q_after = q_before - outflow
-            if q_after > cfg.queue_max_uav:
-                self.uav_drop[u] = q_after - cfg.queue_max_uav
-                q_after = cfg.queue_max_uav
-            self.uav_queue[u] = q_after
-            if total_rate > 0:
-                outflow_matrix[u] = (rate_matrix[u] / total_rate) * outflow
+        valid = self.last_association >= 0
+        if np.any(valid):
+            inflow = np.bincount(
+                self.last_association[valid],
+                weights=gu_outflow[valid],
+                minlength=cfg.num_uav,
+            ).astype(np.float32)
+        else:
+            inflow = np.zeros((cfg.num_uav,), dtype=np.float32)
+        q_before = self.uav_queue + inflow
+        total_rate = np.sum(rate_matrix, axis=1).astype(np.float32)
+        outflow = np.minimum(q_before, total_rate * cfg.tau0)
+        q_after = q_before - outflow
+        self.uav_drop = np.maximum(q_after - cfg.queue_max_uav, 0.0).astype(np.float32)
+        q_after = np.minimum(q_after, cfg.queue_max_uav)
+        self.uav_queue = q_after.astype(np.float32)
+        mask = total_rate > 0
+        if np.any(mask):
+            outflow_matrix[mask] = (rate_matrix[mask] / total_rate[mask, None]) * outflow[mask, None]
         return outflow_matrix
 
     def _update_sat_queues(self, outflow_matrix: np.ndarray) -> None:
@@ -733,7 +767,14 @@ class SaginParallelEnv(ParallelEnv):
         ax.legend(loc="upper right")
         fig.canvas.draw()
         w, h = fig.canvas.get_width_height()
-        buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        buf = buf.reshape((h, w, 3))
+        # Matplotlib backends differ; prefer buffer_rgba and fall back to tostring_argb.
+        try:
+            rgba = np.asarray(fig.canvas.buffer_rgba())
+            rgba = rgba.reshape((h, w, 4))
+            buf = rgba[:, :, :3]
+        except AttributeError:
+            argb = np.frombuffer(fig.canvas.tostring_argb(), dtype=np.uint8)
+            argb = argb.reshape((h, w, 4))
+            buf = argb[:, :, 1:4]
         plt.close(fig)
         return buf

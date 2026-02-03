@@ -81,6 +81,11 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
     reward_history = []
 
     obs, _ = env.reset()
+    use_direct_logprob = (
+        (not cfg.enable_bw_action)
+        and cfg.fixed_satellite_strategy
+        and not (cfg.energy_enabled and cfg.energy_safety_enabled)
+    )
 
     for update in range(total_updates):
         update_start = time.perf_counter()
@@ -103,12 +108,12 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
         for step in range(cfg.buffer_size):
             obs_list = list(obs.values())
             obs_batch = batch_flatten_obs(obs_list, cfg)
-            obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
+            obs_tensor = torch.from_numpy(obs_batch).to(device)
 
             state_np = env.get_global_state()
             with torch.no_grad():
                 policy_out = actor.act(obs_tensor)
-                value = critic(torch.tensor(state_np, dtype=torch.float32, device=device))
+                value = critic(torch.from_numpy(state_np).to(device))
 
             accel_actions = policy_out.accel.cpu().numpy()
             bw_logits = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
@@ -134,29 +139,27 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
             elif not cfg.fixed_satellite_strategy:
                 sat_exec = np.zeros((len(obs_list), cfg.sats_obs_max), dtype=np.float32)
 
-            action_parts = [accel_actions]
-            if cfg.enable_bw_action and bw_exec is not None:
-                action_parts.append(bw_exec)
-            if not cfg.fixed_satellite_strategy and sat_exec is not None:
-                action_parts.append(sat_exec)
-            action_vec = np.concatenate(action_parts, axis=1)
-
             action_dict = assemble_actions(cfg, env.agents, accel_actions, bw_logits=bw_exec, sat_logits=sat_exec)
             next_obs, rewards, terms, truncs, _ = env.step(action_dict)
 
             accel_exec = getattr(env, "last_exec_accel", accel_actions)
-            accel_exec_norm = accel_exec / max(cfg.a_max, 1e-6)
-            accel_exec_norm = np.clip(accel_exec_norm, -1.0, 1.0)
+            if use_direct_logprob:
+                accel_exec_norm = accel_actions
+            else:
+                accel_exec_norm = accel_exec / max(cfg.a_max, 1e-6)
+                accel_exec_norm = np.clip(accel_exec_norm, -1.0, 1.0).astype(np.float32, copy=False)
             exec_parts = [accel_exec_norm]
             if cfg.enable_bw_action and bw_exec is not None:
                 exec_parts.append(bw_exec)
             if not cfg.fixed_satellite_strategy and sat_exec is not None:
                 exec_parts.append(sat_exec)
-            action_vec_exec = np.concatenate(exec_parts, axis=1)
-            with torch.no_grad():
-                logprobs = actor.evaluate_actions(
-                    obs_tensor, torch.tensor(action_vec_exec, dtype=torch.float32, device=device)
-                )[0].cpu().numpy()
+            action_vec_exec = np.concatenate(exec_parts, axis=1).astype(np.float32, copy=False)
+            if use_direct_logprob:
+                logprobs = policy_out.logprob.detach().cpu().numpy()
+            else:
+                with torch.no_grad():
+                    action_vec_exec_t = torch.from_numpy(action_vec_exec).to(device)
+                    logprobs = actor.evaluate_actions(obs_tensor, action_vec_exec_t)[0].detach().cpu().numpy()
 
             reward_scalar = list(rewards.values())[0]
             done_scalar = list(terms.values())[0] or list(truncs.values())[0]

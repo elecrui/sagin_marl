@@ -12,6 +12,7 @@ class MetricLogger:
         os.makedirs(log_dir, exist_ok=True)
         self.log_dir = log_dir
         self.writer = SummaryWriter(log_dir)
+        self._init_tb_layout()
         self.csv_path = os.path.join(log_dir, "metrics.csv")
         self.fieldnames: Optional[List[str]] = list(fieldnames) if fieldnames is not None else None
         self._header_written = False
@@ -31,6 +32,37 @@ class MetricLogger:
                 writer = csv.writer(f)
                 writer.writerow(["step"] + list(self.fieldnames))
             self._header_written = True
+
+    def _init_tb_layout(self) -> None:
+        layout = {
+            "Training/Reward": {
+                "EpisodeReward": ["Multiline", ["episode_reward"]],
+            },
+            "Training/Losses": {
+                "Losses": ["Multiline", ["policy_loss", "value_loss", "entropy"]],
+            },
+            "Training/Queues": {
+                "QueueMean": ["Multiline", ["gu_queue_mean", "uav_queue_mean", "sat_queue_mean"]],
+                "QueueMax": ["Multiline", ["gu_queue_max", "uav_queue_max", "sat_queue_max"]],
+            },
+            "Training/Drops": {
+                "Drops": ["Multiline", ["gu_drop_sum", "uav_drop_sum"]],
+            },
+            "Training/Satellite": {
+                "SatFlow": ["Multiline", ["sat_incoming_sum", "sat_processed_sum"]],
+            },
+            "Training/Performance": {
+                "Throughput": ["Multiline", ["env_steps_per_sec", "update_steps_per_sec"]],
+                "UpdateTime": ["Multiline", ["rollout_time_sec", "optim_time_sec", "update_time_sec"]],
+            },
+            "Training/Totals": {
+                "Totals": ["Multiline", ["total_env_steps", "total_time_sec"]],
+            },
+            "Training/Energy": {
+                "EnergyMean": ["Multiline", ["energy_mean"]],
+            },
+        }
+        self.writer.add_custom_scalars(layout)
 
     def log(self, step: int, metrics: Dict[str, float]) -> None:
         if not self._header_written:

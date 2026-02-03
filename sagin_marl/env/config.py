@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict
 
+import re
+
 import math
 
 try:
@@ -50,6 +52,7 @@ class SaginConfig:
     v_max: float = 30.0
     a_max: float = 5.0
     d_safe: float = 20.0
+    boundary_mode: str = "clip"  # "clip" or "reflect"
 
     # Queues (bits)
     queue_max_gu: float = 5e6
@@ -76,6 +79,7 @@ class SaginConfig:
     xi_los: float = 1.0
     xi_nlos: float = 20.0
     pl_threshold_db: float = 140.0
+    pathloss_mode: str = "prob_los"  # "prob_los" or "free_space"
     rician_K: float = 10.0
     atm_loss_enabled: bool = False
     atm_loss_db: float = 2.0
@@ -176,5 +180,37 @@ def update_config(cfg: SaginConfig, updates: Dict[str, Any]) -> SaginConfig:
     for key, value in updates.items():
         if not hasattr(cfg, key):
             raise KeyError(f"Unknown config key: {key}")
+        current = getattr(cfg, key)
+        value = _coerce_scalar(value, current)
+        if isinstance(current, bool) and isinstance(value, int):
+            value = bool(value)
+        if isinstance(current, int) and isinstance(value, float) and value.is_integer():
+            value = int(value)
         setattr(cfg, key, value)
     return cfg
+
+
+def _coerce_scalar(value: Any, current: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    low = s.lower()
+
+    if isinstance(current, bool) or low in ("true", "false", "1", "0", "yes", "no", "y", "n"):
+        if low in ("true", "1", "yes", "y"):
+            return True
+        if low in ("false", "0", "no", "n"):
+            return False
+
+    if isinstance(current, (int, float)) or current is None:
+        if re.fullmatch(r"[+-]?\d+", s):
+            try:
+                return int(s)
+            except Exception:
+                pass
+        try:
+            return float(s)
+        except Exception:
+            return value
+
+    return value

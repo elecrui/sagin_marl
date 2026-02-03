@@ -3,15 +3,20 @@ from __future__ import annotations
 import numpy as np
 
 
-def los_probability(phi_rad: np.ndarray, a: float, b: float) -> np.ndarray:
-    # Probabilistic LoS model
-    return 1.0 / (1.0 + a * np.exp(-b * (phi_rad - a)))
+def los_probability(phi_deg: np.ndarray, a: float, b: float) -> np.ndarray:
+    # Probabilistic LoS model (phi in degrees)
+    return 1.0 / (1.0 + a * np.exp(-b * (phi_deg - a)))
 
 
 def pathloss_db(d: np.ndarray, phi_rad: np.ndarray, cfg) -> np.ndarray:
-    pl_los = cfg.xi_los + 20.0 * np.log10(d + 1e-9)
-    pl_nlos = cfg.xi_nlos + 20.0 * np.log10(d + 1e-9)
-    p_los = los_probability(phi_rad, cfg.los_a, cfg.los_b)
+    d = np.maximum(d, 1e-9)
+    pl_base = cfg.pathloss_const_db + 20.0 * np.log10(cfg.carrier_freq / 1e9)
+    pl_los = pl_base + cfg.xi_los + 20.0 * np.log10(d)
+    pl_nlos = pl_base + cfg.xi_nlos + 20.0 * np.log10(d)
+    if getattr(cfg, "pathloss_mode", "prob_los") == "free_space":
+        return pl_los
+    phi_deg = np.degrees(phi_rad)
+    p_los = los_probability(phi_deg, cfg.los_a, cfg.los_b)
     return p_los * pl_los + (1.0 - p_los) * pl_nlos
 
 
