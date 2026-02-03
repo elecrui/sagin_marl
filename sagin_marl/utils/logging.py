@@ -2,35 +2,47 @@ from __future__ import annotations
 
 import csv
 import os
-from typing import Dict
+from typing import Dict, Iterable, List, Optional
 
 from torch.utils.tensorboard import SummaryWriter
 
 
 class MetricLogger:
-    def __init__(self, log_dir: str):
+    def __init__(self, log_dir: str, fieldnames: Optional[Iterable[str]] = None):
         os.makedirs(log_dir, exist_ok=True)
         self.log_dir = log_dir
         self.writer = SummaryWriter(log_dir)
         self.csv_path = os.path.join(log_dir, "metrics.csv")
+        self.fieldnames: Optional[List[str]] = list(fieldnames) if fieldnames is not None else None
+        self._header_written = False
         self._init_csv()
 
     def _init_csv(self) -> None:
-        if not os.path.exists(self.csv_path):
+        if os.path.exists(self.csv_path):
+            with open(self.csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header and header[0] == "step":
+                    self.fieldnames = header[1:]
+                    self._header_written = True
+            return
+        if self.fieldnames is not None:
             with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow(["step", "episode_reward", "policy_loss", "value_loss", "entropy"])
+                writer.writerow(["step"] + list(self.fieldnames))
+            self._header_written = True
 
     def log(self, step: int, metrics: Dict[str, float]) -> None:
+        if not self._header_written:
+            self.fieldnames = list(metrics.keys())
+            with open(self.csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["step"] + list(self.fieldnames))
+            self._header_written = True
+        fieldnames = self.fieldnames or list(metrics.keys())
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                step,
-                metrics.get("episode_reward", 0.0),
-                metrics.get("policy_loss", 0.0),
-                metrics.get("value_loss", 0.0),
-                metrics.get("entropy", 0.0),
-            ])
+            writer.writerow([step] + [metrics.get(name, 0.0) for name in fieldnames])
         for key, val in metrics.items():
             self.writer.add_scalar(key, val, step)
 

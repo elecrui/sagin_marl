@@ -65,9 +65,9 @@ class SaginConfig:
     b_sat_total: float = 20e6
     gu_tx_power: float = 0.2  # Watts
     uav_tx_power: float = 1.0  # Watts
-    uav_tx_gain: float = 1.0
-    sat_rx_gain: float = 1.0
-    noise_density: float = 1e-17  # W/Hz
+    uav_tx_gain: float = 300.0
+    sat_rx_gain: float = 300.0
+    noise_density: float = 4e-21  # W/Hz (thermal noise at ~290K)
     carrier_freq: float = 2e9
     speed_of_light: float = 3e8
     pathloss_const_db: float = 32.4
@@ -82,7 +82,7 @@ class SaginConfig:
     subcarrier_spacing: float = 15e3
 
     # Satellite compute
-    sat_cpu_freq: float = 5e9  # cycles/s
+    sat_cpu_freq: float = 1e10  # cycles/s
     task_cycles_per_bit: float = 1000.0  # cycles/bit
 
     # Doppler
@@ -151,6 +151,13 @@ class SaginConfig:
 
     actor_hidden: int = 128
     critic_hidden: int = 128
+
+    # Early stopping (convergence)
+    early_stop_enabled: bool = True
+    early_stop_min_updates: int = 20
+    early_stop_window: int = 5
+    early_stop_patience: int = 10
+    early_stop_min_delta: float = 1e-3
 
     @property
     def theta_min_rad(self) -> float:
