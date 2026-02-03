@@ -94,6 +94,8 @@ class SaginParallelEnv(ParallelEnv):
         self.gu_drop = np.zeros((cfg.num_gu,), dtype=np.float32)
         self.uav_drop = np.zeros((cfg.num_uav,), dtype=np.float32)
         self.last_energy_cost = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_sat_processed = np.zeros((cfg.num_sat,), dtype=np.float32)
+        self.last_sat_incoming = np.zeros((cfg.num_sat,), dtype=np.float32)
 
         self.last_association = np.full((cfg.num_gu,), -1, dtype=np.int32)
         self.prev_association = self.last_association.copy()
@@ -433,7 +435,11 @@ class SaginParallelEnv(ParallelEnv):
         cfg = self.cfg
         incoming = np.sum(outflow_matrix, axis=0)
         compute_rate = cfg.sat_cpu_freq / cfg.task_cycles_per_bit
-        self.sat_queue = np.maximum(self.sat_queue + incoming - compute_rate * cfg.tau0, 0.0)
+        before = self.sat_queue.copy()
+        processed = np.minimum(before + incoming, compute_rate * cfg.tau0)
+        self.last_sat_processed = processed
+        self.last_sat_incoming = incoming
+        self.sat_queue = np.maximum(before + incoming - compute_rate * cfg.tau0, 0.0)
 
     def _update_energy(self, selections: List[List[int]]) -> None:
         cfg = self.cfg

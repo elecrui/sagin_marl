@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Tuple
 
 import numpy as np
@@ -44,15 +45,61 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
     critic_optim = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
 
     from ..utils.logging import MetricLogger
+    from ..utils.progress import Progress
 
-    logger = MetricLogger(log_dir)
+    metric_fields = [
+        "episode_reward",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "gu_queue_mean",
+        "uav_queue_mean",
+        "sat_queue_mean",
+        "gu_queue_max",
+        "uav_queue_max",
+        "sat_queue_max",
+        "gu_drop_sum",
+        "uav_drop_sum",
+        "sat_processed_sum",
+        "sat_incoming_sum",
+        "energy_mean",
+        "update_time_sec",
+        "rollout_time_sec",
+        "optim_time_sec",
+        "env_steps",
+        "env_steps_per_sec",
+        "update_steps_per_sec",
+        "total_env_steps",
+        "total_time_sec",
+    ]
+    logger = MetricLogger(log_dir, fieldnames=metric_fields)
+    progress = Progress(total_updates, desc="Train")
+    training_start = time.perf_counter()
+    total_env_steps = 0
+    best_ma = -float("inf")
+    no_improve = 0
+    reward_history = []
 
     obs, _ = env.reset()
 
     for update in range(total_updates):
+        update_start = time.perf_counter()
         buffer = RolloutBuffer()
         ep_reward = 0.0
+        steps_count = 0
+        gu_queue_sum = 0.0
+        uav_queue_sum = 0.0
+        sat_queue_sum = 0.0
+        gu_queue_max = 0.0
+        uav_queue_max = 0.0
+        sat_queue_max = 0.0
+        gu_drop_sum = 0.0
+        uav_drop_sum = 0.0
+        sat_processed_sum = 0.0
+        sat_incoming_sum = 0.0
+        energy_mean_sum = 0.0
 
+        rollout_start = time.perf_counter()
         for step in range(cfg.buffer_size):
             obs_list = list(obs.values())
             obs_batch = batch_flatten_obs(obs_list, cfg)
@@ -98,7 +145,9 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
             next_obs, rewards, terms, truncs, _ = env.step(action_dict)
 
             accel_exec = getattr(env, "last_exec_accel", accel_actions)
-            exec_parts = [accel_exec]
+            accel_exec_norm = accel_exec / max(cfg.a_max, 1e-6)
+            accel_exec_norm = np.clip(accel_exec_norm, -1.0, 1.0)
+            exec_parts = [accel_exec_norm]
             if cfg.enable_bw_action and bw_exec is not None:
                 exec_parts.append(bw_exec)
             if not cfg.fixed_satellite_strategy and sat_exec is not None:
@@ -112,6 +161,22 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
             reward_scalar = list(rewards.values())[0]
             done_scalar = list(terms.values())[0] or list(truncs.values())[0]
             ep_reward += reward_scalar
+            steps_count += 1
+            total_env_steps += 1
+            gu_queue_sum += float(np.mean(env.gu_queue))
+            uav_queue_sum += float(np.mean(env.uav_queue))
+            sat_queue_sum += float(np.mean(env.sat_queue))
+            gu_queue_max = max(gu_queue_max, float(np.max(env.gu_queue)))
+            uav_queue_max = max(uav_queue_max, float(np.max(env.uav_queue)))
+            sat_queue_max = max(sat_queue_max, float(np.max(env.sat_queue)))
+            gu_drop_sum += float(np.sum(env.gu_drop))
+            uav_drop_sum += float(np.sum(env.uav_drop))
+            if hasattr(env, "last_sat_processed"):
+                sat_processed_sum += float(np.sum(env.last_sat_processed))
+            if hasattr(env, "last_sat_incoming"):
+                sat_incoming_sum += float(np.sum(env.last_sat_incoming))
+            if cfg.energy_enabled:
+                energy_mean_sum += float(np.mean(env.uav_energy))
 
             buffer.add(
                 obs_batch,
@@ -126,6 +191,7 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
             obs = next_obs
             if done_scalar:
                 obs, _ = env.reset()
+        rollout_time = time.perf_counter() - rollout_start
 
         # Prepare batches
         obs_arr, act_arr, logp_arr, rewards, values, dones, state_arr = buffer.as_arrays()
@@ -157,6 +223,7 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
         value_losses = []
         entropies = []
 
+        optim_start = time.perf_counter()
         for _ in range(cfg.ppo_epochs):
             np.random.shuffle(indices)
             for start in range(0, batch_size, minibatch_size):
@@ -184,21 +251,64 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
             torch.nn.utils.clip_grad_norm_(critic.parameters(), cfg.max_grad_norm)
             critic_optim.step()
             value_losses.append(value_loss.item())
+        optim_time = time.perf_counter() - optim_start
+
+        update_time = time.perf_counter() - update_start
+        steps_count = max(1, steps_count)
+        episode_reward = ep_reward / steps_count
+        metrics = {
+            "episode_reward": episode_reward,
+            "policy_loss": float(np.mean(policy_losses)),
+            "value_loss": float(np.mean(value_losses)),
+            "entropy": float(np.mean(entropies)),
+            "gu_queue_mean": gu_queue_sum / steps_count,
+            "uav_queue_mean": uav_queue_sum / steps_count,
+            "sat_queue_mean": sat_queue_sum / steps_count,
+            "gu_queue_max": gu_queue_max,
+            "uav_queue_max": uav_queue_max,
+            "sat_queue_max": sat_queue_max,
+            "gu_drop_sum": gu_drop_sum,
+            "uav_drop_sum": uav_drop_sum,
+            "sat_processed_sum": sat_processed_sum,
+            "sat_incoming_sum": sat_incoming_sum,
+            "energy_mean": (energy_mean_sum / steps_count) if cfg.energy_enabled else 0.0,
+            "update_time_sec": update_time,
+            "rollout_time_sec": rollout_time,
+            "optim_time_sec": optim_time,
+            "env_steps": float(steps_count),
+            "env_steps_per_sec": steps_count / max(1e-9, rollout_time),
+            "update_steps_per_sec": steps_count / max(1e-9, update_time),
+            "total_env_steps": float(total_env_steps),
+            "total_time_sec": time.perf_counter() - training_start,
+        }
 
         logger.log(
             update,
-            {
-                "episode_reward": ep_reward / max(1, cfg.buffer_size),
-                "policy_loss": float(np.mean(policy_losses)),
-                "value_loss": float(np.mean(value_losses)),
-                "entropy": float(np.mean(entropies)),
-            },
+            metrics,
         )
+        progress.update(update + 1)
+
+        if cfg.early_stop_enabled:
+            reward_history.append(episode_reward)
+            if update + 1 >= cfg.early_stop_min_updates and len(reward_history) >= cfg.early_stop_window:
+                ma = float(np.mean(reward_history[-cfg.early_stop_window :]))
+                if ma > best_ma + cfg.early_stop_min_delta:
+                    best_ma = ma
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                if no_improve >= cfg.early_stop_patience:
+                    print(
+                        f"Early stopping at update {update + 1}: "
+                        f"moving average={ma:.6f}, best={best_ma:.6f}"
+                    )
+                    break
 
     # Save checkpoints
     os.makedirs(log_dir, exist_ok=True)
     torch.save(actor.state_dict(), os.path.join(log_dir, "actor.pt"))
     torch.save(critic.state_dict(), os.path.join(log_dir, "critic.pt"))
 
+    progress.close()
     logger.close()
     return actor, critic

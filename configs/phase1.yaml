@@ -22,6 +22,11 @@ d_safe: 20.0
 task_arrival_rate: 200000.0
 task_arrival_poisson: false
 
+uav_tx_gain: 300.0
+sat_rx_gain: 300.0
+sat_cpu_freq: 1e10
+noise_density: 4e-21
+
 doppler_observed: true
 doppler_enabled: false
 energy_enabled: false
@@ -34,3 +39,9 @@ N_RF: 1
 buffer_size: 4000
 num_mini_batch: 32
 ppo_epochs: 4
+
+early_stop_enabled: true
+early_stop_min_updates: 20
+early_stop_window: 5
+early_stop_patience: 10
+early_stop_min_delta: 0.001
