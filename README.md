@@ -33,68 +33,77 @@ python -m pip install -r requirements.txt
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
-说明：当前默认使用 `configs/phase1.yaml` 的简化阶段一设置（仅距离衰减、固定卫星策略、不开启带宽分配）。
+说明：阶段一当前默认使用 `configs/phase1_actions.yaml`，关键条件/开关为：
+- `enable_bw_action=true`（带宽分配动作）
+- `fixed_satellite_strategy=false` + `sat_select_mode=sample`（卫星选择动作）
+- `avoidance_enabled=true`（避障安全层）
+对照用简化版为 `configs/phase1.yaml`（固定卫星策略、关闭带宽分配与避障安全层）。
+
 可选：吞吐估算（判断到达率是否合理）
 ```powershell
-python scripts/estimate_throughput.py --config configs/phase1.yaml
+python scripts/estimate_throughput.py --config configs/phase1_actions.yaml
 ```
-2. 训练（生成模型与训练日志）
+2. 训练（自动生成独立目录，避免多次流程数据堆在一起）
 ```powershell
-python scripts/train.py --config configs/phase1.yaml --log_dir runs/phase1 --updates 200
+python scripts/train.py --config configs/phase1_actions.yaml --log_dir runs/phase1_actions --run_id auto --updates 200
 ```
+说明：终端会输出 `Run dir: runs/phase1_actions/20260204_121530`，下文用 `<RUN_DIR>` 指代该目录。
+如需手动指定目录，可用 `--run_dir runs/phase1_actions/exp1`。
 3. 评估（训练模型）
 ```powershell
-python scripts/evaluate.py --config configs/phase1.yaml --checkpoint runs/phase1/actor.pt --episodes 20 --out runs/phase1/eval_trained.csv
+python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20
 ```
 4. 评估（零加速度基线，用于对照）
 ```powershell
-python scripts/evaluate.py --config configs/phase1.yaml --episodes 20 --out runs/phase1/eval_baseline.csv --baseline zero_accel
+python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20 --baseline zero_accel
 ```
 5. 查看训练结果
-- 训练指标：`runs/phase1/metrics.csv`
-- TensorBoard（训练 + 评估）：`tensorboard --logdir runs/phase1`
+- 训练指标：`<RUN_DIR>/metrics.csv`
+- TensorBoard（训练 + 评估）：`tensorboard --logdir <RUN_DIR>`
 6. 查看评估结果
-- 评估指标：`runs/phase1/eval_trained.csv`, `runs/phase1/eval_baseline.csv`
-- 评估 TensorBoard：`runs/phase1/eval_tb`（tags: `eval/trained`, `eval/baseline`）
+- 评估指标：`<RUN_DIR>/eval_trained.csv`, `<RUN_DIR>/eval_baseline.csv`
+- 评估 TensorBoard：`<RUN_DIR>/eval_tb`（tags: `eval/trained`, `eval/baseline`）
+
+以下命令默认使用 `<RUN_DIR>`（上一步输出的 Run dir），如未设置请替换为具体目录。
 
 训练：
 ```powershell
-python scripts/train.py --config configs/phase1.yaml --log_dir runs/phase1 --updates 200
+python scripts/train.py --config configs/phase1_actions.yaml --log_dir runs/phase1_actions --run_id auto --updates 200
 ```
 
 评估（输出 CSV）：
 ```powershell
-python scripts/evaluate.py --config configs/phase1.yaml --checkpoint runs/phase1/actor.pt --episodes 20 --out runs/phase1/eval_trained.csv
+python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20
 ```
 
 评估（零加速度基线）：
 ```powershell
-python scripts/evaluate.py --config configs/phase1.yaml --episodes 20 --out runs/phase1/eval_baseline.csv --baseline zero_accel
+python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20 --baseline zero_accel
 ```
 
 渲染一条轨迹（输出 GIF）：
 ```powershell
-python scripts/render_episode.py --config configs/phase1.yaml --checkpoint runs/phase1/actor.pt --out runs/phase1/episode.gif
+python scripts/render_episode.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR>
 ```
 
 TensorBoard：
 ```powershell
-tensorboard --logdir runs/phase1
+tensorboard --logdir <RUN_DIR>
 ```
 - 分组图在 `Custom Scalars` 标签页（训练 + 评估）。
 
 吞吐估算（判断到达率是否合理）：
 ```powershell
-python scripts/estimate_throughput.py --config configs/phase1.yaml
+python scripts/estimate_throughput.py --config configs/phase1_actions.yaml
 ```
 
 **训练与评估输出**
 训练输出：
-- `runs/phase1/actor.pt`、`runs/phase1/critic.pt`
-- `runs/phase1/metrics.csv`（同时写入 TensorBoard）
+- `<RUN_DIR>/actor.pt`、`<RUN_DIR>/critic.pt`
+- `<RUN_DIR>/metrics.csv`（同时写入 TensorBoard）
 
 评估输出：
-- `runs/phase1/eval_trained.csv`、`runs/phase1/eval_baseline.csv`
+- `<RUN_DIR>/eval_trained.csv`、`<RUN_DIR>/eval_baseline.csv`
 - 指标说明文档：`docs/metrics_guide.md`
 
 日志包含关键指标（部分示例）：
@@ -132,7 +141,7 @@ python scripts/estimate_throughput.py --config configs/phase1.yaml
 - `sat_logits`: `(sats_obs_max,)`，卫星选择权重（`fixed_satellite_strategy=false` 生效）
 
 **配置说明**
-默认配置见 `sagin_marl/env/config.py`，`configs/phase1.yaml` 会覆盖其中字段。常用参数：
+默认配置见 `sagin_marl/env/config.py`，阶段一默认使用 `configs/phase1_actions.yaml` 覆盖其中字段；对照可用 `configs/phase1.yaml`。常用参数：
 - 规模：`num_uav`、`num_gu`、`num_sat`
 - 时域：`tau0`、`T_steps`
 - 观测截断：`users_obs_max`、`sats_obs_max`、`nbrs_obs_max`
@@ -153,7 +162,7 @@ python -m pytest -q
 from sagin_marl.env.config import load_config
 from sagin_marl.env.sagin_env import SaginParallelEnv
 
-cfg = load_config("configs/phase1.yaml")
+cfg = load_config("configs/phase1_actions.yaml")
 env = SaginParallelEnv(cfg)
 obs, infos = env.reset()
 ```

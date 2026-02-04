@@ -16,13 +16,33 @@ from sagin_marl.env.sagin_env import SaginParallelEnv
 from sagin_marl.rl.policy import ActorNet, batch_flatten_obs
 
 
+def _resolve_render_paths(
+    run_dir: str | None, checkpoint: str | None, out: str | None
+) -> tuple[str, str]:
+    if run_dir:
+        checkpoint = checkpoint or os.path.join(run_dir, "actor.pt")
+        out = out or os.path.join(run_dir, "episode.gif")
+    else:
+        checkpoint = checkpoint or "runs/phase1/actor.pt"
+        out = out or "runs/phase1/episode.gif"
+    return checkpoint, out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/phase1.yaml")
-    parser.add_argument("--checkpoint", type=str, default="runs/phase1/actor.pt")
-    parser.add_argument("--out", type=str, default="runs/phase1/episode.gif")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--out", type=str, default=None)
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help="Run directory that contains checkpoints and render outputs.",
+    )
     parser.add_argument("--fps", type=int, default=10)
     args = parser.parse_args()
+
+    args.checkpoint, args.out = _resolve_render_paths(args.run_dir, args.checkpoint, args.out)
 
     cfg = load_config(args.config)
     env = SaginParallelEnv(cfg)
@@ -59,7 +79,8 @@ def main():
         obs, rewards, terms, truncs, _ = env.step(actions)
         done = list(terms.values())[0] or list(truncs.values())[0]
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
+    out_dir = os.path.dirname(args.out) or "."
+    os.makedirs(out_dir, exist_ok=True)
     try:
         import imageio.v2 as imageio
     except Exception:

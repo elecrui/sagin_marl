@@ -103,6 +103,12 @@ class SaginConfig:
     fixed_satellite_strategy: bool = True
     N_RF: int = 1
     sat_select_mode: str = "topk"
+    sat_state_max: int | None = None
+
+    # Collision avoidance (optional safety layer)
+    avoidance_enabled: bool = False
+    avoidance_eta: float = 100.0
+    avoidance_alert_factor: float = 1.5
 
     # Energy placeholders
     uav_energy_init: float = 1.0

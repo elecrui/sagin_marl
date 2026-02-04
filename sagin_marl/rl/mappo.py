@@ -89,7 +89,7 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
 
     for update in range(total_updates):
         update_start = time.perf_counter()
-        buffer = RolloutBuffer()
+        buffer = RolloutBuffer(capacity=cfg.buffer_size)
         ep_reward = 0.0
         steps_count = 0
         gu_queue_sum = 0.0
@@ -111,7 +111,7 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
             obs_tensor = torch.from_numpy(obs_batch).to(device)
 
             state_np = env.get_global_state()
-            with torch.no_grad():
+            with torch.inference_mode():
                 policy_out = actor.act(obs_tensor)
                 value = critic(torch.from_numpy(state_np).to(device))
 
@@ -157,9 +157,14 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
             if use_direct_logprob:
                 logprobs = policy_out.logprob.detach().cpu().numpy()
             else:
-                with torch.no_grad():
+                with torch.inference_mode():
                     action_vec_exec_t = torch.from_numpy(action_vec_exec).to(device)
-                    logprobs = actor.evaluate_actions(obs_tensor, action_vec_exec_t)[0].detach().cpu().numpy()
+                    logprobs = (
+                        actor.evaluate_actions(obs_tensor, action_vec_exec_t, out=policy_out.dist_out)[0]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
 
             reward_scalar = list(rewards.values())[0]
             done_scalar = list(terms.values())[0] or list(truncs.values())[0]
@@ -206,17 +211,14 @@ def train(env, cfg, log_dir: str, total_updates: int = 50):
         act_flat = act_arr.reshape(T * N, -1)
         logp_flat = logp_arr.reshape(T * N)
         adv_flat = np.repeat(adv, N)
-        ret_flat = np.repeat(rets, N)
 
         # Convert to torch
-        obs_flat_t = torch.tensor(obs_flat, dtype=torch.float32, device=device)
-        act_flat_t = torch.tensor(act_flat, dtype=torch.float32, device=device)
-        logp_flat_t = torch.tensor(logp_flat, dtype=torch.float32, device=device)
-        adv_flat_t = torch.tensor(adv_flat, dtype=torch.float32, device=device)
-        ret_flat_t = torch.tensor(ret_flat, dtype=torch.float32, device=device)
-
-        state_t = torch.tensor(state_arr, dtype=torch.float32, device=device)
-        ret_t = torch.tensor(rets, dtype=torch.float32, device=device)
+        obs_flat_t = torch.from_numpy(obs_flat).to(device)
+        act_flat_t = torch.from_numpy(act_flat).to(device)
+        logp_flat_t = torch.from_numpy(logp_flat).to(device)
+        adv_flat_t = torch.from_numpy(adv_flat).to(device)
+        state_t = torch.from_numpy(state_arr).to(device)
+        ret_t = torch.from_numpy(rets).to(device)
 
         batch_size = len(obs_flat)
         minibatch_size = max(1, batch_size // cfg.num_mini_batch)

@@ -18,6 +18,7 @@ class PolicyOutput:
     accel: torch.Tensor
     bw_logits: torch.Tensor | None = None
     sat_logits: torch.Tensor | None = None
+    dist_out: Dict[str, torch.Tensor] | None = None
 
 
 def flatten_obs(obs: Dict[str, np.ndarray], cfg) -> np.ndarray:
@@ -164,10 +165,17 @@ class ActorNet(nn.Module):
             accel=accel,
             bw_logits=bw_logits,
             sat_logits=sat_logits,
+            dist_out=out,
         )
 
-    def evaluate_actions(self, obs: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        out = self.forward(obs)
+    def evaluate_actions(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        out: Dict[str, torch.Tensor] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if out is None:
+            out = self.forward(obs)
         accel_action, bw_action, sat_action = self._split_actions(action)
 
         mu = out["mu"]

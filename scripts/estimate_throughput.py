@@ -51,9 +51,22 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/phase1.yaml")
     parser.add_argument("--samples", type=int, default=3, help="Number of random resets to average.")
+    parser.add_argument(
+        "--sat_mode",
+        type=str,
+        default="config",
+        choices=["config", "fixed", "topk", "sample"],
+        help="Override satellite selection mode for the estimate.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.sat_mode != "config":
+        if args.sat_mode == "fixed":
+            cfg.fixed_satellite_strategy = True
+        else:
+            cfg.fixed_satellite_strategy = False
+            cfg.sat_select_mode = args.sat_mode
     env = SaginParallelEnv(cfg)
 
     access_caps = []
@@ -89,6 +102,8 @@ def main() -> None:
     print(f"- Compute cap*: {_fmt(compute_cap_eff)} (effective, active sats)")
     print(f"- Active sats:  {_fmt(active_sat)} / {cfg.num_sat}")
     print(f"- Links:        {_fmt(link_count)} (avg UAV-sat links)")
+    mode = "fixed" if cfg.fixed_satellite_strategy else cfg.sat_select_mode
+    print(f"- Sat mode:     {mode} (N_RF={cfg.N_RF})")
     print(f"- Assoc GU:     {_fmt(assoc_count)} / {cfg.num_gu}")
     print(f"- Bottleneck:   {_fmt(bottleneck)}")
     if bottleneck <= 0:

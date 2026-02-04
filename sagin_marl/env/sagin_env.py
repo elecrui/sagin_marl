@@ -109,6 +109,8 @@ class SaginParallelEnv(ParallelEnv):
         self._cached_eta = np.zeros((cfg.num_uav, cfg.users_obs_max), dtype=np.float32)
         self._cached_sat_obs = np.zeros((cfg.num_uav, cfg.sats_obs_max, self.sat_dim), dtype=np.float32)
         self._cached_sat_mask = np.zeros((cfg.num_uav, cfg.sats_obs_max), dtype=np.float32)
+        self._invalidate_step_caches()
+        self._refresh_uav_cache()
 
     def reset(self, seed=None, options=None):
         if seed is not None:
@@ -126,7 +128,7 @@ class SaginParallelEnv(ParallelEnv):
             for agent in self.agents
         }
         _, self._cached_eta = self._compute_access_rates(assoc, self._cached_candidates, dummy_actions)
-        sat_pos, sat_vel = self.orbit.get_states(self.t * self.cfg.tau0)
+        sat_pos, sat_vel = self._get_orbit_states()
         visible = self._visible_sats_sorted(sat_pos)
         self._cache_sat_obs(sat_pos, sat_vel, visible)
         obs = {agent: self._get_obs(idx) for idx, agent in enumerate(self.agents)}
@@ -139,7 +141,7 @@ class SaginParallelEnv(ParallelEnv):
 
         self.prev_association = self.last_association.copy()
         # Satellite states
-        sat_pos, sat_vel = self.orbit.get_states(self.t * cfg.tau0)
+        sat_pos, sat_vel = self._get_orbit_states()
         visible = self._visible_sats_sorted(sat_pos)
 
         # Compute associations and rates
@@ -184,9 +186,19 @@ class SaginParallelEnv(ParallelEnv):
     def _apply_uav_dynamics(self, actions: Dict[str, Dict]) -> None:
         cfg = self.cfg
         accel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
+        d_alert = cfg.avoidance_alert_factor * cfg.d_safe if cfg.avoidance_enabled else 0.0
         for i, agent in enumerate(self.agents):
             a = np.array(actions[agent]["accel"], dtype=np.float32)
             a = np.clip(a, -1.0, 1.0) * cfg.a_max
+            a_rep = np.zeros(2, dtype=np.float32)
+            if cfg.avoidance_enabled and d_alert > 0.0:
+                for j in range(cfg.num_uav):
+                    if i == j:
+                        continue
+                    diff = self.uav_pos[i] - self.uav_pos[j]
+                    dist = float(np.linalg.norm(diff))
+                    if dist < d_alert and dist > 1e-6:
+                        a_rep += cfg.avoidance_eta * (1.0 / dist - 1.0 / d_alert) * (diff / dist)
             if cfg.energy_enabled and cfg.energy_safety_enabled:
                 v_next = self.uav_vel[i] + a * cfg.tau0
                 speed_next = float(np.linalg.norm(v_next))
@@ -204,6 +216,8 @@ class SaginParallelEnv(ParallelEnv):
                             direction = np.zeros(2, dtype=np.float32)
                     target_delta = cfg.uav_opt_speed - cur_speed
                     a = direction * np.clip(target_delta / max(cfg.tau0, 1e-6), -cfg.a_max, cfg.a_max)
+            a = a + a_rep
+            a = np.clip(a, -cfg.a_max, cfg.a_max)
             accel[i] = a
         self.last_exec_accel = accel.copy()
         self.uav_vel = np.clip(self.uav_vel + accel * cfg.tau0, -cfg.v_max, cfg.v_max)
@@ -218,22 +232,81 @@ class SaginParallelEnv(ParallelEnv):
                         self.uav_pos[i, axis] = 2 * cfg.map_size - self.uav_pos[i, axis]
                         self.uav_vel[i, axis] = -self.uav_vel[i, axis]
         self.uav_pos = np.clip(self.uav_pos, 0.0, cfg.map_size)
+        self._refresh_uav_cache()
+
+    def _invalidate_step_caches(self) -> None:
+        self._cached_orbit_t = None
+        self._cached_orbit_pos = None
+        self._cached_orbit_vel = None
+        self._cached_uav_ecef = None
+        self._cached_uav_vel_ecef = None
+        self._cached_uav_neighbor_t = None
+        self._cached_uav_neighbor_order = None
+
+    def _get_orbit_states(self) -> Tuple[np.ndarray, np.ndarray]:
+        if self._cached_orbit_t != self.t or self._cached_orbit_pos is None:
+            self._cached_orbit_pos, self._cached_orbit_vel = self.orbit.get_states(self.t * self.cfg.tau0)
+            self._cached_orbit_t = self.t
+        return self._cached_orbit_pos, self._cached_orbit_vel
+
+    def _refresh_uav_cache(self) -> None:
+        cfg = self.cfg
+        uav_ecef = np.zeros((cfg.num_uav, 3), dtype=np.float32)
+        uav_vel_ecef = np.zeros((cfg.num_uav, 3), dtype=np.float32)
+        for u in range(cfg.num_uav):
+            x = float(self.uav_pos[u, 0])
+            y = float(self.uav_pos[u, 1])
+            lat, lon = self._local_to_latlon(x, y)
+            r = cfg.r_earth + cfg.uav_height
+            cos_lat = math.cos(lat)
+            sin_lat = math.sin(lat)
+            cos_lon = math.cos(lon)
+            sin_lon = math.sin(lon)
+            uav_ecef[u] = np.array(
+                [
+                    r * cos_lat * cos_lon,
+                    r * cos_lat * sin_lon,
+                    r * sin_lat,
+                ],
+                dtype=np.float32,
+            )
+            uav_vel_ecef[u] = self._enu_to_ecef(
+                float(self.uav_vel[u, 0]),
+                float(self.uav_vel[u, 1]),
+                0.0,
+                lat,
+                lon,
+            )
+        self._cached_uav_ecef = uav_ecef
+        self._cached_uav_vel_ecef = uav_vel_ecef
+        self._cached_uav_neighbor_t = None
+        self._cached_uav_neighbor_order = None
+
+    def _ensure_neighbor_cache(self) -> None:
+        if self._cached_uav_neighbor_t == self.t and self._cached_uav_neighbor_order is not None:
+            return
+        diff = self.uav_pos[:, None, :] - self.uav_pos[None, :, :]
+        dist = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(dist, np.inf)
+        self._cached_uav_neighbor_order = np.argsort(dist, axis=1)
+        self._cached_uav_neighbor_t = self.t
 
     def _associate_users(self) -> np.ndarray:
         cfg = self.cfg
         K = cfg.num_gu
-        U = cfg.num_uav
         assoc = np.full((K,), -1, dtype=np.int32)
 
-        for k in range(K):
-            dists = np.linalg.norm(self.uav_pos - self.gu_pos[k], axis=1)
-            d3d = np.sqrt(dists ** 2 + cfg.uav_height ** 2)
-            phi = np.arcsin(cfg.uav_height / (d3d + 1e-9))
-            pl = channel.pathloss_db(d3d, phi, cfg)
-            best = int(np.argmin(pl))
-            if pl[best] <= cfg.pl_threshold_db:
-                assoc[k] = best
+        if K <= 0:
+            return assoc
 
+        diff = self.gu_pos[:, None, :] - self.uav_pos[None, :, :]
+        d2d = np.linalg.norm(diff, axis=2)
+        d3d = np.sqrt(d2d * d2d + cfg.uav_height ** 2)
+        phi = np.arcsin(cfg.uav_height / (d3d + 1e-9))
+        pl = channel.pathloss_db(d3d, phi, cfg)
+        best = np.argmin(pl, axis=1)
+        best_pl = pl[np.arange(K), best]
+        assoc = np.where(best_pl <= cfg.pl_threshold_db, best, -1).astype(np.int32)
         return assoc
 
     def _build_candidate_users(self, assoc: np.ndarray) -> List[List[int]]:
@@ -630,12 +703,14 @@ class SaginParallelEnv(ParallelEnv):
         return visible
 
     def _uav_ecef(self, u: int) -> np.ndarray:
-        cfg = self.cfg
-        return self._local_to_ecef(self.uav_pos[u, 0], self.uav_pos[u, 1], cfg.uav_height)
+        if self._cached_uav_ecef is None:
+            self._refresh_uav_cache()
+        return self._cached_uav_ecef[u]
 
     def _uav_vel_ecef(self, u: int) -> np.ndarray:
-        lat, lon = self._local_to_latlon(self.uav_pos[u, 0], self.uav_pos[u, 1])
-        return self._enu_to_ecef(self.uav_vel[u, 0], self.uav_vel[u, 1], 0.0, lat, lon)
+        if self._cached_uav_vel_ecef is None:
+            self._refresh_uav_cache()
+        return self._cached_uav_vel_ecef[u]
 
     def _doppler(self, u: int, l: int, sat_pos: np.ndarray, sat_vel: np.ndarray) -> float:
         cfg = self.cfg
@@ -714,15 +789,20 @@ class SaginParallelEnv(ParallelEnv):
         # neighbors
         nbrs = np.zeros((cfg.nbrs_obs_max, self.nbr_dim), dtype=np.float32)
         nbrs_mask = np.zeros((cfg.nbrs_obs_max,), dtype=np.float32)
-        others = [i for i in range(cfg.num_uav) if i != u]
-        dists = [(i, np.linalg.norm(self.uav_pos[i] - self.uav_pos[u])) for i in others]
-        dists.sort(key=lambda x: x[1])
-        for i, (idx, _) in enumerate(dists[: cfg.nbrs_obs_max]):
+        self._ensure_neighbor_cache()
+        order = self._cached_uav_neighbor_order[u]
+        count = 0
+        for idx in order:
+            if idx == u:
+                continue
             rel_pos = self.uav_pos[idx] - self.uav_pos[u]
             rel_vel = self.uav_vel[idx] - self.uav_vel[u]
-            nbrs[i, 0:2] = rel_pos / cfg.map_size
-            nbrs[i, 2:4] = rel_vel / cfg.v_max
-            nbrs_mask[i] = 1.0
+            nbrs[count, 0:2] = rel_pos / cfg.map_size
+            nbrs[count, 2:4] = rel_vel / cfg.v_max
+            nbrs_mask[count] = 1.0
+            count += 1
+            if count >= cfg.nbrs_obs_max:
+                break
 
         return {
             "own": own,
@@ -737,7 +817,23 @@ class SaginParallelEnv(ParallelEnv):
     def get_global_state(self) -> np.ndarray:
         cfg = self.cfg
         # Flatten global state for critic
-        sat_pos, sat_vel = self.orbit.get_states(self.t * cfg.tau0)
+        sat_pos, sat_vel = self._get_orbit_states()
+        sat_idx = None
+        if cfg.sat_state_max is not None and cfg.sat_state_max < cfg.num_sat:
+            scores = np.full((cfg.num_sat,), -np.inf, dtype=np.float32)
+            for l in range(cfg.num_sat):
+                max_theta = -1e9
+                for u in range(cfg.num_uav):
+                    theta = self._elevation_angle(u, l, sat_pos)
+                    if theta > max_theta:
+                        max_theta = theta
+                scores[l] = max_theta
+            sat_idx = np.argsort(scores)[::-1][: cfg.sat_state_max]
+            sat_pos = sat_pos[sat_idx]
+            sat_vel = sat_vel[sat_idx]
+            sat_queue = self.sat_queue[sat_idx]
+        else:
+            sat_queue = self.sat_queue
         parts = [
             self.uav_pos.flatten() / cfg.map_size,
             self.uav_vel.flatten() / cfg.v_max,
@@ -747,7 +843,7 @@ class SaginParallelEnv(ParallelEnv):
             self.gu_queue / cfg.queue_max_gu,
             sat_pos.flatten() / (cfg.r_earth + cfg.sat_height),
             sat_vel.flatten() / (cfg.r_earth + cfg.sat_height),
-            self.sat_queue / cfg.queue_max_sat,
+            sat_queue / cfg.queue_max_sat,
             np.array([self.t / max(cfg.T_steps, 1)], dtype=np.float32),
         ]
         return np.concatenate(parts).astype(np.float32)

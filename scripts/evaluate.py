@@ -83,12 +83,40 @@ def _init_eval_tb_layout(writer: SummaryWriter, tag_prefix: str) -> None:
     writer.add_custom_scalars(layout)
 
 
+def _resolve_eval_paths(
+    run_dir: str | None,
+    checkpoint: str | None,
+    out: str | None,
+    tb_dir: str | None,
+    baseline: str,
+) -> tuple[str, str, str]:
+    use_baseline = baseline != "none"
+    if run_dir:
+        checkpoint = checkpoint or os.path.join(run_dir, "actor.pt")
+        if out is None:
+            filename = "eval_baseline.csv" if use_baseline else "eval_trained.csv"
+            out = os.path.join(run_dir, filename)
+    else:
+        checkpoint = checkpoint or "runs/phase1/actor.pt"
+        out = out or "runs/phase1/eval_trained.csv"
+
+    out_dir = os.path.dirname(out) or "."
+    tb_dir = tb_dir or os.path.join(out_dir, "eval_tb")
+    return checkpoint, out, tb_dir
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/phase1.yaml")
-    parser.add_argument("--checkpoint", type=str, default="runs/phase1/actor.pt")
+    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--episodes", type=int, default=20)
-    parser.add_argument("--out", type=str, default="runs/phase1/eval_trained.csv")
+    parser.add_argument("--out", type=str, default=None)
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help="Run directory that contains checkpoints and evaluation outputs.",
+    )
     parser.add_argument(
         "--tb_dir",
         type=str,
@@ -109,6 +137,10 @@ def main():
         help="Use a baseline policy instead of a trained model.",
     )
     args = parser.parse_args()
+
+    args.checkpoint, args.out, args.tb_dir = _resolve_eval_paths(
+        args.run_dir, args.checkpoint, args.out, args.tb_dir, args.baseline
+    )
 
     cfg = load_config(args.config)
     env = SaginParallelEnv(cfg)
