@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from sagin_marl.env.config import load_config
 from sagin_marl.env.sagin_env import SaginParallelEnv
 from sagin_marl.rl.action_assembler import assemble_actions
-from sagin_marl.rl.baselines import zero_accel_policy
+from sagin_marl.rl.baselines import queue_aware_policy, zero_accel_policy
 from sagin_marl.rl.policy import ActorNet, batch_flatten_obs
 from sagin_marl.utils.progress import Progress
 
@@ -29,14 +29,26 @@ def _init_eval_tb_layout(writer: SummaryWriter, tag_prefix: str) -> None:
     layout = {
         "Eval/Reward": {
             "RewardSum": ["Multiline", [t("reward_sum")]],
+            "RewardRaw": ["Multiline", [t("reward_raw")]],
             "Steps": ["Multiline", [t("steps")]],
         },
         "Eval/Queues": {
             "QueueMean": ["Multiline", [t("gu_queue_mean"), t("uav_queue_mean"), t("sat_queue_mean")]],
             "QueueMax": ["Multiline", [t("gu_queue_max"), t("uav_queue_max"), t("sat_queue_max")]],
         },
+        "Eval/Service": {
+            "ServiceNorm": ["Multiline", [t("service_norm")]],
+            "DropNorm": ["Multiline", [t("drop_norm")]],
+        },
+        "Eval/Distance": {
+            "CentroidDist": ["Multiline", [t("centroid_dist_mean")]],
+        },
         "Eval/Drops": {
             "Drops": ["Multiline", [t("gu_drop_sum"), t("uav_drop_sum")]],
+        },
+        "Eval/Association": {
+            "AssocRatio": ["Multiline", [t("assoc_ratio_mean")]],
+            "AssocDist": ["Multiline", [t("assoc_dist_mean")]],
         },
         "Eval/Satellite": {
             "SatFlow": ["Multiline", [t("sat_incoming_sum"), t("sat_processed_sum")]],
@@ -81,6 +93,19 @@ def _init_eval_tb_layout(writer: SummaryWriter, tag_prefix: str) -> None:
         }
 
     writer.add_custom_scalars(layout)
+
+
+def _baseline_actions(
+    baseline: str,
+    obs_list,
+    cfg,
+    num_agents: int,
+):
+    if baseline == "zero_accel":
+        return zero_accel_policy(num_agents), None, None
+    if baseline == "queue_aware":
+        return queue_aware_policy(obs_list, cfg)
+    raise ValueError(f"Unknown baseline: {baseline}")
 
 
 def _resolve_eval_paths(
@@ -133,8 +158,15 @@ def main():
         "--baseline",
         type=str,
         default="none",
-        choices=["none", "zero_accel"],
+        choices=["none", "zero_accel", "queue_aware"],
         help="Use a baseline policy instead of a trained model.",
+    )
+    parser.add_argument(
+        "--hybrid_bw_sat",
+        type=str,
+        default="none",
+        choices=["none", "queue_aware"],
+        help="Use queue_aware for bw/sat while keeping accel from the trained actor.",
     )
     args = parser.parse_args()
 
@@ -146,6 +178,9 @@ def main():
     env = SaginParallelEnv(cfg)
 
     use_baseline = args.baseline != "none"
+    use_hybrid = args.hybrid_bw_sat != "none"
+    if use_hybrid and use_baseline:
+        raise ValueError("Hybrid bw/sat is only valid when evaluating a trained model (baseline=none).")
     out_dir = os.path.dirname(args.out) or "."
     tb_dir = args.tb_dir or os.path.join(out_dir, "eval_tb")
     tb_tag = args.tb_tag or ("eval/baseline" if use_baseline else "eval/trained")
@@ -159,16 +194,21 @@ def main():
         obs, _ = env.reset()
         obs_dim = batch_flatten_obs(list(obs.values()), cfg).shape[1]
         actor = ActorNet(obs_dim, cfg).to(device)
-        actor.load_state_dict(torch.load(args.checkpoint, map_location=device))
+        state = torch.load(args.checkpoint, map_location=device)
+        actor.load_state_dict(state, strict=not use_hybrid)
         actor.eval()
 
     os.makedirs(out_dir, exist_ok=True)
     fieldnames = [
         "episode",
         "reward_sum",
+        "reward_raw",
         "steps",
         "episode_time_sec",
         "steps_per_sec",
+        "service_norm",
+        "drop_norm",
+        "centroid_dist_mean",
         "gu_queue_mean",
         "uav_queue_mean",
         "sat_queue_mean",
@@ -180,6 +220,8 @@ def main():
         "sat_processed_sum",
         "sat_incoming_sum",
         "energy_mean",
+        "assoc_ratio_mean",
+        "assoc_dist_mean",
     ]
     progress = Progress(args.episodes, desc="Eval")
     with open(args.out, "w", newline="", encoding="utf-8") as f:
@@ -201,11 +243,22 @@ def main():
             sat_processed_sum = 0.0
             sat_incoming_sum = 0.0
             energy_mean_sum = 0.0
+            assoc_ratio_sum = 0.0
+            assoc_dist_sum = 0.0
+            reward_raw_sum = 0.0
+            service_norm_sum = 0.0
+            drop_norm_sum = 0.0
+            centroid_dist_sum = 0.0
             ep_start = time.perf_counter()
             while not done:
                 if use_baseline:
-                    accel_actions = zero_accel_policy(len(env.agents))
-                    actions = assemble_actions(cfg, env.agents, accel_actions)
+                    obs_list = list(obs.values())
+                    accel_actions, bw_logits, sat_logits = _baseline_actions(
+                        args.baseline, obs_list, cfg, len(env.agents)
+                    )
+                    actions = assemble_actions(
+                        cfg, env.agents, accel_actions, bw_logits=bw_logits, sat_logits=sat_logits
+                    )
                 else:
                     obs_batch = batch_flatten_obs(list(obs.values()), cfg)
                     obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
@@ -214,6 +267,9 @@ def main():
                     accel_actions = policy_out.accel.cpu().numpy()
                     bw_logits = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
                     sat_logits = policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
+                    if use_hybrid:
+                        obs_list = list(obs.values())
+                        _, bw_logits, sat_logits = queue_aware_policy(obs_list, cfg)
                     actions = assemble_actions(cfg, env.agents, accel_actions, bw_logits=bw_logits, sat_logits=sat_logits)
                 obs, rewards, terms, truncs, _ = env.step(actions)
                 reward_sum += list(rewards.values())[0]
@@ -233,13 +289,38 @@ def main():
                     sat_incoming_sum += float(np.sum(env.last_sat_incoming))
                 if cfg.energy_enabled:
                     energy_mean_sum += float(np.mean(env.uav_energy))
+                parts = getattr(env, "last_reward_parts", None)
+                if parts:
+                    reward_raw_sum += float(parts.get("reward_raw", 0.0))
+                    service_norm_sum += float(parts.get("service_norm", 0.0))
+                    drop_norm_sum += float(parts.get("drop_norm", 0.0))
+                    centroid_dist_sum += float(parts.get("centroid_dist_mean", 0.0))
+                assoc_ratio = 0.0
+                assoc_dist = 0.0
+                if cfg.num_gu > 0 and hasattr(env, "last_association"):
+                    assoc = env.last_association
+                    mask = assoc >= 0
+                    if mask.size > 0:
+                        assoc_ratio = float(np.mean(mask))
+                        if np.any(mask):
+                            gu_pos = env.gu_pos[mask]
+                            u_idx = assoc[mask].astype(np.int32)
+                            uav_pos = env.uav_pos[u_idx]
+                            d2d = np.linalg.norm(gu_pos - uav_pos, axis=1)
+                            assoc_dist = float(np.mean(d2d)) if d2d.size else 0.0
+                assoc_ratio_sum += assoc_ratio
+                assoc_dist_sum += assoc_dist
             ep_time = time.perf_counter() - ep_start
             steps = max(1, steps)
             metrics = {
                 "reward_sum": reward_sum,
+                "reward_raw": reward_raw_sum / steps,
                 "steps": steps,
                 "episode_time_sec": ep_time,
                 "steps_per_sec": steps / max(1e-9, ep_time),
+                "service_norm": service_norm_sum / steps,
+                "drop_norm": drop_norm_sum / steps,
+                "centroid_dist_mean": centroid_dist_sum / steps,
                 "gu_queue_mean": gu_queue_sum / steps,
                 "uav_queue_mean": uav_queue_sum / steps,
                 "sat_queue_mean": sat_queue_sum / steps,
@@ -251,14 +332,20 @@ def main():
                 "sat_processed_sum": sat_processed_sum,
                 "sat_incoming_sum": sat_incoming_sum,
                 "energy_mean": (energy_mean_sum / steps) if cfg.energy_enabled else 0.0,
+                "assoc_ratio_mean": assoc_ratio_sum / steps,
+                "assoc_dist_mean": assoc_dist_sum / steps,
             }
             writer.writerow(
                 [
                     ep,
                     metrics["reward_sum"],
+                    metrics["reward_raw"],
                     metrics["steps"],
                     metrics["episode_time_sec"],
                     metrics["steps_per_sec"],
+                    metrics["service_norm"],
+                    metrics["drop_norm"],
+                    metrics["centroid_dist_mean"],
                     metrics["gu_queue_mean"],
                     metrics["uav_queue_mean"],
                     metrics["sat_queue_mean"],
@@ -270,6 +357,8 @@ def main():
                     metrics["sat_processed_sum"],
                     metrics["sat_incoming_sum"],
                     metrics["energy_mean"],
+                    metrics["assoc_ratio_mean"],
+                    metrics["assoc_dist_mean"],
                 ]
             )
             for key, val in metrics.items():

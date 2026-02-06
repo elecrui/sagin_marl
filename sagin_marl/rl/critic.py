@@ -8,11 +8,13 @@ import torch.nn.functional as F
 class CriticNet(nn.Module):
     def __init__(self, state_dim: int, cfg):
         super().__init__()
+        self.state_norm = nn.LayerNorm(state_dim) if getattr(cfg, "input_norm_enabled", False) else nn.Identity()
         self.fc1 = nn.Linear(state_dim, cfg.critic_hidden)
         self.fc2 = nn.Linear(cfg.critic_hidden, cfg.critic_hidden)
         self.v = nn.Linear(cfg.critic_hidden, 1)
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.fc1(state))
+        x = self.state_norm(state)
+        x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         return self.v(x).squeeze(-1)

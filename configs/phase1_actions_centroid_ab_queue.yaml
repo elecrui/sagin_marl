@@ -1,3 +1,5 @@
+# Queue-focused variant of phase1_actions_centroid_ab.yaml
+# Suggested usage: python scripts/train.py --config configs/phase1_actions_centroid_ab_queue.yaml --updates 60
 seed: 42
 map_size: 3000.0
 tau0: 1.0
@@ -26,7 +28,7 @@ boundary_mode: reflect
 task_arrival_rate: 3.0e5
 task_arrival_poisson: true
 
-gu_tx_power: 0.06
+gu_tx_power: 0.12
 uav_tx_gain: 300.0
 sat_rx_gain: 300.0
 b_acc: 5.0e6
@@ -34,7 +36,7 @@ b_sat_total: 2.0e7
 sat_cpu_freq: 1.0e10
 noise_density: 4.0e-21
 pathloss_mode: prob_los
-pl_threshold_db: 110.0
+pl_threshold_db: 120.0
 
 doppler_observed: true
 doppler_enabled: false
@@ -43,48 +45,39 @@ fading_enabled: false
 interference_enabled: false
 enable_bw_action: true
 fixed_satellite_strategy: false
-sat_select_mode: sample
+sat_select_mode: topk
 N_RF: 2
 
 avoidance_enabled: true
 avoidance_eta: 100.0
 avoidance_alert_factor: 1.5
-
-# queue_aware baseline
-baseline_accel_gain: 2.0
-baseline_assoc_bonus: 0.3
-baseline_sat_queue_penalty: 0.5
-baseline_repulse_gain: 1.0
-baseline_repulse_radius_factor: 1.5
-baseline_energy_low: 0.3
-baseline_energy_weight: 1.0
-
 eta_crash: 5.0
-omega_q: 0.6
-omega_q_gu: 1.0
+
+# Reward weights: focus on total queue backlog
+omega_q: 1.0
+omega_q_gu: 0.0
 omega_q_uav: 0.0
 omega_q_sat: 0.0
-eta_drop: 1.0
-eta_service: 1.5
+eta_drop: 1.5
+eta_service: 0.5
 eta_assoc: 0.2
 eta_q_delta: 0.6
 eta_accel: 0.02
-eta_centroid: 0.6
-centroid_dist_scale: 800.0
-eta_bw_align: 0.3
-eta_sat_score: 0.1
+eta_centroid: 0.0
+centroid_dist_scale: 500.0
+eta_bw_align: 0.1
+eta_sat_score: 0.0
+queue_log_k: 4.0
 
 input_norm_enabled: true
-reward_norm_enabled: true
+reward_norm_enabled: false
 reward_norm_clip: 5.0
 critic_lr: 1.0e-4
 
-buffer_size: 4000
-num_mini_batch: 32
-ppo_epochs: 4
+# Smoke PPO (fast, coarse)
+buffer_size: 300
+num_mini_batch: 3
+ppo_epochs: 1
+entropy_coef: 0.01
 
 early_stop_enabled: false
-early_stop_min_updates: 20
-early_stop_window: 5
-early_stop_patience: 10
-early_stop_min_delta: 0.001

@@ -18,6 +18,7 @@ class RolloutBuffer:
         self._values: Optional[np.ndarray] = None
         self._dones: Optional[np.ndarray] = None
         self._global_states: Optional[np.ndarray] = None
+        self._imitation: Optional[np.ndarray] = None
 
         if self._use_list:
             self.obs: List[np.ndarray] = []
@@ -27,6 +28,7 @@ class RolloutBuffer:
             self.values: List[float] = []
             self.dones: List[bool] = []
             self.global_states: List[np.ndarray] = []
+            self.imitation: List[np.ndarray] = []
 
     def _allocate(
         self,
@@ -34,6 +36,7 @@ class RolloutBuffer:
         actions: np.ndarray,
         logprobs: np.ndarray,
         global_state: np.ndarray,
+        imitation: np.ndarray,
     ) -> None:
         if self.capacity is None:
             return
@@ -45,6 +48,7 @@ class RolloutBuffer:
         self._values = np.empty((cap,), dtype=np.float32)
         self._dones = np.empty((cap,), dtype=np.float32)
         self._global_states = np.empty((cap,) + global_state.shape, dtype=np.float32)
+        self._imitation = np.empty((cap,) + imitation.shape, dtype=np.float32)
 
     def add(
         self,
@@ -55,7 +59,10 @@ class RolloutBuffer:
         value: float,
         done: bool,
         global_state: np.ndarray,
+        imitation: np.ndarray | None = None,
     ) -> None:
+        if imitation is None:
+            imitation = np.zeros_like(actions, dtype=np.float32)
         if self._use_list:
             self.obs.append(obs)
             self.actions.append(actions)
@@ -64,10 +71,11 @@ class RolloutBuffer:
             self.values.append(float(value))
             self.dones.append(bool(done))
             self.global_states.append(global_state)
+            self.imitation.append(imitation)
             return
 
         if self._obs is None:
-            self._allocate(obs, actions, logprobs, global_state)
+            self._allocate(obs, actions, logprobs, global_state, imitation)
 
         if self.capacity is not None and self._idx >= self.capacity:
             raise IndexError("RolloutBuffer capacity exceeded.")
@@ -79,6 +87,7 @@ class RolloutBuffer:
         self._values[self._idx] = float(value)
         self._dones[self._idx] = float(done)
         self._global_states[self._idx] = global_state
+        self._imitation[self._idx] = imitation
         self._idx += 1
 
     def as_arrays(self):
@@ -91,6 +100,7 @@ class RolloutBuffer:
                 np.array(self.values, dtype=np.float32),
                 np.array(self.dones, dtype=np.float32),
                 np.stack(self.global_states, axis=0),
+                np.stack(self.imitation, axis=0),
             )
         end = self._idx
         return (
@@ -101,4 +111,5 @@ class RolloutBuffer:
             self._values[:end],
             self._dones[:end],
             self._global_states[:end],
+            self._imitation[:end],
         )

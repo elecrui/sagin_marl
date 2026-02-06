@@ -67,7 +67,7 @@ def main():
         actions = {}
         for i, agent in enumerate(env.agents):
             act = {
-                "accel": policy_out.action[i].cpu().numpy(),
+                "accel": policy_out.accel[i].cpu().numpy(),
                 "bw_logits": np.zeros(cfg.users_obs_max, dtype=np.float32),
                 "sat_logits": np.zeros(cfg.sats_obs_max, dtype=np.float32),
             }

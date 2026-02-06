@@ -38,6 +38,51 @@ class MetricLogger:
             "Training/Reward": {
                 "EpisodeReward": ["Multiline", ["episode_reward"]],
             },
+            "Training/RewardParts": {
+                "Ratios": [
+                    "Multiline",
+                    [
+                        "r_service_ratio",
+                        "r_drop_ratio",
+                        "r_assoc_ratio",
+                        "r_queue_delta",
+                        "r_dist",
+                        "r_dist_delta",
+                    ],
+                ],
+                "Penalties": [
+                    "Multiline",
+                    [
+                        "r_queue_pen",
+                        "r_fail_penalty",
+                    ],
+                ],
+                "Guidance": [
+                    "Multiline",
+                    [
+                        "r_centroid",
+                        "centroid_dist_mean",
+                        "r_bw_align",
+                        "r_sat_score",
+                    ],
+                ],
+                "Terms": [
+                    "Multiline",
+                    [
+                        "r_term_service",
+                        "r_term_drop",
+                        "r_term_queue",
+                        "r_term_assoc",
+                        "r_term_q_delta",
+                        "r_term_dist",
+                        "r_term_dist_delta",
+                        "r_term_centroid",
+                        "r_term_bw_align",
+                        "r_term_sat_score",
+                        "r_term_energy",
+                    ],
+                ],
+            },
             "Training/Losses": {
                 "Losses": ["Multiline", ["policy_loss", "value_loss", "entropy"]],
             },

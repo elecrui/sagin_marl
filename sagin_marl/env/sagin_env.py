@@ -19,6 +19,8 @@ class SaginParallelEnv(ParallelEnv):
     def __init__(self, cfg: SaginConfig):
         self.cfg = cfg
         self.rng = np.random.default_rng(cfg.seed)
+        self.episode_idx = 0
+        self.global_step = 0
         self.orbit = WalkerDeltaOrbitModel(
             cfg.num_sat,
             cfg.r_earth,
@@ -46,6 +48,62 @@ class SaginParallelEnv(ParallelEnv):
 
         self._build_spaces()
         self._init_state()
+
+    def _compute_centroid_stats(self) -> Tuple[float, float]:
+        cfg = self.cfg
+        centroid_reward = 0.0
+        centroid_dist_mean = 0.0
+        if cfg.num_gu > 0:
+            q_weights = self.gu_queue / max(cfg.queue_max_gu, 1e-9)
+            w_sum = float(np.sum(q_weights))
+            if w_sum > 0:
+                centroid = np.sum(self.gu_pos * q_weights[:, None], axis=0) / w_sum
+                dists = np.linalg.norm(self.uav_pos - centroid[None, :], axis=1)
+                centroid_dist_mean = float(np.mean(dists)) if dists.size else 0.0
+                scale = max(float(getattr(cfg, "centroid_dist_scale", 1.0) or 1.0), 1e-6)
+                centroid_reward = float(np.mean(np.exp(-dists / scale))) if dists.size else 0.0
+        return centroid_reward, centroid_dist_mean
+
+    def _sample_uav_positions(self) -> np.ndarray:
+        cfg = self.cfg
+        if cfg.num_uav <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if not getattr(cfg, "uav_spawn_curriculum_enabled", False):
+            return self.rng.uniform(0.0, cfg.map_size, size=(cfg.num_uav, 2)).astype(np.float32)
+
+        steps = int(getattr(cfg, "uav_spawn_curriculum_steps", 0) or 0)
+        progress = 1.0 if steps <= 0 else min(1.0, float(max(self.episode_idx - 1, 0)) / steps)
+        if progress >= 1.0 and getattr(cfg, "uav_spawn_full_random_final", True):
+            return self.rng.uniform(0.0, cfg.map_size, size=(cfg.num_uav, 2)).astype(np.float32)
+
+        radius_start = max(float(getattr(cfg, "uav_spawn_radius_start", 0.0) or 0.0), 0.0)
+        radius_end = getattr(cfg, "uav_spawn_radius_end", None)
+        if radius_end is None:
+            radius_end = cfg.map_size * 0.5
+        radius_end = max(float(radius_end), radius_start)
+        radius = radius_start + (radius_end - radius_start) * progress
+
+        if cfg.num_gu > 0:
+            center = self.gu_pos[self.rng.integers(0, cfg.num_gu)].astype(np.float32, copy=False)
+        else:
+            center = np.array([cfg.map_size * 0.5, cfg.map_size * 0.5], dtype=np.float32)
+
+        positions = np.zeros((cfg.num_uav, 2), dtype=np.float32)
+        for i in range(cfg.num_uav):
+            pos = None
+            for _ in range(20):
+                ang = self.rng.uniform(0.0, 2.0 * math.pi)
+                r = radius * math.sqrt(self.rng.uniform(0.0, 1.0))
+                candidate = center + np.array([math.cos(ang) * r, math.sin(ang) * r], dtype=np.float32)
+                if 0.0 <= candidate[0] <= cfg.map_size and 0.0 <= candidate[1] <= cfg.map_size:
+                    pos = candidate
+                    break
+            if pos is None:
+                if candidate is None:
+                    candidate = center
+                pos = np.clip(candidate, 0.0, cfg.map_size)
+            positions[i] = pos
+        return positions
 
     def _build_spaces(self) -> None:
         cfg = self.cfg
@@ -89,7 +147,7 @@ class SaginParallelEnv(ParallelEnv):
             cluster_std=80.0,
             rng=self.rng,
         )
-        self.uav_pos = self.rng.uniform(0.0, cfg.map_size, size=(cfg.num_uav, 2))
+        self.uav_pos = self._sample_uav_positions()
         self.uav_vel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
         self.uav_energy = np.full((cfg.num_uav,), cfg.uav_energy_init, dtype=np.float32)
         self.last_exec_accel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
@@ -97,14 +155,60 @@ class SaginParallelEnv(ParallelEnv):
         self.gu_queue = np.zeros((cfg.num_gu,), dtype=np.float32)
         self.uav_queue = np.zeros((cfg.num_uav,), dtype=np.float32)
         self.sat_queue = np.zeros((cfg.num_sat,), dtype=np.float32)
+        init_frac = float(getattr(cfg, "queue_init_frac", 0.0) or 0.0)
+        if init_frac > 0.0 and cfg.num_gu > 0:
+            init_frac = float(np.clip(init_frac, 0.0, 1.0))
+            self.gu_queue = np.full((cfg.num_gu,), cfg.queue_max_gu * init_frac, dtype=np.float32)
+        self.prev_queue_sum = 0.0
+        self.prev_queue_sum_active = 0.0
+        self.prev_centroid_dist_mean = self._compute_centroid_stats()[1]
+        self.prev_d_min = 0.0
+        self.last_gu_outflow = np.zeros((cfg.num_gu,), dtype=np.float32)
+        self.last_gu_arrival = np.zeros((cfg.num_gu,), dtype=np.float32)
         self.gu_drop = np.zeros((cfg.num_gu,), dtype=np.float32)
         self.uav_drop = np.zeros((cfg.num_uav,), dtype=np.float32)
         self.last_energy_cost = np.zeros((cfg.num_uav,), dtype=np.float32)
         self.last_sat_processed = np.zeros((cfg.num_sat,), dtype=np.float32)
         self.last_sat_incoming = np.zeros((cfg.num_sat,), dtype=np.float32)
+        self.last_bw_align = 0.0
+        self.last_sat_score = 0.0
+        self.last_arrival_rate = float(cfg.task_arrival_rate)
 
         self.last_association = np.full((cfg.num_gu,), -1, dtype=np.int32)
         self.prev_association = self.last_association.copy()
+        self.last_reward_parts = {
+            "service_ratio": 0.0,
+            "drop_ratio": 0.0,
+            "queue_pen": 0.0,
+            "queue_pen_gu": 0.0,
+            "queue_pen_uav": 0.0,
+            "queue_pen_sat": 0.0,
+            "queue_topk": 0.0,
+            "assoc_ratio": 0.0,
+            "queue_delta": 0.0,
+            "centroid_reward": 0.0,
+            "centroid_dist_mean": 0.0,
+            "bw_align": 0.0,
+            "sat_score": 0.0,
+            "dist_reward": 0.0,
+            "dist_delta": 0.0,
+            "energy_reward": 0.0,
+            "fail_penalty": 0.0,
+            "term_service": 0.0,
+            "term_drop": 0.0,
+            "term_queue": 0.0,
+            "term_topk": 0.0,
+            "term_assoc": 0.0,
+            "term_q_delta": 0.0,
+            "term_centroid": 0.0,
+            "term_bw_align": 0.0,
+            "term_sat_score": 0.0,
+            "term_dist": 0.0,
+            "term_dist_delta": 0.0,
+            "term_energy": 0.0,
+            "term_accel": 0.0,
+            "reward_raw": 0.0,
+        }
         self._cached_candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
         self._cached_eta = np.zeros((cfg.num_uav, cfg.users_obs_max), dtype=np.float32)
         self._cached_sat_obs = np.zeros((cfg.num_uav, cfg.sats_obs_max, self.sat_dim), dtype=np.float32)
@@ -115,6 +219,7 @@ class SaginParallelEnv(ParallelEnv):
     def reset(self, seed=None, options=None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
+        self.episode_idx = int(getattr(self, "episode_idx", 0)) + 1
         self._init_state()
         # Prime candidates and eta for initial observations
         assoc = self._associate_users()
@@ -137,6 +242,17 @@ class SaginParallelEnv(ParallelEnv):
 
     def step(self, actions: Dict[str, Dict]):
         cfg = self.cfg
+        self.global_step = int(getattr(self, "global_step", 0)) + 1
+        self.prev_queue_sum = float(
+            np.sum(self.gu_queue) + np.sum(self.uav_queue) + np.sum(self.sat_queue)
+        )
+        self.prev_queue_sum_active = float(np.sum(self.gu_queue) + np.sum(self.uav_queue))
+        self.prev_centroid_dist_mean = self._compute_centroid_stats()[1]
+        if cfg.num_gu > 0:
+            d2d = np.linalg.norm(self.gu_pos - self.uav_pos[:, None, :], axis=2)
+            self.prev_d_min = float(np.min(d2d))
+        else:
+            self.prev_d_min = 0.0
         self._apply_uav_dynamics(actions)
 
         self.prev_association = self.last_association.copy()
@@ -312,16 +428,43 @@ class SaginParallelEnv(ParallelEnv):
     def _build_candidate_users(self, assoc: np.ndarray) -> List[List[int]]:
         cfg = self.cfg
         candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
-        for k, u in enumerate(assoc):
-            if u >= 0:
-                candidates[u].append(k)
+        mode = str(getattr(cfg, "candidate_mode", "assoc")).lower()
+        max_keep = int(getattr(cfg, "candidate_k", 0) or 0)
+        if max_keep <= 0:
+            max_keep = cfg.users_obs_max
+        else:
+            max_keep = min(max_keep, cfg.users_obs_max)
+        if mode == "assoc":
+            for k, u in enumerate(assoc):
+                if u >= 0:
+                    candidates[u].append(k)
 
-        # Limit to users_obs_max by queue (descending)
+            # Limit to max_keep by queue (descending)
+            for u in range(cfg.num_uav):
+                if len(candidates[u]) > max_keep:
+                    qs = [(k, self.gu_queue[k]) for k in candidates[u]]
+                    qs.sort(key=lambda x: x[1], reverse=True)
+                    candidates[u] = [k for k, _ in qs[: max_keep]]
+            return candidates
+
+        if cfg.num_gu <= 0:
+            return candidates
+
+        use_radius = mode in ("radius", "dist", "distance")
+        radius = getattr(cfg, "candidate_radius", None)
         for u in range(cfg.num_uav):
-            if len(candidates[u]) > cfg.users_obs_max:
-                qs = [(k, self.gu_queue[k]) for k in candidates[u]]
-                qs.sort(key=lambda x: x[1], reverse=True)
-                candidates[u] = [k for k, _ in qs[: cfg.users_obs_max]]
+            d2d = np.linalg.norm(self.gu_pos - self.uav_pos[u], axis=1)
+            if use_radius and radius is not None and radius > 0:
+                idx = np.nonzero(d2d <= radius)[0]
+                if idx.size > 0:
+                    idx = idx[np.argsort(d2d[idx])]
+                else:
+                    idx = np.argsort(d2d)
+            else:
+                idx = np.argsort(d2d)
+            if idx.size > max_keep:
+                idx = idx[: max_keep]
+            candidates[u] = idx.tolist()
         return candidates
 
     def _compute_access_rates(
@@ -333,25 +476,39 @@ class SaginParallelEnv(ParallelEnv):
         cfg = self.cfg
         rates = np.zeros((cfg.num_gu,), dtype=np.float32)
         eta = np.zeros((cfg.num_uav, cfg.users_obs_max), dtype=np.float32)
+        bw_align_sum = 0.0
+        bw_align_count = 0
 
         for u in range(cfg.num_uav):
             cand = candidates[u]
             if not cand:
                 continue
+            cand_idx = np.asarray(cand, dtype=np.int32)
+            assoc_mask = assoc[cand_idx] == u
             if cfg.enable_bw_action:
                 logits = np.array(actions[self.agents[u]]["bw_logits"], dtype=np.float32)
                 mask = np.zeros((cfg.users_obs_max,), dtype=np.float32)
-                mask[: len(cand)] = 1.0
+                mask[: len(cand)] = assoc_mask.astype(np.float32)
                 logits = logits[: cfg.users_obs_max]
                 logits = logits - np.max(logits)
                 weights = np.exp(logits) * mask
-                weights = weights / (np.sum(weights) + 1e-9)
-                betas = weights[: len(cand)]
+                denom = np.sum(weights)
+                if denom > 0:
+                    weights = weights / denom
+                    betas = weights[: len(cand)]
+                else:
+                    betas = np.zeros((len(cand),), dtype=np.float32)
             else:
-                betas = np.full((len(cand),), 1.0 / len(cand), dtype=np.float32)
+                if np.any(assoc_mask):
+                    betas = np.zeros((len(cand),), dtype=np.float32)
+                    betas[assoc_mask] = 1.0 / float(np.sum(assoc_mask))
+                else:
+                    betas = np.zeros((len(cand),), dtype=np.float32)
 
+            se_values = None
             # Preserve exact behavior when interference/fading are enabled (RNG order matters)
             if cfg.interference_enabled or cfg.fading_enabled:
+                se_values = np.zeros((len(cand),), dtype=np.float32)
                 for i, k in enumerate(cand):
                     d2d = np.linalg.norm(self.uav_pos[u] - self.gu_pos[k])
                     d3d = math.sqrt(d2d**2 + cfg.uav_height**2)
@@ -376,37 +533,68 @@ class SaginParallelEnv(ParallelEnv):
 
                     snr = channel.snr_linear(cfg.gu_tx_power, gain, cfg.noise_density, cfg.b_acc, interference)
                     se = channel.spectral_efficiency(snr)
-                    rate = betas[i] * cfg.b_acc * se
-                    rates[k] = rate
+                    if assoc_mask[i]:
+                        rate = betas[i] * cfg.b_acc * se
+                        rates[k] = rate
                     eta[u, i] = se
-                continue
+                    se_values[i] = se
+            else:
+                gu_pos = self.gu_pos[cand_idx]
+                uav_pos = self.uav_pos[u]
+                d2d = np.linalg.norm(gu_pos - uav_pos, axis=1)
+                d3d = np.sqrt(d2d * d2d + self._uav_height_sq)
+                phi = np.arcsin(cfg.uav_height / (d3d + 1e-9))
+                pl = channel.pathloss_db(d3d, phi, cfg)
+                gain = 10 ** (-pl / 10.0)
 
-            cand_idx = np.asarray(cand, dtype=np.int32)
-            gu_pos = self.gu_pos[cand_idx]
-            uav_pos = self.uav_pos[u]
-            d2d = np.linalg.norm(gu_pos - uav_pos, axis=1)
-            d3d = np.sqrt(d2d * d2d + self._uav_height_sq)
-            phi = np.arcsin(cfg.uav_height / (d3d + 1e-9))
-            pl = channel.pathloss_db(d3d, phi, cfg)
-            gain = 10 ** (-pl / 10.0)
+                snr = channel.snr_linear(cfg.gu_tx_power, gain, cfg.noise_density, cfg.b_acc)
+                se = channel.spectral_efficiency(snr)
+                rate = betas * cfg.b_acc * se
+                if np.any(assoc_mask):
+                    rates[cand_idx[assoc_mask]] = rate[assoc_mask].astype(np.float32)
+                eta[u, : len(cand)] = se.astype(np.float32)
+                se_values = se.astype(np.float32)
 
-            snr = channel.snr_linear(cfg.gu_tx_power, gain, cfg.noise_density, cfg.b_acc)
-            se = channel.spectral_efficiency(snr)
-            rate = betas * cfg.b_acc * se
-            rates[cand_idx] = rate.astype(np.float32)
-            eta[u, : len(cand)] = se.astype(np.float32)
+            if cfg.enable_bw_action and se_values is not None and len(cand) > 0:
+                if np.any(assoc_mask):
+                    active_idx = cand_idx[assoc_mask]
+                    q_norm = self.gu_queue[active_idx] / max(cfg.queue_max_gu, 1e-9)
+                    assoc_bonus = 0.2
+                    prev_mask = (self.prev_association[active_idx] == u).astype(np.float32)
+                    target_weights = q_norm * (0.5 + se_values[assoc_mask]) * (1.0 + assoc_bonus * prev_mask)
+                    denom = float(np.sum(target_weights))
+                    if denom > 0:
+                        target = target_weights / denom
+                        betas_sel = betas[assoc_mask]
+                        l1 = float(np.sum(np.abs(betas_sel - target)))
+                        align = 1.0 - 0.5 * l1
+                        bw_align_sum += align
+                        bw_align_count += 1
 
+        self.last_bw_align = bw_align_sum / max(1, bw_align_count)
         return rates, eta
 
     def _update_gu_queues(self, access_rates: np.ndarray, assoc: np.ndarray) -> np.ndarray:
         cfg = self.cfg
+        arrival_rate = float(cfg.task_arrival_rate)
+        ramp_steps = int(getattr(cfg, "arrival_ramp_steps", 0) or 0)
+        if ramp_steps > 0:
+            start = float(getattr(cfg, "arrival_ramp_start", 0.0) or 0.0)
+            start = float(np.clip(start, 0.0, 1.0))
+            use_global = bool(getattr(cfg, "arrival_ramp_use_global", False))
+            t_ref = self.global_step if use_global else self.t
+            progress = min(1.0, float(t_ref) / max(ramp_steps, 1))
+            arrival_rate = arrival_rate * (start + (1.0 - start) * progress)
+        self.last_arrival_rate = arrival_rate
         if cfg.task_arrival_poisson:
-            arrival = self.rng.poisson(cfg.task_arrival_rate, size=cfg.num_gu).astype(np.float32)
+            arrival = self.rng.poisson(arrival_rate, size=cfg.num_gu).astype(np.float32)
         else:
-            arrival = np.full((cfg.num_gu,), cfg.task_arrival_rate, dtype=np.float32)
+            arrival = np.full((cfg.num_gu,), arrival_rate, dtype=np.float32)
+        self.last_gu_arrival = arrival.astype(np.float32)
         q_before = self.gu_queue + arrival
         outflow = np.minimum(q_before, access_rates * cfg.tau0)
         q_after = q_before - outflow
+        self.last_gu_outflow = outflow.astype(np.float32)
         self.gu_drop = np.maximum(q_after - cfg.queue_max_gu, 0.0).astype(np.float32)
         q_after = np.minimum(q_after, cfg.queue_max_gu)
         self.gu_queue = q_after.astype(np.float32)
@@ -478,6 +666,8 @@ class SaginParallelEnv(ParallelEnv):
         U = cfg.num_uav
         L = cfg.num_sat
         rate_matrix = np.zeros((U, L), dtype=np.float32)
+        sat_score_sum = 0.0
+        sat_score_count = 0
 
         # count connections per sat
         counts = np.zeros((L,), dtype=np.int32)
@@ -511,7 +701,11 @@ class SaginParallelEnv(ParallelEnv):
                 if cfg.doppler_enabled and abs(nu) > cfg.nu_max:
                     rate = 0.0
                 rate_matrix[u, l] = rate
+                sat_score = float(se) - 0.5 * float(self.sat_queue[l] / max(cfg.queue_max_sat, 1e-9))
+                sat_score_sum += sat_score
+                sat_score_count += 1
 
+        self.last_sat_score = sat_score_sum / max(1, sat_score_count)
         return rate_matrix, counts
 
     def _update_uav_queues(self, gu_outflow: np.ndarray, rate_matrix: np.ndarray) -> np.ndarray:
@@ -563,37 +757,192 @@ class SaginParallelEnv(ParallelEnv):
 
     def _compute_reward(self) -> float:
         cfg = self.cfg
-        r_delay = -(
-            np.mean(self.gu_queue / (cfg.queue_max_gu + 1e-9))
-            + np.mean(self.uav_queue / (cfg.queue_max_uav + 1e-9))
-            + np.mean(self.sat_queue / (cfg.queue_max_sat + 1e-9))
-        )
-
         if cfg.energy_enabled:
             p_max = self._energy_scale()
             r_energy = -np.mean(self.last_energy_cost / (p_max + 1e-9))
         else:
             r_energy = 0.0
 
-        # Overflow penalty
-        drop_scale = cfg.queue_max_uav + 1e-9
-        drop_penalty = -cfg.eta_drop * (
-            float(np.sum(self.gu_drop)) / drop_scale + float(np.sum(self.uav_drop)) / drop_scale
+        q_gu = float(np.sum(self.gu_queue))
+        q_uav = float(np.sum(self.uav_queue))
+        q_sat = float(np.sum(self.sat_queue))
+        q_total = q_gu + q_uav + q_sat
+        q_max_total = float(
+            cfg.num_gu * cfg.queue_max_gu
+            + cfg.num_uav * cfg.queue_max_uav
+            + cfg.num_sat * cfg.queue_max_sat
         )
+        q_max_total = max(q_max_total, 1e-9)
+        q_gu_max = max(float(cfg.num_gu * cfg.queue_max_gu), 1e-9)
+        q_uav_max = max(float(cfg.num_uav * cfg.queue_max_uav), 1e-9)
+        q_sat_max = max(float(cfg.num_sat * cfg.queue_max_sat), 1e-9)
+        q_gu_norm = q_gu / q_gu_max
+        q_uav_norm = q_uav / q_uav_max
+        q_sat_norm = q_sat / q_sat_max
+        q_total_active = q_gu + q_uav
+        q_max_active = max(q_gu_max + q_uav_max, 1e-9)
 
-        # Congestion penalty based on soft thresholds
-        th_gu = cfg.queue_th_gu if cfg.queue_th_gu is not None else cfg.queue_max_gu * cfg.queue_th_gu_frac
-        th_uav = cfg.queue_th_uav if cfg.queue_th_uav is not None else cfg.queue_max_uav * cfg.queue_th_uav_frac
-        cong_gu = np.maximum(self.gu_queue - th_gu, 0.0) / (th_gu + 1e-9)
-        cong_uav = np.maximum(self.uav_queue - th_uav, 0.0) / (th_uav + 1e-9)
-        cong_penalty = -cfg.eta_cong * (float(np.mean(cong_gu)) + float(np.mean(cong_uav)))
+        def _queue_smooth(q_norm: float) -> float:
+            if getattr(cfg, "queue_log_k", 0.0) > 0:
+                k = float(cfg.queue_log_k)
+                return math.log1p(k * q_norm) / math.log1p(k)
+            return math.log1p(q_norm)
 
-        reward = cfg.omega_q * r_delay + cfg.omega_e * r_energy + drop_penalty + cong_penalty
+        queue_gu = _queue_smooth(q_gu_norm)
+        queue_uav = _queue_smooth(q_uav_norm)
+        queue_sat = _queue_smooth(q_sat_norm)
+        w_gu = float(getattr(cfg, "omega_q_gu", 0.0) or 0.0)
+        w_uav = float(getattr(cfg, "omega_q_uav", 0.0) or 0.0)
+        w_sat = float(getattr(cfg, "omega_q_sat", 0.0) or 0.0)
+        if abs(w_gu) + abs(w_uav) + abs(w_sat) < 1e-9:
+            queue_term = _queue_smooth(q_total / q_max_total)
+        else:
+            queue_term = w_gu * queue_gu + w_uav * queue_uav + w_sat * queue_sat
 
+        queue_topk = 0.0
+        topk_k = int(getattr(cfg, "queue_topk_k", 0) or 0)
+        use_topk_local = bool(getattr(cfg, "queue_topk_local", False))
+        if cfg.num_gu > 0 and topk_k > 0:
+            def _queue_smooth_vec(q_norm: np.ndarray) -> np.ndarray:
+                if getattr(cfg, "queue_log_k", 0.0) > 0:
+                    klog = float(cfg.queue_log_k)
+                    return np.log1p(klog * q_norm) / math.log1p(klog)
+                return np.log1p(q_norm)
+
+            if use_topk_local:
+                per_uav = []
+                for cand in self._cached_candidates:
+                    if not cand:
+                        continue
+                    q_norm = self.gu_queue[cand] / max(cfg.queue_max_gu, 1e-9)
+                    q_s = _queue_smooth_vec(q_norm)
+                    k = min(topk_k, q_s.size)
+                    if k > 0:
+                        topk_vals = np.partition(q_s, -k)[-k:]
+                        per_uav.append(float(np.mean(topk_vals)))
+                if per_uav:
+                    queue_topk = float(np.mean(per_uav))
+            else:
+                q_norm = self.gu_queue / max(cfg.queue_max_gu, 1e-9)
+                q_s = _queue_smooth_vec(q_norm)
+                topk_k = min(topk_k, q_s.size)
+                if topk_k > 0:
+                    topk_vals = np.partition(q_s, -topk_k)[-topk_k:]
+                    queue_topk = float(np.mean(topk_vals))
+
+        arrival_sum = float(np.sum(self.last_gu_arrival))
+        outflow_sum = float(np.sum(self.last_gu_outflow))
+        drop_sum = float(np.sum(self.gu_drop)) + float(np.sum(self.uav_drop))
+        service_ratio = outflow_sum / (arrival_sum + 1e-9)
+        drop_ratio = drop_sum / (arrival_sum + 1e-9)
+        service_ratio = float(np.clip(service_ratio, 0.0, 1.0))
+        drop_ratio = float(np.clip(drop_ratio, 0.0, 1.0))
+        if cfg.num_gu > 0:
+            assoc_ratio = float(np.mean(self.last_association >= 0))
+        else:
+            assoc_ratio = 0.0
+
+        arrival_scale = max(float(cfg.task_arrival_rate) * float(cfg.num_gu) * float(cfg.tau0), 1e-9)
+        service_norm = outflow_sum / arrival_scale
+        drop_norm = drop_sum / arrival_scale
+
+        use_active = bool(getattr(cfg, "queue_delta_use_active", False))
+        if use_active:
+            prev_sum = float(getattr(self, "prev_queue_sum_active", self.prev_queue_sum))
+            cur_sum = q_total_active
+            q_delta_den = q_max_active
+        else:
+            prev_sum = self.prev_queue_sum
+            cur_sum = q_total
+            q_delta_den = q_max_total
+        queue_delta = (prev_sum - cur_sum) / max(q_delta_den, 1e-9)
+        queue_delta = float(np.clip(queue_delta, -1.0, 1.0))
+
+        if cfg.a_max > 0:
+            accel_norm2 = float(np.mean(np.sum(self.last_exec_accel**2, axis=1))) / (cfg.a_max**2 + 1e-9)
+        else:
+            accel_norm2 = 0.0
+
+        centroid_reward, centroid_dist_mean = self._compute_centroid_stats()
+        scale = max(float(getattr(cfg, "centroid_dist_scale", 1.0) or 1.0), 1e-6)
+
+        dist_delta = (self.prev_centroid_dist_mean - centroid_dist_mean) / scale
+        dist_delta = float(np.clip(dist_delta, -1.0, 1.0))
+
+        bw_align = float(getattr(self, "last_bw_align", 0.0))
+        sat_score = float(getattr(self, "last_sat_score", 0.0))
+
+        base_reward = (
+            cfg.eta_service * service_norm
+            - cfg.eta_drop * drop_norm
+            - cfg.omega_q * queue_term
+            - cfg.omega_q_topk * queue_topk
+            + cfg.eta_assoc * assoc_ratio
+        )
+        shape_reward = (
+            cfg.eta_q_delta * queue_delta
+            - cfg.eta_accel * accel_norm2
+            + cfg.eta_centroid * centroid_reward
+            + cfg.eta_bw_align * bw_align
+            + cfg.eta_sat_score * sat_score
+            + cfg.eta_dist_delta * dist_delta
+        )
+        energy_term = cfg.omega_e * r_energy
+        raw_reward = base_reward + shape_reward + energy_term
+
+        fail_penalty = 0.0
         if self._check_collision():
-            reward -= cfg.eta_crash
+            fail_penalty -= cfg.eta_crash
         if cfg.energy_enabled and np.any(self.uav_energy <= 0.0):
-            reward -= cfg.eta_batt
+            fail_penalty -= cfg.eta_batt
+
+        reward = raw_reward
+        if bool(getattr(cfg, "reward_tanh_enabled", True)):
+            reward = math.tanh(raw_reward)
+        reward = reward + fail_penalty
+
+        dist_reward = 0.0
+
+        self.last_reward_parts = {
+            "service_ratio": service_ratio,
+            "drop_ratio": drop_ratio,
+            "arrival_sum": arrival_sum,
+            "outflow_sum": outflow_sum,
+            "service_norm": service_norm,
+            "drop_norm": drop_norm,
+            "queue_pen": queue_term,
+            "queue_pen_gu": queue_gu,
+            "queue_pen_uav": queue_uav,
+            "queue_pen_sat": queue_sat,
+            "queue_topk": queue_topk,
+            "queue_total": q_total,
+            "queue_total_active": q_total_active,
+            "assoc_ratio": assoc_ratio,
+            "queue_delta": queue_delta,
+            "dist_reward": dist_reward,
+            "dist_delta": dist_delta,
+            "centroid_reward": centroid_reward,
+            "centroid_dist_mean": centroid_dist_mean,
+            "bw_align": bw_align,
+            "sat_score": sat_score,
+            "energy_reward": float(r_energy),
+            "fail_penalty": fail_penalty,
+            "arrival_rate_eff": float(getattr(self, "last_arrival_rate", cfg.task_arrival_rate)),
+            "term_service": cfg.eta_service * service_norm,
+            "term_drop": -cfg.eta_drop * drop_norm,
+            "term_queue": -cfg.omega_q * queue_term,
+            "term_topk": -cfg.omega_q_topk * queue_topk,
+            "term_assoc": cfg.eta_assoc * assoc_ratio,
+            "term_q_delta": cfg.eta_q_delta * queue_delta,
+            "term_dist": cfg.eta_dist * dist_reward,
+            "term_dist_delta": cfg.eta_dist_delta * dist_delta,
+            "term_centroid": cfg.eta_centroid * centroid_reward,
+            "term_bw_align": cfg.eta_bw_align * bw_align,
+            "term_sat_score": cfg.eta_sat_score * sat_score,
+            "term_energy": cfg.omega_e * float(r_energy),
+            "term_accel": -cfg.eta_accel * accel_norm2,
+            "reward_raw": raw_reward,
+        }
         return float(reward)
 
     def _check_collision(self) -> bool:

@@ -1,0 +1,74 @@
+seed: 42
+map_size: 1500.0
+tau0: 1.0
+T_steps: 100
+
+num_uav: 1
+num_gu: 2
+num_sat: 1
+walker_num_planes: 1
+sat_state_max: 1
+
+users_obs_max: 2
+sats_obs_max: 1
+visible_sats_max: 1
+visible_sats_min: 1
+nbrs_obs_max: 1
+
+uav_height: 100.0
+sat_height: 500000.0
+theta_min_deg: 0.0
+v_max: 30.0
+a_max: 5.0
+d_safe: 20.0
+boundary_mode: reflect
+
+task_arrival_rate: 2.0e5
+task_arrival_poisson: false
+
+gu_tx_power: 0.3
+uav_tx_gain: 300.0
+sat_rx_gain: 300.0
+b_acc: 8.0e6
+b_sat_total: 2.0e7
+sat_cpu_freq: 1.0e10
+noise_density: 4.0e-21
+pathloss_mode: prob_los
+pl_threshold_db: 120.0
+
+doppler_observed: false
+doppler_enabled: false
+energy_enabled: false
+fading_enabled: false
+interference_enabled: false
+enable_bw_action: false
+fixed_satellite_strategy: true
+sat_select_mode: topk
+N_RF: 1
+
+avoidance_enabled: false
+avoidance_eta: 0.0
+avoidance_alert_factor: 1.0
+eta_crash: 1.0
+omega_q: 0.2
+eta_drop: 0.2
+eta_service: 0.5
+eta_assoc: 0.1
+eta_q_delta: 0.1
+eta_dist: 2.0
+eta_dist_delta: 1.0
+dist_reward_scale: 300.0
+queue_log_k: 0.0
+
+# Light PPO for quick sanity
+buffer_size: 500
+num_mini_batch: 4
+ppo_epochs: 2
+
+reward_norm_enabled: true
+reward_norm_clip: 5.0
+kl_coef: 1.0
+target_kl: 0.02
+kl_stop: true
+
+early_stop_enabled: false

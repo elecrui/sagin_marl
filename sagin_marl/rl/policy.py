@@ -41,7 +41,7 @@ def batch_flatten_obs(obs_batch: Dict[str, np.ndarray], cfg) -> np.ndarray:
 
 
 def atanh(x: torch.Tensor) -> torch.Tensor:
-    eps = 1e-6
+    eps = 1e-4
     x = torch.clamp(x, -1 + eps, 1 - eps)
     return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
@@ -51,9 +51,11 @@ def _squash_action(z: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
 
 
 def _logprob_from_squashed(dist: Normal, action: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    eps = 1e-4
     t = action / scale
+    t = torch.clamp(t, -1 + eps, 1 - eps)
     z = atanh(t)
-    logprob = dist.log_prob(z) - torch.log(1 - t.pow(2) + 1e-6)
+    logprob = dist.log_prob(z) - torch.log(1 - t.pow(2) + eps)
     if scale != 1.0:
         logprob = logprob - math.log(scale)
     return logprob.sum(-1)
@@ -68,6 +70,7 @@ class ActorNet(nn.Module):
         self.bw_scale = float(cfg.bw_logit_scale)
         self.sat_scale = float(cfg.sat_logit_scale)
 
+        self.obs_norm = nn.LayerNorm(obs_dim) if getattr(cfg, "input_norm_enabled", False) else nn.Identity()
         self.fc1 = nn.Linear(obs_dim, cfg.actor_hidden)
         self.fc2 = nn.Linear(cfg.actor_hidden, cfg.actor_hidden)
 
@@ -89,7 +92,8 @@ class ActorNet(nn.Module):
             self.sat_log_std = None
 
     def forward(self, obs: torch.Tensor) -> Dict[str, torch.Tensor]:
-        x = F.relu(self.fc1(obs))
+        x = self.obs_norm(obs)
+        x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         mu = self.mu_head(x)
         out = {"mu": mu}
@@ -130,7 +134,8 @@ class ActorNet(nn.Module):
     def act(self, obs: torch.Tensor, deterministic: bool = False) -> PolicyOutput:
         out = self.forward(obs)
         mu = out["mu"]
-        std = torch.exp(self.log_std)
+        log_std = torch.clamp(self.log_std, -5.0, 2.0)
+        std = torch.exp(log_std)
         dist = Normal(mu, std)
         if deterministic:
             z = mu
@@ -144,7 +149,8 @@ class ActorNet(nn.Module):
 
         if self.enable_bw:
             bw_mu = out["bw_mu"]
-            bw_std = torch.exp(self.bw_log_std)
+            bw_log_std = torch.clamp(self.bw_log_std, -5.0, 2.0)
+            bw_std = torch.exp(bw_log_std)
             bw_dist = Normal(bw_mu, bw_std)
             z_bw = bw_mu if deterministic else bw_dist.rsample()
             bw_logits = _squash_action(z_bw, scale=self.bw_scale)
@@ -152,7 +158,8 @@ class ActorNet(nn.Module):
 
         if self.enable_sat:
             sat_mu = out["sat_mu"]
-            sat_std = torch.exp(self.sat_log_std)
+            sat_log_std = torch.clamp(self.sat_log_std, -5.0, 2.0)
+            sat_std = torch.exp(sat_log_std)
             sat_dist = Normal(sat_mu, sat_std)
             z_sat = sat_mu if deterministic else sat_dist.rsample()
             sat_logits = _squash_action(z_sat, scale=self.sat_scale)
@@ -174,26 +181,38 @@ class ActorNet(nn.Module):
         action: torch.Tensor,
         out: Dict[str, torch.Tensor] | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not torch.isfinite(obs).all():
+            print("NaN/Inf detected in obs passed to evaluate_actions")
+            raise ValueError("obs contains NaN/Inf")
         if out is None:
             out = self.forward(obs)
         accel_action, bw_action, sat_action = self._split_actions(action)
 
         mu = out["mu"]
-        std = torch.exp(self.log_std)
+        if not torch.isfinite(mu).all():
+            print("NaN/Inf detected in actor mu inside evaluate_actions")
+            raise ValueError("actor mu contains NaN/Inf")
+        log_std = torch.clamp(self.log_std, -5.0, 2.0)
+        std = torch.exp(log_std)
+        if not torch.isfinite(std).all():
+            print("NaN/Inf detected in actor std inside evaluate_actions")
+            raise ValueError("actor std contains NaN/Inf")
         dist = Normal(mu, std)
         logprob = _logprob_from_squashed(dist, accel_action, scale=1.0)
         entropy = dist.entropy().sum(-1)
 
         if self.enable_bw and bw_action is not None:
             bw_mu = out["bw_mu"]
-            bw_std = torch.exp(self.bw_log_std)
+            bw_log_std = torch.clamp(self.bw_log_std, -5.0, 2.0)
+            bw_std = torch.exp(bw_log_std)
             bw_dist = Normal(bw_mu, bw_std)
             logprob = logprob + _logprob_from_squashed(bw_dist, bw_action, scale=self.bw_scale)
             entropy = entropy + bw_dist.entropy().sum(-1)
 
         if self.enable_sat and sat_action is not None:
             sat_mu = out["sat_mu"]
-            sat_std = torch.exp(self.sat_log_std)
+            sat_log_std = torch.clamp(self.sat_log_std, -5.0, 2.0)
+            sat_std = torch.exp(sat_log_std)
             sat_dist = Normal(sat_mu, sat_std)
             logprob = logprob + _logprob_from_squashed(sat_dist, sat_action, scale=self.sat_scale)
             entropy = entropy + sat_dist.entropy().sum(-1)

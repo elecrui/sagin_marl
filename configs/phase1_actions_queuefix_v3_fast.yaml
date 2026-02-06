@@ -1,7 +1,9 @@
+# Queue-aligned v3 fast: quick trend check with lighter PPO and shorter episodes.
+# Suggested usage: python scripts/train.py --config configs/phase1_actions_queuefix_v3_fast.yaml --updates 60
 seed: 42
 map_size: 3000.0
 tau0: 1.0
-T_steps: 200
+T_steps: 100
 
 num_uav: 3
 num_gu: 20
@@ -23,18 +25,23 @@ a_max: 5.0
 d_safe: 20.0
 boundary_mode: reflect
 
-task_arrival_rate: 3.0e5
+# Arrivals (lower base + global ramp)
+task_arrival_rate: 7.0e4
 task_arrival_poisson: true
+arrival_ramp_steps: 3000
+arrival_ramp_start: 0.2
+arrival_ramp_use_global: true
+queue_init_frac: 0.1
 
-gu_tx_power: 0.06
+gu_tx_power: 0.18
 uav_tx_gain: 300.0
 sat_rx_gain: 300.0
-b_acc: 5.0e6
+b_acc: 1.0e7
 b_sat_total: 2.0e7
 sat_cpu_freq: 1.0e10
 noise_density: 4.0e-21
 pathloss_mode: prob_los
-pl_threshold_db: 110.0
+pl_threshold_db: 135.0
 
 doppler_observed: true
 doppler_enabled: false
@@ -49,42 +56,32 @@ N_RF: 2
 avoidance_enabled: true
 avoidance_eta: 100.0
 avoidance_alert_factor: 1.5
-
-# queue_aware baseline
-baseline_accel_gain: 2.0
-baseline_assoc_bonus: 0.3
-baseline_sat_queue_penalty: 0.5
-baseline_repulse_gain: 1.0
-baseline_repulse_radius_factor: 1.5
-baseline_energy_low: 0.3
-baseline_energy_weight: 1.0
-
 eta_crash: 5.0
-omega_q: 0.6
+omega_q: 1.0
 omega_q_gu: 1.0
 omega_q_uav: 0.0
 omega_q_sat: 0.0
-eta_drop: 1.0
-eta_service: 1.5
-eta_assoc: 0.2
-eta_q_delta: 0.6
+eta_drop: 1.2
+eta_service: 1.3
+eta_assoc: 0.1
+eta_q_delta: 1.0
 eta_accel: 0.02
-eta_centroid: 0.6
+eta_centroid: 0.2
 centroid_dist_scale: 800.0
-eta_bw_align: 0.3
-eta_sat_score: 0.1
+eta_bw_align: 0.2
+eta_sat_score: 0.05
+queue_log_k: 6.0
+queue_delta_use_active: true
 
 input_norm_enabled: true
 reward_norm_enabled: true
 reward_norm_clip: 5.0
 critic_lr: 1.0e-4
 
-buffer_size: 4000
-num_mini_batch: 32
-ppo_epochs: 4
+# Faster PPO
+buffer_size: 400
+num_mini_batch: 4
+ppo_epochs: 1
+entropy_coef: 0.005
 
 early_stop_enabled: false
-early_stop_min_updates: 20
-early_stop_window: 5
-early_stop_patience: 10
-early_stop_min_delta: 0.001
