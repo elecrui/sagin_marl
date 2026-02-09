@@ -14,13 +14,45 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 @dataclass
+class AblationConfig:
+    """Toggle non-standard mechanisms for ablation studies."""
+
+    # RL-side additions over vanilla PPO
+    use_imitation_loss: bool = False
+    use_heuristic_mask: bool = False
+    use_magic_decay: bool = False  # Reserved for future schedules.
+
+    # Environment curricula / safety layers
+    use_curriculum_spawn: bool = False
+    use_arrival_ramp: bool = False
+    use_avoidance_layer: bool = False
+    use_energy_safety_layer: bool = False
+
+    # Reward shaping components
+    use_throughput_reward: bool = True
+    use_potential_shaping: bool = True
+    use_legacy_queue_penalty: bool = False
+    use_queue_log_smoothing: bool = False
+    use_queue_topk_penalty: bool = False
+    use_queue_delta_reward: bool = False
+    use_active_queue_delta: bool = False
+    use_centroid_reward: bool = False
+    use_bw_align_reward: bool = False
+    use_sat_score_reward: bool = False
+    use_dist_delta_reward: bool = False
+    use_energy_reward: bool = False
+    use_reward_tanh: bool = False
+
+
+@dataclass
 class SaginConfig:
     seed: int = 42
+    ablation: AblationConfig = field(default_factory=AblationConfig)
 
     # Map and timing
     map_size: float = 1000.0
     tau0: float = 1.0
-    T_steps: int = 200
+    T_steps: int = 400
 
     # Entity counts
     num_uav: int = 3
@@ -64,10 +96,16 @@ class SaginConfig:
     queue_max_uav: float = 1e7
     queue_max_sat: float = 5e7
     queue_init_frac: float = 0.0
+    queue_init_uav_frac: float = 0.0
+    queue_init_sat_frac: float = 0.0
 
     # Task arrivals
     task_arrival_rate: float = 2e5  # bits per slot (mean)
     task_arrival_poisson: bool = True
+    traffic_level: int = 2
+    traffic_level_nav_ratio: float = 0.08
+    traffic_level_easy_ratio: float = 0.5
+    traffic_level_hard_ratio: float = 1.0
     arrival_ramp_steps: int = 0
     arrival_ramp_start: float = 0.0
     arrival_ramp_use_global: bool = False
@@ -166,6 +204,8 @@ class SaginConfig:
     eta_service: float = 1.5
     eta_assoc: float = 0.2
     eta_q_delta: float = 0.6
+    eta_throughput_access: float = 1.0
+    eta_throughput_backhaul: float = 1.0
     eta_accel: float = 0.02
     eta_centroid: float = 0.6
     centroid_dist_scale: float = 800.0
@@ -198,9 +238,11 @@ class SaginConfig:
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
-    reward_norm_enabled: bool = False
+    reward_norm_enabled: bool = True
     reward_norm_clip: float = 10.0
-    reward_tanh_enabled: bool = True
+    reward_tanh_enabled: bool = False
+    lr_decay_enabled: bool = True
+    lr_final_factor: float = 0.1
     input_norm_enabled: bool = True
     kl_coef: float = 0.0
     target_kl: float = 0.0
@@ -210,9 +252,18 @@ class SaginConfig:
     imitation_accel: bool = True
     imitation_bw: bool = True
     imitation_sat: bool = False
+    train_accel: bool | None = None
+    train_bw: bool | None = None
+    train_sat: bool | None = None
+    train_shared_backbone: bool = True
+    exec_accel_source: str = "policy"  # policy|teacher|heuristic|zero
+    exec_bw_source: str = "policy"  # policy|teacher|heuristic|zero
+    exec_sat_source: str = "policy"  # policy|teacher|heuristic|zero
+    exec_teacher_actor_path: str | None = None
+    exec_teacher_deterministic: bool = True
 
-    actor_hidden: int = 128
-    critic_hidden: int = 128
+    actor_hidden: int = 256
+    critic_hidden: int = 256
 
     # Early stopping (convergence)
     early_stop_enabled: bool = True
@@ -226,6 +277,16 @@ class SaginConfig:
         return math.radians(self.theta_min_deg)
 
 
+def ablation_flag(cfg: SaginConfig, name: str, fallback_attr: str | None = None, default: bool = False) -> bool:
+    """Read an ablation flag with optional legacy fallback."""
+    ablation = getattr(cfg, "ablation", None)
+    if ablation is not None and hasattr(ablation, name):
+        return bool(getattr(ablation, name))
+    if fallback_attr and hasattr(cfg, fallback_attr):
+        return bool(getattr(cfg, fallback_attr))
+    return bool(default)
+
+
 def load_config(path: str) -> SaginConfig:
     if yaml is None:
         raise RuntimeError("PyYAML is required to load config files.")
@@ -235,17 +296,36 @@ def load_config(path: str) -> SaginConfig:
 
 
 def update_config(cfg: SaginConfig, updates: Dict[str, Any]) -> SaginConfig:
-    for key, value in updates.items():
-        if not hasattr(cfg, key):
-            raise KeyError(f"Unknown config key: {key}")
-        current = getattr(cfg, key)
-        value = _coerce_scalar(value, current)
-        if isinstance(current, bool) and isinstance(value, int):
-            value = bool(value)
-        if isinstance(current, int) and isinstance(value, float) and value.is_integer():
-            value = int(value)
-        setattr(cfg, key, value)
+    if not isinstance(updates, dict):
+        raise TypeError("Config updates must be a mapping.")
+    _apply_updates(cfg, updates)
     return cfg
+
+
+def _apply_updates(target: Any, updates: Dict[str, Any], path: str = "") -> None:
+    for key, value in updates.items():
+        k = "ablation" if key == "ablation_flags" else key
+        full_key = f"{path}.{k}" if path else k
+        if not hasattr(target, k):
+            raise KeyError(f"Unknown config key: {full_key}")
+
+        current = getattr(target, k)
+        if _is_dataclass_instance(current):
+            if not isinstance(value, dict):
+                raise TypeError(f"Expected mapping for nested config key: {full_key}")
+            _apply_updates(current, value, full_key)
+            continue
+
+        coerced = _coerce_scalar(value, current)
+        if isinstance(current, bool) and isinstance(coerced, int):
+            coerced = bool(coerced)
+        if isinstance(current, int) and isinstance(coerced, float) and coerced.is_integer():
+            coerced = int(coerced)
+        setattr(target, k, coerced)
+
+
+def _is_dataclass_instance(obj: Any) -> bool:
+    return hasattr(obj, "__dataclass_fields__")
 
 
 def _coerce_scalar(value: Any, current: Any) -> Any:

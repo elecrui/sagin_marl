@@ -7,7 +7,7 @@ import numpy as np
 import gymnasium as gym
 from pettingzoo.utils.env import ParallelEnv
 
-from .config import SaginConfig
+from .config import SaginConfig, ablation_flag
 from .topology import thomas_cluster_process
 from .orbit import WalkerDeltaOrbitModel
 from . import channel
@@ -47,6 +47,11 @@ class SaginParallelEnv(ParallelEnv):
         self.nbr_dim = 4
 
         self._build_spaces()
+        self.effective_task_arrival_rate = float(cfg.task_arrival_rate)
+        raw_level = getattr(cfg, "traffic_level", 2)
+        self.traffic_level = int(2 if raw_level is None else raw_level)
+        self.traffic_level_ratio = 1.0
+        self._set_effective_task_arrival_rate()
         self._init_state()
 
     def _compute_centroid_stats(self) -> Tuple[float, float]:
@@ -56,19 +61,50 @@ class SaginParallelEnv(ParallelEnv):
         if cfg.num_gu > 0:
             q_weights = self.gu_queue / max(cfg.queue_max_gu, 1e-9)
             w_sum = float(np.sum(q_weights))
-            if w_sum > 0:
-                centroid = np.sum(self.gu_pos * q_weights[:, None], axis=0) / w_sum
-                dists = np.linalg.norm(self.uav_pos - centroid[None, :], axis=1)
-                centroid_dist_mean = float(np.mean(dists)) if dists.size else 0.0
-                scale = max(float(getattr(cfg, "centroid_dist_scale", 1.0) or 1.0), 1e-6)
-                centroid_reward = float(np.mean(np.exp(-dists / scale))) if dists.size else 0.0
+            if w_sum <= 1e-9:
+                # Keep a dense navigation signal even when all queues are empty.
+                weights = np.full((cfg.num_gu,), 1.0 / max(cfg.num_gu, 1), dtype=np.float32)
+            else:
+                weights = (q_weights / (w_sum + 1e-9)).astype(np.float32, copy=False)
+            centroid = np.sum(self.gu_pos * weights[:, None], axis=0)
+            dists = np.linalg.norm(self.uav_pos - centroid[None, :], axis=1)
+            centroid_dist_mean = float(np.mean(dists)) if dists.size else 0.0
+            scale = max(float(getattr(cfg, "centroid_dist_scale", 1.0) or 1.0), 1e-6)
+            centroid_reward = float(np.mean(np.exp(-dists / scale))) if dists.size else 0.0
         return centroid_reward, centroid_dist_mean
+
+    def _traffic_level_ratio(self) -> float:
+        cfg = self.cfg
+        raw_level = getattr(cfg, "traffic_level", 2)
+        level = int(2 if raw_level is None else raw_level)
+        level = int(np.clip(level, 0, 2))
+        if level == 0:
+            ratio = float(getattr(cfg, "traffic_level_nav_ratio", 0.08) or 0.08)
+        elif level == 1:
+            ratio = float(getattr(cfg, "traffic_level_easy_ratio", 0.5) or 0.5)
+        else:
+            ratio = float(getattr(cfg, "traffic_level_hard_ratio", 1.0) or 1.0)
+        self.traffic_level = level
+        self.traffic_level_ratio = float(np.clip(ratio, 0.0, 1.0))
+        return self.traffic_level_ratio
+
+    def _set_effective_task_arrival_rate(self) -> None:
+        cfg = self.cfg
+        base_rate = max(float(getattr(cfg, "task_arrival_rate", 0.0) or 0.0), 0.0)
+        ratio = self._traffic_level_ratio()
+        self.effective_task_arrival_rate = base_rate * ratio
 
     def _sample_uav_positions(self) -> np.ndarray:
         cfg = self.cfg
         if cfg.num_uav <= 0:
             return np.zeros((0, 2), dtype=np.float32)
-        if not getattr(cfg, "uav_spawn_curriculum_enabled", False):
+        use_curriculum_spawn = ablation_flag(
+            cfg,
+            "use_curriculum_spawn",
+            fallback_attr="uav_spawn_curriculum_enabled",
+            default=False,
+        )
+        if not use_curriculum_spawn:
             return self.rng.uniform(0.0, cfg.map_size, size=(cfg.num_uav, 2)).astype(np.float32)
 
         steps = int(getattr(cfg, "uav_spawn_curriculum_steps", 0) or 0)
@@ -155,10 +191,18 @@ class SaginParallelEnv(ParallelEnv):
         self.gu_queue = np.zeros((cfg.num_gu,), dtype=np.float32)
         self.uav_queue = np.zeros((cfg.num_uav,), dtype=np.float32)
         self.sat_queue = np.zeros((cfg.num_sat,), dtype=np.float32)
-        init_frac = float(getattr(cfg, "queue_init_frac", 0.0) or 0.0)
-        if init_frac > 0.0 and cfg.num_gu > 0:
-            init_frac = float(np.clip(init_frac, 0.0, 1.0))
-            self.gu_queue = np.full((cfg.num_gu,), cfg.queue_max_gu * init_frac, dtype=np.float32)
+        init_gu_frac = float(getattr(cfg, "queue_init_frac", 0.0) or 0.0)
+        init_uav_frac = float(getattr(cfg, "queue_init_uav_frac", 0.0) or 0.0)
+        init_sat_frac = float(getattr(cfg, "queue_init_sat_frac", 0.0) or 0.0)
+        if init_gu_frac > 0.0 and cfg.num_gu > 0:
+            init_gu_frac = float(np.clip(init_gu_frac, 0.0, 1.0))
+            self.gu_queue = np.full((cfg.num_gu,), cfg.queue_max_gu * init_gu_frac, dtype=np.float32)
+        if init_uav_frac > 0.0 and cfg.num_uav > 0:
+            init_uav_frac = float(np.clip(init_uav_frac, 0.0, 1.0))
+            self.uav_queue = np.full((cfg.num_uav,), cfg.queue_max_uav * init_uav_frac, dtype=np.float32)
+        if init_sat_frac > 0.0 and cfg.num_sat > 0:
+            init_sat_frac = float(np.clip(init_sat_frac, 0.0, 1.0))
+            self.sat_queue = np.full((cfg.num_sat,), cfg.queue_max_sat * init_sat_frac, dtype=np.float32)
         self.prev_queue_sum = 0.0
         self.prev_queue_sum_active = 0.0
         self.prev_centroid_dist_mean = self._compute_centroid_stats()[1]
@@ -172,7 +216,7 @@ class SaginParallelEnv(ParallelEnv):
         self.last_sat_incoming = np.zeros((cfg.num_sat,), dtype=np.float32)
         self.last_bw_align = 0.0
         self.last_sat_score = 0.0
-        self.last_arrival_rate = float(cfg.task_arrival_rate)
+        self.last_arrival_rate = float(getattr(self, "effective_task_arrival_rate", cfg.task_arrival_rate))
 
         self.last_association = np.full((cfg.num_gu,), -1, dtype=np.int32)
         self.prev_association = self.last_association.copy()
@@ -220,6 +264,7 @@ class SaginParallelEnv(ParallelEnv):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self.episode_idx = int(getattr(self, "episode_idx", 0)) + 1
+        self._set_effective_task_arrival_rate()
         self._init_state()
         # Prime candidates and eta for initial observations
         assoc = self._associate_users()
@@ -237,7 +282,14 @@ class SaginParallelEnv(ParallelEnv):
         visible = self._visible_sats_sorted(sat_pos)
         self._cache_sat_obs(sat_pos, sat_vel, visible)
         obs = {agent: self._get_obs(idx) for idx, agent in enumerate(self.agents)}
-        infos = {agent: {} for agent in self.agents}
+        infos = {
+            agent: {
+                "traffic_level": self.traffic_level,
+                "traffic_level_ratio": self.traffic_level_ratio,
+                "effective_task_arrival_rate": self.effective_task_arrival_rate,
+            }
+            for agent in self.agents
+        }
         return obs, infos
 
     def step(self, actions: Dict[str, Dict]):
@@ -302,12 +354,24 @@ class SaginParallelEnv(ParallelEnv):
     def _apply_uav_dynamics(self, actions: Dict[str, Dict]) -> None:
         cfg = self.cfg
         accel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
-        d_alert = cfg.avoidance_alert_factor * cfg.d_safe if cfg.avoidance_enabled else 0.0
+        use_avoidance = ablation_flag(
+            cfg,
+            "use_avoidance_layer",
+            fallback_attr="avoidance_enabled",
+            default=False,
+        )
+        use_energy_safety = ablation_flag(
+            cfg,
+            "use_energy_safety_layer",
+            fallback_attr="energy_safety_enabled",
+            default=False,
+        )
+        d_alert = cfg.avoidance_alert_factor * cfg.d_safe if use_avoidance else 0.0
         for i, agent in enumerate(self.agents):
             a = np.array(actions[agent]["accel"], dtype=np.float32)
             a = np.clip(a, -1.0, 1.0) * cfg.a_max
             a_rep = np.zeros(2, dtype=np.float32)
-            if cfg.avoidance_enabled and d_alert > 0.0:
+            if use_avoidance and d_alert > 0.0:
                 for j in range(cfg.num_uav):
                     if i == j:
                         continue
@@ -315,7 +379,7 @@ class SaginParallelEnv(ParallelEnv):
                     dist = float(np.linalg.norm(diff))
                     if dist < d_alert and dist > 1e-6:
                         a_rep += cfg.avoidance_eta * (1.0 / dist - 1.0 / d_alert) * (diff / dist)
-            if cfg.energy_enabled and cfg.energy_safety_enabled:
+            if cfg.energy_enabled and use_energy_safety:
                 v_next = self.uav_vel[i] + a * cfg.tau0
                 speed_next = float(np.linalg.norm(v_next))
                 est_energy = self.uav_energy[i] - float(self._fly_power(speed_next)) * cfg.tau0
@@ -576,9 +640,11 @@ class SaginParallelEnv(ParallelEnv):
 
     def _update_gu_queues(self, access_rates: np.ndarray, assoc: np.ndarray) -> np.ndarray:
         cfg = self.cfg
-        arrival_rate = float(cfg.task_arrival_rate)
+        arrival_rate = float(getattr(self, "effective_task_arrival_rate", cfg.task_arrival_rate))
         ramp_steps = int(getattr(cfg, "arrival_ramp_steps", 0) or 0)
-        if ramp_steps > 0:
+        legacy_arrival_ramp = ramp_steps > 0
+        use_arrival_ramp = ablation_flag(cfg, "use_arrival_ramp", default=False) or legacy_arrival_ramp
+        if use_arrival_ramp and ramp_steps > 0:
             start = float(getattr(cfg, "arrival_ramp_start", 0.0) or 0.0)
             start = float(np.clip(start, 0.0, 1.0))
             use_global = bool(getattr(cfg, "arrival_ramp_use_global", False))
@@ -757,6 +823,21 @@ class SaginParallelEnv(ParallelEnv):
 
     def _compute_reward(self) -> float:
         cfg = self.cfg
+        # Core dense reward for queueing: service/drop + absolute backlog + backlog trend.
+        use_active_queue_delta = ablation_flag(
+            cfg,
+            "use_active_queue_delta",
+            fallback_attr="queue_delta_use_active",
+            default=False,
+        )
+        use_energy_reward = ablation_flag(cfg, "use_energy_reward", default=cfg.energy_enabled)
+        use_reward_tanh = ablation_flag(
+            cfg,
+            "use_reward_tanh",
+            fallback_attr="reward_tanh_enabled",
+            default=False,
+        )
+
         if cfg.energy_enabled:
             p_max = self._energy_scale()
             r_energy = -np.mean(self.last_energy_cost / (p_max + 1e-9))
@@ -783,10 +864,11 @@ class SaginParallelEnv(ParallelEnv):
         q_max_active = max(q_gu_max + q_uav_max, 1e-9)
 
         def _queue_smooth(q_norm: float) -> float:
-            if getattr(cfg, "queue_log_k", 0.0) > 0:
-                k = float(cfg.queue_log_k)
+            q_norm = float(np.clip(q_norm, 0.0, 1.0))
+            k = float(getattr(cfg, "queue_log_k", 0.0) or 0.0)
+            if k > 0:
                 return math.log1p(k * q_norm) / math.log1p(k)
-            return math.log1p(q_norm)
+            return q_norm
 
         queue_gu = _queue_smooth(q_gu_norm)
         queue_uav = _queue_smooth(q_uav_norm)
@@ -794,44 +876,16 @@ class SaginParallelEnv(ParallelEnv):
         w_gu = float(getattr(cfg, "omega_q_gu", 0.0) or 0.0)
         w_uav = float(getattr(cfg, "omega_q_uav", 0.0) or 0.0)
         w_sat = float(getattr(cfg, "omega_q_sat", 0.0) or 0.0)
-        if abs(w_gu) + abs(w_uav) + abs(w_sat) < 1e-9:
-            queue_term = _queue_smooth(q_total / q_max_total)
+        w_sum = abs(w_gu) + abs(w_uav) + abs(w_sat)
+        if w_sum < 1e-9:
+            q_ref = (q_total_active / q_max_active) if use_active_queue_delta else (q_total / q_max_total)
+            queue_term = _queue_smooth(q_ref)
         else:
-            queue_term = w_gu * queue_gu + w_uav * queue_uav + w_sat * queue_sat
-
-        queue_topk = 0.0
-        topk_k = int(getattr(cfg, "queue_topk_k", 0) or 0)
-        use_topk_local = bool(getattr(cfg, "queue_topk_local", False))
-        if cfg.num_gu > 0 and topk_k > 0:
-            def _queue_smooth_vec(q_norm: np.ndarray) -> np.ndarray:
-                if getattr(cfg, "queue_log_k", 0.0) > 0:
-                    klog = float(cfg.queue_log_k)
-                    return np.log1p(klog * q_norm) / math.log1p(klog)
-                return np.log1p(q_norm)
-
-            if use_topk_local:
-                per_uav = []
-                for cand in self._cached_candidates:
-                    if not cand:
-                        continue
-                    q_norm = self.gu_queue[cand] / max(cfg.queue_max_gu, 1e-9)
-                    q_s = _queue_smooth_vec(q_norm)
-                    k = min(topk_k, q_s.size)
-                    if k > 0:
-                        topk_vals = np.partition(q_s, -k)[-k:]
-                        per_uav.append(float(np.mean(topk_vals)))
-                if per_uav:
-                    queue_topk = float(np.mean(per_uav))
-            else:
-                q_norm = self.gu_queue / max(cfg.queue_max_gu, 1e-9)
-                q_s = _queue_smooth_vec(q_norm)
-                topk_k = min(topk_k, q_s.size)
-                if topk_k > 0:
-                    topk_vals = np.partition(q_s, -topk_k)[-topk_k:]
-                    queue_topk = float(np.mean(topk_vals))
+            queue_term = (w_gu * queue_gu + w_uav * queue_uav + w_sat * queue_sat) / w_sum
 
         arrival_sum = float(np.sum(self.last_gu_arrival))
         outflow_sum = float(np.sum(self.last_gu_outflow))
+        backhaul_sum = float(np.sum(getattr(self, "last_sat_incoming", 0.0)))
         drop_sum = float(np.sum(self.gu_drop)) + float(np.sum(self.uav_drop))
         service_ratio = outflow_sum / (arrival_sum + 1e-9)
         drop_ratio = drop_sum / (arrival_sum + 1e-9)
@@ -842,12 +896,14 @@ class SaginParallelEnv(ParallelEnv):
         else:
             assoc_ratio = 0.0
 
-        arrival_scale = max(float(cfg.task_arrival_rate) * float(cfg.num_gu) * float(cfg.tau0), 1e-9)
+        arrival_ref = float(getattr(self, "effective_task_arrival_rate", cfg.task_arrival_rate))
+        arrival_scale = max(arrival_ref * float(cfg.num_gu) * float(cfg.tau0), 1e-9)
         service_norm = outflow_sum / arrival_scale
         drop_norm = drop_sum / arrival_scale
+        throughput_access_norm = outflow_sum / arrival_scale
+        throughput_backhaul_norm = backhaul_sum / arrival_scale
 
-        use_active = bool(getattr(cfg, "queue_delta_use_active", False))
-        if use_active:
+        if use_active_queue_delta:
             prev_sum = float(getattr(self, "prev_queue_sum_active", self.prev_queue_sum))
             cur_sum = q_total_active
             q_delta_den = q_max_active
@@ -864,31 +920,26 @@ class SaginParallelEnv(ParallelEnv):
             accel_norm2 = 0.0
 
         centroid_reward, centroid_dist_mean = self._compute_centroid_stats()
-        scale = max(float(getattr(cfg, "centroid_dist_scale", 1.0) or 1.0), 1e-6)
-
-        dist_delta = (self.prev_centroid_dist_mean - centroid_dist_mean) / scale
-        dist_delta = float(np.clip(dist_delta, -1.0, 1.0))
-
+        dist_delta = 0.0
+        queue_topk = 0.0
         bw_align = float(getattr(self, "last_bw_align", 0.0))
         sat_score = float(getattr(self, "last_sat_score", 0.0))
-
-        base_reward = (
-            cfg.eta_service * service_norm
-            - cfg.eta_drop * drop_norm
-            - cfg.omega_q * queue_term
-            - cfg.omega_q_topk * queue_topk
-            + cfg.eta_assoc * assoc_ratio
+        term_service = cfg.eta_service * service_norm
+        term_drop = -cfg.eta_drop * drop_norm
+        term_queue = -cfg.omega_q * queue_term
+        term_q_delta = cfg.eta_q_delta * queue_delta
+        term_centroid = cfg.eta_centroid * centroid_reward
+        term_accel = -cfg.eta_accel * accel_norm2
+        term_energy = cfg.omega_e * r_energy if use_energy_reward else 0.0
+        raw_reward = (
+            term_service
+            + term_drop
+            + term_queue
+            + term_q_delta
+            + term_centroid
+            + term_accel
+            + term_energy
         )
-        shape_reward = (
-            cfg.eta_q_delta * queue_delta
-            - cfg.eta_accel * accel_norm2
-            + cfg.eta_centroid * centroid_reward
-            + cfg.eta_bw_align * bw_align
-            + cfg.eta_sat_score * sat_score
-            + cfg.eta_dist_delta * dist_delta
-        )
-        energy_term = cfg.omega_e * r_energy
-        raw_reward = base_reward + shape_reward + energy_term
 
         fail_penalty = 0.0
         if self._check_collision():
@@ -897,19 +948,30 @@ class SaginParallelEnv(ParallelEnv):
             fail_penalty -= cfg.eta_batt
 
         reward = raw_reward
-        if bool(getattr(cfg, "reward_tanh_enabled", True)):
+        if use_reward_tanh:
             reward = math.tanh(raw_reward)
         reward = reward + fail_penalty
 
         dist_reward = 0.0
+        term_topk = 0.0
+        term_assoc = 0.0
+        term_throughput_access = 0.0
+        term_throughput_backhaul = 0.0
+        term_dist = 0.0
+        term_dist_delta = 0.0
+        term_bw_align = 0.0
+        term_sat_score = 0.0
 
         self.last_reward_parts = {
             "service_ratio": service_ratio,
             "drop_ratio": drop_ratio,
             "arrival_sum": arrival_sum,
             "outflow_sum": outflow_sum,
+            "backhaul_sum": backhaul_sum,
             "service_norm": service_norm,
             "drop_norm": drop_norm,
+            "throughput_access_norm": throughput_access_norm,
+            "throughput_backhaul_norm": throughput_backhaul_norm,
             "queue_pen": queue_term,
             "queue_pen_gu": queue_gu,
             "queue_pen_uav": queue_uav,
@@ -928,19 +990,21 @@ class SaginParallelEnv(ParallelEnv):
             "energy_reward": float(r_energy),
             "fail_penalty": fail_penalty,
             "arrival_rate_eff": float(getattr(self, "last_arrival_rate", cfg.task_arrival_rate)),
-            "term_service": cfg.eta_service * service_norm,
-            "term_drop": -cfg.eta_drop * drop_norm,
-            "term_queue": -cfg.omega_q * queue_term,
-            "term_topk": -cfg.omega_q_topk * queue_topk,
-            "term_assoc": cfg.eta_assoc * assoc_ratio,
-            "term_q_delta": cfg.eta_q_delta * queue_delta,
-            "term_dist": cfg.eta_dist * dist_reward,
-            "term_dist_delta": cfg.eta_dist_delta * dist_delta,
-            "term_centroid": cfg.eta_centroid * centroid_reward,
-            "term_bw_align": cfg.eta_bw_align * bw_align,
-            "term_sat_score": cfg.eta_sat_score * sat_score,
-            "term_energy": cfg.omega_e * float(r_energy),
-            "term_accel": -cfg.eta_accel * accel_norm2,
+            "term_service": term_service,
+            "term_drop": term_drop,
+            "term_queue": term_queue,
+            "term_topk": term_topk,
+            "term_assoc": term_assoc,
+            "term_q_delta": term_q_delta,
+            "term_throughput_access": term_throughput_access,
+            "term_throughput_backhaul": term_throughput_backhaul,
+            "term_dist": term_dist,
+            "term_dist_delta": term_dist_delta,
+            "term_centroid": term_centroid,
+            "term_bw_align": term_bw_align,
+            "term_sat_score": term_sat_score,
+            "term_energy": float(term_energy),
+            "term_accel": term_accel,
             "reward_raw": raw_reward,
         }
         return float(reward)

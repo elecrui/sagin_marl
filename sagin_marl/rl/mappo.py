@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ from .buffer import RolloutBuffer
 from .action_assembler import assemble_actions
 from .baselines import queue_aware_policy
 from ..utils.normalization import RunningMeanStd
+from ..env.config import ablation_flag
 
 
 def compute_gae(rewards, values, dones, gamma, lam):
@@ -31,6 +32,96 @@ def compute_gae(rewards, values, dones, gamma, lam):
     return advantages, returns
 
 
+def _single_env_step_stats(env) -> Dict[str, object]:
+    def _safe_mean(arr) -> float:
+        a = np.asarray(arr, dtype=np.float32)
+        return float(np.mean(a)) if a.size > 0 else 0.0
+
+    def _safe_max(arr) -> float:
+        a = np.asarray(arr, dtype=np.float32)
+        return float(np.max(a)) if a.size > 0 else 0.0
+
+    def _safe_sum(arr) -> float:
+        a = np.asarray(arr, dtype=np.float32)
+        return float(np.sum(a)) if a.size > 0 else 0.0
+
+    num_agents = len(getattr(env, "agents", []))
+    default_accel = np.zeros((num_agents, 2), dtype=np.float32)
+    parts = getattr(env, "last_reward_parts", None) or {}
+    sat_processed = getattr(env, "last_sat_processed", None)
+    sat_incoming = getattr(env, "last_sat_incoming", None)
+
+    return {
+        "last_exec_accel": np.asarray(getattr(env, "last_exec_accel", default_accel), dtype=np.float32),
+        "gu_queue_mean": _safe_mean(getattr(env, "gu_queue", 0.0)),
+        "uav_queue_mean": _safe_mean(getattr(env, "uav_queue", 0.0)),
+        "sat_queue_mean": _safe_mean(getattr(env, "sat_queue", 0.0)),
+        "gu_queue_max": _safe_max(getattr(env, "gu_queue", 0.0)),
+        "uav_queue_max": _safe_max(getattr(env, "uav_queue", 0.0)),
+        "sat_queue_max": _safe_max(getattr(env, "sat_queue", 0.0)),
+        "gu_drop_sum": _safe_sum(getattr(env, "gu_drop", 0.0)),
+        "uav_drop_sum": _safe_sum(getattr(env, "uav_drop", 0.0)),
+        "sat_processed_sum": _safe_sum(sat_processed) if sat_processed is not None else 0.0,
+        "sat_incoming_sum": _safe_sum(sat_incoming) if sat_incoming is not None else 0.0,
+        "energy_mean": _safe_mean(getattr(env, "uav_energy", 0.0)),
+        "reward_parts": dict(parts),
+    }
+
+
+def _get_state_batch(env) -> np.ndarray:
+    if hasattr(env, "get_global_state_batch"):
+        states = env.get_global_state_batch()
+        return np.asarray(states, dtype=np.float32)
+    return np.expand_dims(np.asarray(env.get_global_state(), dtype=np.float32), axis=0)
+
+
+def _set_module_requires_grad(module, enabled: bool) -> None:
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = bool(enabled)
+
+
+def _sum_selected_parts(parts: Dict[str, torch.Tensor], train_heads: Dict[str, bool]) -> torch.Tensor:
+    order = ("accel", "bw", "sat")
+    selected: List[torch.Tensor] = []
+    for key in order:
+        if train_heads.get(key, False):
+            if key not in parts:
+                raise ValueError(f"Missing action head '{key}' while it is marked trainable.")
+            selected.append(parts[key])
+    if not selected:
+        raise ValueError("No trainable action heads selected. Check train_accel/train_bw/train_sat.")
+    out = selected[0]
+    for item in selected[1:]:
+        out = out + item
+    return out
+
+
+def _normalize_exec_source(raw: str | None) -> str:
+    src = str("policy" if raw is None else raw).strip().lower()
+    allowed = {"policy", "teacher", "heuristic", "zero"}
+    if src not in allowed:
+        raise ValueError(f"Invalid exec source '{raw}'. Allowed: {sorted(allowed)}")
+    return src
+
+
+def _select_exec_values(
+    source: str,
+    policy_values: np.ndarray | None,
+    teacher_values: np.ndarray | None,
+    heuristic_values: np.ndarray | None,
+    shape: Tuple[int, int],
+) -> np.ndarray:
+    if source == "policy" and policy_values is not None:
+        return np.asarray(policy_values, dtype=np.float32)
+    if source == "teacher" and teacher_values is not None:
+        return np.asarray(teacher_values, dtype=np.float32)
+    if source == "heuristic" and heuristic_values is not None:
+        return np.asarray(heuristic_values, dtype=np.float32)
+    return np.zeros(shape, dtype=np.float32)
+
+
 def train(
     env,
     cfg,
@@ -41,10 +132,20 @@ def train(
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    num_envs = int(getattr(env, "num_envs", 1))
+
     # Determine observation and state dimensions
-    obs_sample, _ = env.reset()
-    obs_dim = batch_flatten_obs(list(obs_sample.values()), cfg).shape[1]
-    global_state = env.get_global_state()
+    obs_sample_raw, _ = env.reset()
+    if num_envs > 1:
+        if not isinstance(obs_sample_raw, list) or len(obs_sample_raw) != num_envs:
+            raise ValueError("Vectorized env reset() must return a list of per-env observations.")
+        obs_sample_env = obs_sample_raw
+    else:
+        obs_sample_env = [obs_sample_raw]
+
+    num_agents = len(env.agents)
+    obs_dim = batch_flatten_obs(list(obs_sample_env[0].values()), cfg).shape[1]
+    global_state = _get_state_batch(env)[0]
     state_dim = global_state.shape[0]
 
     actor = ActorNet(obs_dim, cfg).to(device)
@@ -64,8 +165,60 @@ def train(
         except Exception as exc:
             print(f"Warning: failed to load critic init from {init_critic_path}: {exc}")
 
-    actor_optim = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr)
+    raw_train_accel = getattr(cfg, "train_accel", None)
+    raw_train_bw = getattr(cfg, "train_bw", None)
+    raw_train_sat = getattr(cfg, "train_sat", None)
+    train_accel = True if raw_train_accel is None else bool(raw_train_accel)
+    train_bw = bool(cfg.enable_bw_action) if raw_train_bw is None else bool(raw_train_bw)
+    train_sat = (not bool(cfg.fixed_satellite_strategy)) if raw_train_sat is None else bool(raw_train_sat)
+    if raw_train_bw is not None and train_bw and not cfg.enable_bw_action:
+        raise ValueError("train_bw=true requires enable_bw_action=true")
+    if raw_train_sat is not None and train_sat and cfg.fixed_satellite_strategy:
+        raise ValueError("train_sat=true requires fixed_satellite_strategy=false")
+    if not cfg.enable_bw_action:
+        train_bw = False
+    if cfg.fixed_satellite_strategy:
+        train_sat = False
+    train_heads = {
+        "accel": train_accel,
+        "bw": train_bw,
+        "sat": train_sat,
+    }
+    if not any(train_heads.values()):
+        raise ValueError("At least one of train_accel/train_bw/train_sat must be true.")
+
+    train_shared_backbone = bool(getattr(cfg, "train_shared_backbone", True))
+    _set_module_requires_grad(actor.mu_head, train_heads["accel"])
+    actor.log_std.requires_grad = train_heads["accel"]
+    _set_module_requires_grad(actor.bw_head, train_heads["bw"])
+    if actor.bw_log_std is not None:
+        actor.bw_log_std.requires_grad = train_heads["bw"]
+    _set_module_requires_grad(actor.sat_head, train_heads["sat"])
+    if actor.sat_log_std is not None:
+        actor.sat_log_std.requires_grad = train_heads["sat"]
+    if not train_shared_backbone:
+        _set_module_requires_grad(actor.obs_norm, False)
+        _set_module_requires_grad(actor.fc1, False)
+        _set_module_requires_grad(actor.fc2, False)
+
+    actor_params = [p for p in actor.parameters() if p.requires_grad]
+    if not actor_params:
+        raise ValueError("Actor has no trainable parameters after stage freeze settings.")
+
+    actor_optim = torch.optim.Adam(actor_params, lr=cfg.actor_lr)
     critic_optim = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
+    lr_decay_enabled = bool(getattr(cfg, "lr_decay_enabled", False))
+    lr_final_factor = float(getattr(cfg, "lr_final_factor", 0.1) or 0.1)
+    lr_final_factor = float(np.clip(lr_final_factor, 0.0, 1.0))
+    actor_sched = None
+    critic_sched = None
+    if lr_decay_enabled and total_updates > 1 and lr_final_factor < 1.0:
+        def _linear_lr(step_idx: int) -> float:
+            progress = min(max(step_idx, 0), total_updates - 1) / max(total_updates - 1, 1)
+            return 1.0 - (1.0 - lr_final_factor) * progress
+
+        actor_sched = torch.optim.lr_scheduler.LambdaLR(actor_optim, lr_lambda=_linear_lr)
+        critic_sched = torch.optim.lr_scheduler.LambdaLR(critic_optim, lr_lambda=_linear_lr)
 
     from ..utils.logging import MetricLogger
     from ..utils.progress import Progress
@@ -76,6 +229,8 @@ def train(
         "value_loss",
         "entropy",
         "imitation_loss",
+        "actor_lr",
+        "critic_lr",
         "r_service_ratio",
         "r_drop_ratio",
         "r_queue_pen",
@@ -139,19 +294,54 @@ def train(
     reward_history = []
     reward_rms = RunningMeanStd() if getattr(cfg, "reward_norm_enabled", False) else None
     imitation_coef = float(getattr(cfg, "imitation_coef", 0.0) or 0.0)
-    imitation_enabled = bool(getattr(cfg, "imitation_enabled", False)) and imitation_coef > 0.0
-    imitation_accel = bool(getattr(cfg, "imitation_accel", True))
-    imitation_bw = bool(getattr(cfg, "imitation_bw", True))
-    imitation_sat = bool(getattr(cfg, "imitation_sat", False))
+    use_imitation_loss = ablation_flag(
+        cfg,
+        "use_imitation_loss",
+        fallback_attr="imitation_enabled",
+        default=False,
+    )
+    use_heuristic_mask = ablation_flag(cfg, "use_heuristic_mask", default=False)
+    imitation_enabled = use_imitation_loss and imitation_coef > 0.0
+    imitation_accel = bool(getattr(cfg, "imitation_accel", True)) and train_heads["accel"]
+    imitation_bw = bool(getattr(cfg, "imitation_bw", True)) and train_heads["bw"]
+    imitation_sat = bool(getattr(cfg, "imitation_sat", False)) and train_heads["sat"]
     bw_scale = float(getattr(cfg, "bw_logit_scale", 1.0) or 1.0)
     sat_scale = float(getattr(cfg, "sat_logit_scale", 1.0) or 1.0)
+    exec_accel_source = _normalize_exec_source(getattr(cfg, "exec_accel_source", "policy"))
+    exec_bw_source = _normalize_exec_source(getattr(cfg, "exec_bw_source", "policy"))
+    exec_sat_source = _normalize_exec_source(getattr(cfg, "exec_sat_source", "policy"))
+    teacher_deterministic = bool(getattr(cfg, "exec_teacher_deterministic", True))
+    need_teacher_exec = "teacher" in {exec_accel_source, exec_bw_source, exec_sat_source}
+    need_heuristic_exec = "heuristic" in {exec_accel_source, exec_bw_source, exec_sat_source}
 
-    obs, _ = env.reset()
-    use_direct_logprob = (
-        (not cfg.enable_bw_action)
-        and cfg.fixed_satellite_strategy
-        and not (cfg.energy_enabled and cfg.energy_safety_enabled)
+    teacher_actor = None
+    if need_teacher_exec:
+        teacher_path = getattr(cfg, "exec_teacher_actor_path", None) or init_actor_path
+        if not teacher_path:
+            raise ValueError(
+                "Execution override uses 'teacher' but no teacher checkpoint is provided. "
+                "Set exec_teacher_actor_path or pass --init_actor."
+            )
+        teacher_actor = ActorNet(obs_dim, cfg).to(device)
+        state = torch.load(teacher_path, map_location=device)
+        teacher_actor.load_state_dict(state, strict=False)
+        teacher_actor.eval()
+        for p in teacher_actor.parameters():
+            p.requires_grad = False
+    print(
+        "Train heads: "
+        f"accel={train_heads['accel']}, bw={train_heads['bw']}, sat={train_heads['sat']} | "
+        "Exec sources: "
+        f"accel={exec_accel_source}, bw={exec_bw_source}, sat={exec_sat_source}"
     )
+
+    obs_raw, _ = env.reset()
+    if num_envs > 1:
+        if not isinstance(obs_raw, list) or len(obs_raw) != num_envs:
+            raise ValueError("Vectorized env reset() must return a list of per-env observations.")
+        obs_env = obs_raw
+    else:
+        obs_env = [obs_raw]
 
     def _build_imitation_target(obs_list):
         if not imitation_enabled:
@@ -176,7 +366,7 @@ def train(
 
     for update in range(total_updates):
         update_start = time.perf_counter()
-        buffer = RolloutBuffer(capacity=cfg.buffer_size)
+        buffers = [RolloutBuffer(capacity=cfg.buffer_size) for _ in range(num_envs)]
         ep_reward = 0.0
         steps_count = 0
         gu_queue_sum = 0.0
@@ -228,153 +418,259 @@ def train(
 
         rollout_start = time.perf_counter()
         for step in range(cfg.buffer_size):
-            obs_list = list(obs.values())
-            obs_batch = batch_flatten_obs(obs_list, cfg)
+            per_env_obs_lists = [list(obs_e.values()) for obs_e in obs_env]
+            per_env_obs_batch = [batch_flatten_obs(obs_list, cfg) for obs_list in per_env_obs_lists]
+            obs_batch = np.concatenate(per_env_obs_batch, axis=0)
             if not np.isfinite(obs_batch).all():
                 print(f"NaN/Inf detected in obs_batch at update={update}, step={step}")
                 raise ValueError("obs_batch contains NaN/Inf")
             obs_tensor = torch.from_numpy(obs_batch).to(device)
 
-            state_np = env.get_global_state()
+            state_batch_np = _get_state_batch(env)
+            if state_batch_np.shape[0] != num_envs:
+                raise ValueError(
+                    f"Expected {num_envs} states from env, got {state_batch_np.shape[0]}"
+                )
             with torch.inference_mode():
                 policy_out = actor.act(obs_tensor)
-                value = critic(torch.from_numpy(state_np).to(device))
+                value = critic(torch.from_numpy(state_batch_np).to(device))
             if not torch.isfinite(policy_out.dist_out["mu"]).all():
                 print(f"NaN/Inf detected in actor mu at update={update}, step={step}")
                 raise ValueError("actor mu contains NaN/Inf")
 
             accel_actions = policy_out.accel.cpu().numpy()
-            bw_logits = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
-            sat_logits = policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
+            bw_logits_all = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
+            sat_logits_all = policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
+            teacher_accel_all = None
+            teacher_bw_all = None
+            teacher_sat_all = None
+            if teacher_actor is not None:
+                with torch.inference_mode():
+                    teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
+                teacher_accel_all = teacher_out.accel.cpu().numpy()
+                teacher_bw_all = teacher_out.bw_logits.cpu().numpy() if teacher_out.bw_logits is not None else None
+                teacher_sat_all = teacher_out.sat_logits.cpu().numpy() if teacher_out.sat_logits is not None else None
 
-            # Apply action masks before execution/storage
-            users_mask = np.stack([o["users_mask"] for o in obs_list], axis=0)
-            sats_mask = np.stack([o["sats_mask"] for o in obs_list], axis=0)
-            if cfg.doppler_enabled:
-                nu_norm = np.stack([o["sats"][:, 6] for o in obs_list], axis=0)
-                doppler_ok = (np.abs(nu_norm) <= 1.0).astype(np.float32)
-                sats_mask = sats_mask * doppler_ok
+            action_dicts = []
+            accel_cmd_list: List[np.ndarray] = []
+            bw_exec_list: List[np.ndarray | None] = []
+            sat_exec_list: List[np.ndarray | None] = []
+            for env_idx in range(num_envs):
+                sl = slice(env_idx * num_agents, (env_idx + 1) * num_agents)
+                obs_list = per_env_obs_lists[env_idx]
+                accel_policy_env = accel_actions[sl]
+                bw_policy_env = bw_logits_all[sl] if bw_logits_all is not None else None
+                sat_policy_env = sat_logits_all[sl] if sat_logits_all is not None else None
+                accel_teacher_env = teacher_accel_all[sl] if teacher_accel_all is not None else None
+                bw_teacher_env = teacher_bw_all[sl] if teacher_bw_all is not None else None
+                sat_teacher_env = teacher_sat_all[sl] if teacher_sat_all is not None else None
+                heur_accel = None
+                heur_bw = None
+                heur_sat = None
+                if need_heuristic_exec:
+                    heur_accel, heur_bw, heur_sat = queue_aware_policy(obs_list, cfg)
 
-            bw_exec = None
-            if bw_logits is not None:
-                bw_exec = bw_logits * users_mask
-            elif cfg.enable_bw_action:
-                bw_exec = np.zeros((len(obs_list), cfg.users_obs_max), dtype=np.float32)
+                accel_cmd = _select_exec_values(
+                    exec_accel_source,
+                    accel_policy_env,
+                    accel_teacher_env,
+                    heur_accel,
+                    (len(obs_list), 2),
+                )
+                accel_cmd = np.clip(accel_cmd, -1.0, 1.0).astype(np.float32, copy=False)
 
-            sat_exec = None
-            if sat_logits is not None:
-                sat_exec = sat_logits * sats_mask
-            elif not cfg.fixed_satellite_strategy:
-                sat_exec = np.zeros((len(obs_list), cfg.sats_obs_max), dtype=np.float32)
+                users_mask = np.stack([o["users_mask"] for o in obs_list], axis=0)
+                sats_mask = np.stack([o["sats_mask"] for o in obs_list], axis=0)
+                if cfg.doppler_enabled and use_heuristic_mask:
+                    nu_norm = np.stack([o["sats"][:, 6] for o in obs_list], axis=0)
+                    doppler_ok = (np.abs(nu_norm) <= 1.0).astype(np.float32)
+                    sats_mask = sats_mask * doppler_ok
 
-            action_dict = assemble_actions(cfg, env.agents, accel_actions, bw_logits=bw_exec, sat_logits=sat_exec)
-            next_obs, rewards, terms, truncs, _ = env.step(action_dict)
+                bw_exec = None
+                if cfg.enable_bw_action:
+                    bw_raw = _select_exec_values(
+                        exec_bw_source,
+                        bw_policy_env,
+                        bw_teacher_env,
+                        heur_bw,
+                        (len(obs_list), cfg.users_obs_max),
+                    )
+                    bw_exec = bw_raw * users_mask
 
-            accel_exec = getattr(env, "last_exec_accel", accel_actions)
-            if use_direct_logprob:
-                accel_exec_norm = accel_actions
+                sat_exec = None
+                if not cfg.fixed_satellite_strategy:
+                    sat_raw = _select_exec_values(
+                        exec_sat_source,
+                        sat_policy_env,
+                        sat_teacher_env,
+                        heur_sat,
+                        (len(obs_list), cfg.sats_obs_max),
+                    )
+                    sat_exec = sat_raw * sats_mask
+
+                action_dict = assemble_actions(
+                    cfg,
+                    env.agents,
+                    accel_cmd,
+                    bw_logits=bw_exec,
+                    sat_logits=sat_exec,
+                )
+                action_dicts.append(action_dict)
+                accel_cmd_list.append(accel_cmd)
+                bw_exec_list.append(bw_exec)
+                sat_exec_list.append(sat_exec)
+
+            if num_envs > 1:
+                next_obs_env, rewards_env, terms_env, truncs_env, _ = env.step(action_dicts, auto_reset=True)
+                step_stats = getattr(env, "last_step_stats", None)
+                if not isinstance(step_stats, list) or len(step_stats) != num_envs:
+                    raise ValueError("Vectorized env must expose last_step_stats after step().")
             else:
+                next_obs, rewards, terms, truncs, _ = env.step(action_dicts[0])
+                step_stats = [_single_env_step_stats(env)]
+                done_scalar = list(terms.values())[0] or list(truncs.values())[0]
+                if done_scalar:
+                    next_obs, _ = env.reset()
+                next_obs_env = [next_obs]
+                rewards_env = [rewards]
+                terms_env = [terms]
+                truncs_env = [truncs]
+
+            value_np = value.detach().cpu().numpy().reshape(num_envs)
+
+            action_vec_exec_env = []
+            for env_idx in range(num_envs):
+                stats = step_stats[env_idx] if step_stats[env_idx] is not None else {}
+                fallback_accel = accel_cmd_list[env_idx] * cfg.a_max
+                accel_exec = np.asarray(stats.get("last_exec_accel", fallback_accel), dtype=np.float32)
                 accel_exec_norm = accel_exec / max(cfg.a_max, 1e-6)
                 accel_exec_norm = np.clip(accel_exec_norm, -1.0, 1.0).astype(np.float32, copy=False)
-            exec_parts = [accel_exec_norm]
-            if cfg.enable_bw_action and bw_exec is not None:
-                exec_parts.append(bw_exec)
-            if not cfg.fixed_satellite_strategy and sat_exec is not None:
-                exec_parts.append(sat_exec)
-            action_vec_exec = np.concatenate(exec_parts, axis=1).astype(np.float32, copy=False)
-            if use_direct_logprob:
-                logprobs = policy_out.logprob.detach().cpu().numpy()
-            else:
-                with torch.inference_mode():
-                    action_vec_exec_t = torch.from_numpy(action_vec_exec).to(device)
-                    logprobs = (
-                        actor.evaluate_actions(obs_tensor, action_vec_exec_t, out=policy_out.dist_out)[0]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
+                exec_parts = [accel_exec_norm]
+                if cfg.enable_bw_action and bw_exec_list[env_idx] is not None:
+                    exec_parts.append(bw_exec_list[env_idx])
+                if not cfg.fixed_satellite_strategy and sat_exec_list[env_idx] is not None:
+                    exec_parts.append(sat_exec_list[env_idx])
+                action_vec_exec_env.append(np.concatenate(exec_parts, axis=1).astype(np.float32, copy=False))
 
-            reward_scalar = list(rewards.values())[0]
-            done_scalar = list(terms.values())[0] or list(truncs.values())[0]
-            ep_reward += reward_scalar
-            steps_count += 1
-            total_env_steps += 1
-            gu_queue_sum += float(np.mean(env.gu_queue))
-            uav_queue_sum += float(np.mean(env.uav_queue))
-            sat_queue_sum += float(np.mean(env.sat_queue))
-            gu_queue_max = max(gu_queue_max, float(np.max(env.gu_queue)))
-            uav_queue_max = max(uav_queue_max, float(np.max(env.uav_queue)))
-            sat_queue_max = max(sat_queue_max, float(np.max(env.sat_queue)))
-            gu_drop_sum += float(np.sum(env.gu_drop))
-            uav_drop_sum += float(np.sum(env.uav_drop))
-            if hasattr(env, "last_sat_processed"):
-                sat_processed_sum += float(np.sum(env.last_sat_processed))
-            if hasattr(env, "last_sat_incoming"):
-                sat_incoming_sum += float(np.sum(env.last_sat_incoming))
-            if cfg.energy_enabled:
-                energy_mean_sum += float(np.mean(env.uav_energy))
-            parts = getattr(env, "last_reward_parts", None)
-            if parts:
-                r_service_ratio_sum += float(parts.get("service_ratio", 0.0))
-                r_drop_ratio_sum += float(parts.get("drop_ratio", 0.0))
-                arrival_sum_sum += float(parts.get("arrival_sum", 0.0))
-                outflow_sum_sum += float(parts.get("outflow_sum", 0.0))
-                service_norm_sum += float(parts.get("service_norm", 0.0))
-                drop_norm_sum += float(parts.get("drop_norm", 0.0))
-                queue_total_sum += float(parts.get("queue_total", 0.0))
-                queue_total_active_sum += float(parts.get("queue_total_active", 0.0))
-                arrival_rate_eff_sum += float(parts.get("arrival_rate_eff", 0.0))
-                r_queue_pen_sum += float(parts.get("queue_pen", 0.0))
-                r_queue_topk_sum += float(parts.get("queue_topk", 0.0))
-                r_centroid_sum += float(parts.get("centroid_reward", 0.0))
-                centroid_dist_mean_sum += float(parts.get("centroid_dist_mean", 0.0))
-                r_bw_align_sum += float(parts.get("bw_align", 0.0))
-                r_sat_score_sum += float(parts.get("sat_score", 0.0))
-                r_assoc_ratio_sum += float(parts.get("assoc_ratio", 0.0))
-                r_queue_delta_sum += float(parts.get("queue_delta", 0.0))
-                r_dist_sum += float(parts.get("dist_reward", 0.0))
-                r_dist_delta_sum += float(parts.get("dist_delta", 0.0))
-                r_energy_sum += float(parts.get("energy_reward", 0.0))
-                r_fail_penalty_sum += float(parts.get("fail_penalty", 0.0))
-                r_term_service_sum += float(parts.get("term_service", 0.0))
-                r_term_drop_sum += float(parts.get("term_drop", 0.0))
-                r_term_queue_sum += float(parts.get("term_queue", 0.0))
-                r_term_topk_sum += float(parts.get("term_topk", 0.0))
-                r_term_assoc_sum += float(parts.get("term_assoc", 0.0))
-                r_term_q_delta_sum += float(parts.get("term_q_delta", 0.0))
-                r_term_dist_sum += float(parts.get("term_dist", 0.0))
-                r_term_dist_delta_sum += float(parts.get("term_dist_delta", 0.0))
-                r_term_centroid_sum += float(parts.get("term_centroid", 0.0))
-                r_term_bw_align_sum += float(parts.get("term_bw_align", 0.0))
-                r_term_sat_score_sum += float(parts.get("term_sat_score", 0.0))
-                r_term_energy_sum += float(parts.get("term_energy", 0.0))
-                reward_raw_sum += float(parts.get("reward_raw", 0.0))
+            action_vec_exec = np.concatenate(action_vec_exec_env, axis=0).astype(np.float32, copy=False)
+            with torch.inference_mode():
+                action_vec_exec_t = torch.from_numpy(action_vec_exec).to(device)
+                logprob_parts, _ = actor.evaluate_actions_parts(obs_tensor, action_vec_exec_t, out=policy_out.dist_out)
+                logprobs_all = _sum_selected_parts(logprob_parts, train_heads).detach().cpu().numpy()
 
-            buffer.add(
-                obs_batch,
-                action_vec_exec,
-                logprobs,
-                reward_scalar,
-                float(value.item()),
-                done_scalar,
-                state_np,
-                _build_imitation_target(obs_list),
-            )
+            for env_idx in range(num_envs):
+                sl = slice(env_idx * num_agents, (env_idx + 1) * num_agents)
+                rewards = rewards_env[env_idx]
+                terms = terms_env[env_idx]
+                truncs = truncs_env[env_idx]
 
-            obs = next_obs
-            if done_scalar:
-                obs, _ = env.reset()
+                reward_scalar = list(rewards.values())[0]
+                done_scalar = list(terms.values())[0] or list(truncs.values())[0]
+                ep_reward += reward_scalar
+                steps_count += 1
+                total_env_steps += 1
+
+                stats = step_stats[env_idx] if step_stats[env_idx] is not None else {}
+                gu_queue_sum += float(stats.get("gu_queue_mean", 0.0))
+                uav_queue_sum += float(stats.get("uav_queue_mean", 0.0))
+                sat_queue_sum += float(stats.get("sat_queue_mean", 0.0))
+                gu_queue_max = max(gu_queue_max, float(stats.get("gu_queue_max", 0.0)))
+                uav_queue_max = max(uav_queue_max, float(stats.get("uav_queue_max", 0.0)))
+                sat_queue_max = max(sat_queue_max, float(stats.get("sat_queue_max", 0.0)))
+                gu_drop_sum += float(stats.get("gu_drop_sum", 0.0))
+                uav_drop_sum += float(stats.get("uav_drop_sum", 0.0))
+                sat_processed_sum += float(stats.get("sat_processed_sum", 0.0))
+                sat_incoming_sum += float(stats.get("sat_incoming_sum", 0.0))
+                if cfg.energy_enabled:
+                    energy_mean_sum += float(stats.get("energy_mean", 0.0))
+
+                parts = stats.get("reward_parts", None)
+                if parts:
+                    r_service_ratio_sum += float(parts.get("service_ratio", 0.0))
+                    r_drop_ratio_sum += float(parts.get("drop_ratio", 0.0))
+                    arrival_sum_sum += float(parts.get("arrival_sum", 0.0))
+                    outflow_sum_sum += float(parts.get("outflow_sum", 0.0))
+                    service_norm_sum += float(parts.get("service_norm", 0.0))
+                    drop_norm_sum += float(parts.get("drop_norm", 0.0))
+                    queue_total_sum += float(parts.get("queue_total", 0.0))
+                    queue_total_active_sum += float(parts.get("queue_total_active", 0.0))
+                    arrival_rate_eff_sum += float(parts.get("arrival_rate_eff", 0.0))
+                    r_queue_pen_sum += float(parts.get("queue_pen", 0.0))
+                    r_queue_topk_sum += float(parts.get("queue_topk", 0.0))
+                    r_centroid_sum += float(parts.get("centroid_reward", 0.0))
+                    centroid_dist_mean_sum += float(parts.get("centroid_dist_mean", 0.0))
+                    r_bw_align_sum += float(parts.get("bw_align", 0.0))
+                    r_sat_score_sum += float(parts.get("sat_score", 0.0))
+                    r_assoc_ratio_sum += float(parts.get("assoc_ratio", 0.0))
+                    r_queue_delta_sum += float(parts.get("queue_delta", 0.0))
+                    r_dist_sum += float(parts.get("dist_reward", 0.0))
+                    r_dist_delta_sum += float(parts.get("dist_delta", 0.0))
+                    r_energy_sum += float(parts.get("energy_reward", 0.0))
+                    r_fail_penalty_sum += float(parts.get("fail_penalty", 0.0))
+                    r_term_service_sum += float(parts.get("term_service", 0.0))
+                    r_term_drop_sum += float(parts.get("term_drop", 0.0))
+                    r_term_queue_sum += float(parts.get("term_queue", 0.0))
+                    r_term_topk_sum += float(parts.get("term_topk", 0.0))
+                    r_term_assoc_sum += float(parts.get("term_assoc", 0.0))
+                    r_term_q_delta_sum += float(parts.get("term_q_delta", 0.0))
+                    r_term_dist_sum += float(parts.get("term_dist", 0.0))
+                    r_term_dist_delta_sum += float(parts.get("term_dist_delta", 0.0))
+                    r_term_centroid_sum += float(parts.get("term_centroid", 0.0))
+                    r_term_bw_align_sum += float(parts.get("term_bw_align", 0.0))
+                    r_term_sat_score_sum += float(parts.get("term_sat_score", 0.0))
+                    r_term_energy_sum += float(parts.get("term_energy", 0.0))
+                    reward_raw_sum += float(parts.get("reward_raw", 0.0))
+
+                buffers[env_idx].add(
+                    per_env_obs_batch[env_idx],
+                    action_vec_exec_env[env_idx],
+                    logprobs_all[sl],
+                    reward_scalar,
+                    float(value_np[env_idx]),
+                    done_scalar,
+                    state_batch_np[env_idx],
+                    _build_imitation_target(per_env_obs_lists[env_idx]),
+                )
+
+            obs_env = list(next_obs_env)
         rollout_time = time.perf_counter() - rollout_start
 
         # Prepare batches
-        obs_arr, act_arr, logp_arr, rewards, values, dones, state_arr, imitation_arr = buffer.as_arrays()
+        buffer_data = [buf.as_arrays() for buf in buffers]
+        all_rewards = np.concatenate([data[3] for data in buffer_data], axis=0)
         if getattr(cfg, "reward_norm_enabled", False) and reward_rms is not None:
-            reward_rms.update(rewards)
-            rewards = (rewards - reward_rms.mean) / (np.sqrt(reward_rms.var) + 1e-8)
-            clip_val = float(getattr(cfg, "reward_norm_clip", 0.0) or 0.0)
-            if clip_val > 0:
-                rewards = np.clip(rewards, -clip_val, clip_val)
-        adv, rets = compute_gae(rewards, values, dones, cfg.gamma, cfg.gae_lambda)
+            reward_rms.update(all_rewards)
+
+        obs_arr_list = []
+        act_arr_list = []
+        logp_arr_list = []
+        state_arr_list = []
+        imitation_arr_list = []
+        adv_list = []
+        rets_list = []
+        clip_val = float(getattr(cfg, "reward_norm_clip", 0.0) or 0.0)
+        for obs_arr_e, act_arr_e, logp_arr_e, rewards_e, values_e, dones_e, state_arr_e, imitation_arr_e in buffer_data:
+            rewards_proc = rewards_e
+            if getattr(cfg, "reward_norm_enabled", False) and reward_rms is not None:
+                rewards_proc = (rewards_proc - reward_rms.mean) / (np.sqrt(reward_rms.var) + 1e-8)
+                if clip_val > 0:
+                    rewards_proc = np.clip(rewards_proc, -clip_val, clip_val)
+            adv_e, rets_e = compute_gae(rewards_proc, values_e, dones_e, cfg.gamma, cfg.gae_lambda)
+            obs_arr_list.append(obs_arr_e)
+            act_arr_list.append(act_arr_e)
+            logp_arr_list.append(logp_arr_e)
+            state_arr_list.append(state_arr_e)
+            imitation_arr_list.append(imitation_arr_e)
+            adv_list.append(adv_e)
+            rets_list.append(rets_e)
+
+        obs_arr = np.concatenate(obs_arr_list, axis=0)
+        act_arr = np.concatenate(act_arr_list, axis=0)
+        logp_arr = np.concatenate(logp_arr_list, axis=0)
+        state_arr = np.concatenate(state_arr_list, axis=0)
+        imitation_arr = np.concatenate(imitation_arr_list, axis=0)
+        adv = np.concatenate(adv_list, axis=0)
+        rets = np.concatenate(rets_list, axis=0)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         adv = np.clip(adv, -5.0, 5.0)
 
@@ -452,7 +748,9 @@ def train(
                     print(f"NaN/Inf detected in act minibatch at update={update}")
                     raise ValueError("act minibatch contains NaN/Inf")
                 out = actor.forward(obs_flat_t[mb_idx])
-                new_logp, entropy = actor.evaluate_actions(obs_flat_t[mb_idx], act_flat_t[mb_idx], out=out)
+                logprob_parts, entropy_parts = actor.evaluate_actions_parts(obs_flat_t[mb_idx], act_flat_t[mb_idx], out=out)
+                new_logp = _sum_selected_parts(logprob_parts, train_heads)
+                entropy = _sum_selected_parts(entropy_parts, train_heads)
                 if not torch.isfinite(new_logp).all():
                     print(f"NaN/Inf detected in new_logp at update={update}")
                     raise ValueError("new_logp contains NaN/Inf")
@@ -524,6 +822,8 @@ def train(
             "value_loss": float(np.mean(value_losses)),
             "entropy": float(np.mean(entropies)),
             "imitation_loss": imitation_loss_sum / max(1, len(policy_losses)),
+            "actor_lr": float(actor_optim.param_groups[0]["lr"]),
+            "critic_lr": float(critic_optim.param_groups[0]["lr"]),
               "r_service_ratio": r_service_ratio_sum / steps_count,
             "r_drop_ratio": r_drop_ratio_sum / steps_count,
             "r_queue_pen": r_queue_pen_sum / steps_count,
@@ -583,6 +883,10 @@ def train(
             update,
             metrics,
         )
+        if actor_sched is not None:
+            actor_sched.step()
+        if critic_sched is not None:
+            critic_sched.step()
         progress.update(update + 1)
 
         if cfg.early_stop_enabled:

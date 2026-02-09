@@ -5,6 +5,7 @@
 **主要特性**
 - 可配置的 SAGIN 环境（用户分布、卫星轨道、队列、信道与多种物理约束开关）
 - MAPPO 训练管线，自动保存模型与日志
+- 支持多环境并行 rollout（`sync`/`subproc`），可利用多核 CPU 提升采样吞吐
 - 评估脚本与渲染脚本（GIF）
 - 训练与评估日志包含队列状态、丢包与卫星处理量、用时与吞吐统计
 - 训练支持早停（基于奖励滑动均值的收敛判定）
@@ -33,37 +34,37 @@ python -m pip install -r requirements.txt
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
-说明：阶段一当前默认使用 `configs/phase1_actions.yaml`，关键条件/开关为：
-- `enable_bw_action=true`（带宽分配动作）
-- `fixed_satellite_strategy=false` + `sat_select_mode=sample`（卫星选择动作）
+说明：阶段一当前默认使用 `configs/phase1_actions_curriculum_stage1_accel.yaml`，关键条件/开关为：
+- `enable_bw_action=false`（仅训练加速度）
+- `fixed_satellite_strategy=true`（卫星策略固定）
 - `avoidance_enabled=true`（避障安全层）
-对照用简化版为 `configs/phase1.yaml`（固定卫星策略、关闭带宽分配与避障安全层）。
 
 可选：吞吐估算（判断到达率是否合理）
 ```powershell
-python scripts/estimate_throughput.py --config configs/phase1_actions.yaml
+python scripts/estimate_throughput.py --config configs/phase1_actions_curriculum_stage1_accel.yaml
 ```
 2. 训练（自动生成独立目录，避免多次流程数据堆在一起）
 ```powershell
-python scripts/train.py --config configs/phase1_actions.yaml --log_dir runs/phase1_actions --run_id auto --updates 200
+python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --log_dir runs/phase1_actions --run_id auto --num_envs 8 --vec_backend subproc --torch_threads 8 --updates 400
 ```
 说明：终端会输出 `Run dir: runs/phase1_actions/20260204_121530`，下文用 `<RUN_DIR>` 指代该目录。
 如需手动指定目录，可用 `--run_dir runs/phase1_actions/exp1`。
+调试时可先用 `--num_envs 2 --vec_backend sync`，确认流程后再切到 `subproc`。
 3. 评估（训练模型）
 ```powershell
-python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20
+python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR> --episodes 20
 ```
 可选：混合策略评估（accel 用训练模型，bw/sat 用 queue_aware）
 ```powershell
-python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20 --hybrid_bw_sat queue_aware
+python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR> --episodes 20 --hybrid_bw_sat queue_aware
 ```
 4. 评估（启发式基线，推荐）
 ```powershell
-python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20 --baseline queue_aware
+python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR> --episodes 20 --baseline queue_aware
 ```
 可选：零加速度基线（更弱，但便于对照）
 ```powershell
-python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20 --baseline zero_accel
+python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR> --episodes 20 --baseline zero_accel
 ```
 5. 查看训练结果
 - 训练指标：`<RUN_DIR>/metrics.csv`
@@ -74,9 +75,16 @@ python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_D
 - 评估 TensorBoard：`<RUN_DIR>/eval_tb`（tags: `eval/trained`, `eval/baseline`）
 
 **当前推荐配置**
-- Accel-only 训练（stage1）：`configs/phase1_actions_queuefix_v3_3_stage1_accelonly.yaml`
-- Full-action 训练（stage2，继承 stage1 权重）：`configs/phase1_actions_queuefix_v3_3_stage2_full.yaml`
-- 固定负载主线（nearest K=20）：`configs/phase1_actions_queuefix_v3_3_imitation_fast_notanh_fixedload_nearest_k20.yaml`
+- Stage 1（加速度）：`configs/phase1_actions_curriculum_stage1_accel.yaml`
+- Stage 2（带宽）：`configs/phase1_actions_curriculum_stage2_bw.yaml`
+- Stage 3（卫星选择）：`configs/phase1_actions_curriculum_stage3_sat.yaml`
+
+**三阶段训练（递进）**
+```powershell
+python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --updates 400 --log_dir runs/phase1_actions --run_id stage1_accel
+python scripts/train.py --config configs/phase1_actions_curriculum_stage2_bw.yaml --updates 500 --log_dir runs/phase1_actions --run_id stage2_bw --init_actor runs/phase1_actions/stage1_accel/actor.pt --init_critic runs/phase1_actions/stage1_accel/critic.pt
+python scripts/train.py --config configs/phase1_actions_curriculum_stage3_sat.yaml --updates 500 --log_dir runs/phase1_actions --run_id stage3_sat --init_actor runs/phase1_actions/stage2_bw/actor.pt --init_critic runs/phase1_actions/stage2_bw/critic.pt
+```
 
 **TensorBoard 查看建议（当前采用方案）**
 1. 启动：
@@ -84,7 +92,7 @@ python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_D
 tensorboard --logdir runs/phase1_actions
 ```
 2. 训练曲线（Train）：
-在 Runs 列表勾选 `stage1_accel` / `stage2_full` / `fixedload_nearest_k20`，查看 Scalars：
+在 Runs 列表勾选 `stage1_accel` / `stage2_bw` / `stage3_sat`，查看 Scalars：
 `episode_reward`, `reward_raw`, `gu_queue_mean`, `centroid_dist_mean`, `service_norm`。
 3. 评估曲线（Eval）：
 评估日志在 `<RUN_DIR>/eval_tb`，TensorBoard 左侧会出现 `eval_tb` 子目录。  
@@ -97,31 +105,31 @@ tensorboard --logdir runs/phase1_actions
 
 训练：
 ```powershell
-python scripts/train.py --config configs/phase1_actions.yaml --log_dir runs/phase1_actions --run_id auto --updates 200
+python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --log_dir runs/phase1_actions --run_id auto --num_envs 8 --vec_backend subproc --torch_threads 8 --updates 400
 ```
 
 评估（输出 CSV）：
 ```powershell
-python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20
+python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR> --episodes 20
 ```
 评估（混合策略：accel=训练模型，bw/sat=queue_aware）：
 ```powershell
-python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20 --hybrid_bw_sat queue_aware
+python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR> --episodes 20 --hybrid_bw_sat queue_aware
 ```
 
 评估（启发式基线，推荐）：
 ```powershell
-python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20 --baseline queue_aware
+python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR> --episodes 20 --baseline queue_aware
 ```
 
 评估（零加速度基线）：
 ```powershell
-python scripts/evaluate.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR> --episodes 20 --baseline zero_accel
+python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR> --episodes 20 --baseline zero_accel
 ```
 
 渲染一条轨迹（输出 GIF）：
 ```powershell
-python scripts/render_episode.py --config configs/phase1_actions.yaml --run_dir <RUN_DIR>
+python scripts/render_episode.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir <RUN_DIR>
 ```
 
 TensorBoard：
@@ -132,7 +140,7 @@ tensorboard --logdir <RUN_DIR>
 
 吞吐估算（判断到达率是否合理）：
 ```powershell
-python scripts/estimate_throughput.py --config configs/phase1_actions.yaml
+python scripts/estimate_throughput.py --config configs/phase1_actions_curriculum_stage1_accel.yaml
 ```
 
 **训练与评估输出**
@@ -187,7 +195,7 @@ python scripts/estimate_throughput.py --config configs/phase1_actions.yaml
 - `candidate_k`：控制候选数量上限（不改变 `users_obs_max`，网络输入维度保持不变，超出部分由 mask 置零）。
 
 **配置说明**
-默认配置见 `sagin_marl/env/config.py`，阶段一默认使用 `configs/phase1_actions.yaml` 覆盖其中字段；对照可用 `configs/phase1.yaml`。常用参数：
+默认配置见 `sagin_marl/env/config.py`，课程阶段建议从 `configs/phase1_actions_curriculum_stage1_accel.yaml` 开始。常用参数：
 - 规模：`num_uav`、`num_gu`、`num_sat`
 - 时域：`tau0`、`T_steps`
 - 观测截断：`users_obs_max`、`sats_obs_max`、`nbrs_obs_max`
@@ -198,6 +206,7 @@ python scripts/estimate_throughput.py --config configs/phase1_actions.yaml
 - 奖励与候选：`reward_tanh_enabled`、`candidate_mode`、`candidate_k`、`candidate_radius`、`queue_topk_local`
 - 基线启发式（queue_aware）：`baseline_accel_gain`、`baseline_assoc_bonus`、`baseline_sat_queue_penalty`、`baseline_repulse_gain`、`baseline_repulse_radius_factor`、`baseline_energy_low`、`baseline_energy_weight`
 - 训练超参：`buffer_size`、`num_mini_batch`、`ppo_epochs`、`actor_lr`、`critic_lr`
+- 并行训练参数（命令行）：`--num_envs`、`--vec_backend`、`--torch_threads`
 
 **测试**
 - 测试文件说明：`docs/tests_overview.md`
@@ -211,7 +220,7 @@ python -m pytest -q
 from sagin_marl.env.config import load_config
 from sagin_marl.env.sagin_env import SaginParallelEnv
 
-cfg = load_config("configs/phase1_actions.yaml")
+cfg = load_config("configs/phase1_actions_curriculum_stage1_accel.yaml")
 env = SaginParallelEnv(cfg)
 obs, infos = env.reset()
 ```

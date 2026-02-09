@@ -1,10 +1,10 @@
 # Stage 1: accel-only curriculum. Fixed-load + nearest-K candidates.
 # Suggested usage:
-#   python scripts/train.py --config configs/phase1_actions_queuefix_v3_3_stage1_accelonly.yaml --updates 60 --log_dir runs/phase1_actions --run_id stage1_accel
+#   python scripts/train.py --config configs/phase1_actions_queuefix_v3_3_stage1_accelonly.yaml --updates 400 --log_dir runs/phase1_actions --run_id stage1_accel
 seed: 42
 map_size: 3000.0
 tau0: 1.0
-T_steps: 100
+T_steps: 400
 
 num_uav: 3
 num_gu: 20
@@ -40,10 +40,13 @@ uav_spawn_full_random_final: true
 # Arrivals (fixed load, no ramp)
 task_arrival_rate: 7.0e4
 task_arrival_poisson: true
+traffic_level: 0
 arrival_ramp_steps: 0
 arrival_ramp_start: 0.0
 arrival_ramp_use_global: false
 queue_init_frac: 0.1
+queue_init_uav_frac: 0.02
+queue_init_sat_frac: 0.01
 
 gu_tx_power: 0.18
 uav_tx_gain: 300.0
@@ -94,7 +97,11 @@ input_norm_enabled: true
 reward_norm_enabled: true
 reward_norm_clip: 5.0
 reward_tanh_enabled: false
+lr_decay_enabled: true
+lr_final_factor: 0.1
 critic_lr: 1.0e-4
+actor_hidden: 256
+critic_hidden: 256
 
 # Imitation loss (queue_aware): accel only
 imitation_enabled: true

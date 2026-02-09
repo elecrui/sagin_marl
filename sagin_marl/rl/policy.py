@@ -175,14 +175,14 @@ class ActorNet(nn.Module):
             dist_out=out,
         )
 
-    def evaluate_actions(
+    def evaluate_actions_parts(
         self,
         obs: torch.Tensor,
         action: torch.Tensor,
         out: Dict[str, torch.Tensor] | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         if not torch.isfinite(obs).all():
-            print("NaN/Inf detected in obs passed to evaluate_actions")
+            print("NaN/Inf detected in obs passed to evaluate_actions_parts")
             raise ValueError("obs contains NaN/Inf")
         if out is None:
             out = self.forward(obs)
@@ -190,31 +190,42 @@ class ActorNet(nn.Module):
 
         mu = out["mu"]
         if not torch.isfinite(mu).all():
-            print("NaN/Inf detected in actor mu inside evaluate_actions")
+            print("NaN/Inf detected in actor mu inside evaluate_actions_parts")
             raise ValueError("actor mu contains NaN/Inf")
         log_std = torch.clamp(self.log_std, -5.0, 2.0)
         std = torch.exp(log_std)
         if not torch.isfinite(std).all():
-            print("NaN/Inf detected in actor std inside evaluate_actions")
+            print("NaN/Inf detected in actor std inside evaluate_actions_parts")
             raise ValueError("actor std contains NaN/Inf")
         dist = Normal(mu, std)
-        logprob = _logprob_from_squashed(dist, accel_action, scale=1.0)
-        entropy = dist.entropy().sum(-1)
+        logprob_parts: Dict[str, torch.Tensor] = {"accel": _logprob_from_squashed(dist, accel_action, scale=1.0)}
+        entropy_parts: Dict[str, torch.Tensor] = {"accel": dist.entropy().sum(-1)}
 
         if self.enable_bw and bw_action is not None:
             bw_mu = out["bw_mu"]
             bw_log_std = torch.clamp(self.bw_log_std, -5.0, 2.0)
             bw_std = torch.exp(bw_log_std)
             bw_dist = Normal(bw_mu, bw_std)
-            logprob = logprob + _logprob_from_squashed(bw_dist, bw_action, scale=self.bw_scale)
-            entropy = entropy + bw_dist.entropy().sum(-1)
+            logprob_parts["bw"] = _logprob_from_squashed(bw_dist, bw_action, scale=self.bw_scale)
+            entropy_parts["bw"] = bw_dist.entropy().sum(-1)
 
         if self.enable_sat and sat_action is not None:
             sat_mu = out["sat_mu"]
             sat_log_std = torch.clamp(self.sat_log_std, -5.0, 2.0)
             sat_std = torch.exp(sat_log_std)
             sat_dist = Normal(sat_mu, sat_std)
-            logprob = logprob + _logprob_from_squashed(sat_dist, sat_action, scale=self.sat_scale)
-            entropy = entropy + sat_dist.entropy().sum(-1)
+            logprob_parts["sat"] = _logprob_from_squashed(sat_dist, sat_action, scale=self.sat_scale)
+            entropy_parts["sat"] = sat_dist.entropy().sum(-1)
 
+        return logprob_parts, entropy_parts
+
+    def evaluate_actions(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor,
+        out: Dict[str, torch.Tensor] | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logprob_parts, entropy_parts = self.evaluate_actions_parts(obs, action, out=out)
+        logprob = sum(logprob_parts.values())
+        entropy = sum(entropy_parts.values())
         return logprob, entropy
