@@ -229,6 +229,7 @@ def train(
         "value_loss",
         "entropy",
         "imitation_loss",
+        "imitation_coef",
         "actor_lr",
         "critic_lr",
         "r_service_ratio",
@@ -293,7 +294,24 @@ def train(
     no_improve = 0
     reward_history = []
     reward_rms = RunningMeanStd() if getattr(cfg, "reward_norm_enabled", False) else None
-    imitation_coef = float(getattr(cfg, "imitation_coef", 0.0) or 0.0)
+    imitation_coef_start = float(getattr(cfg, "imitation_coef", 0.0) or 0.0)
+    imitation_coef_final_cfg = getattr(cfg, "imitation_coef_final", None)
+    imitation_coef_final = (
+        imitation_coef_start
+        if imitation_coef_final_cfg is None
+        else float(imitation_coef_final_cfg)
+    )
+    imitation_coef_decay_updates = int(getattr(cfg, "imitation_coef_decay_updates", 0) or 0)
+
+    def _imitation_coef_at(update_idx: int) -> float:
+        if imitation_coef_decay_updates <= 0:
+            return imitation_coef_start
+        progress = min(
+            1.0,
+            float(max(update_idx, 0)) / float(max(imitation_coef_decay_updates - 1, 1)),
+        )
+        return imitation_coef_start + (imitation_coef_final - imitation_coef_start) * progress
+
     use_imitation_loss = ablation_flag(
         cfg,
         "use_imitation_loss",
@@ -301,10 +319,12 @@ def train(
         default=False,
     )
     use_heuristic_mask = ablation_flag(cfg, "use_heuristic_mask", default=False)
-    imitation_enabled = use_imitation_loss and imitation_coef > 0.0
+    imitation_enabled = use_imitation_loss and max(imitation_coef_start, imitation_coef_final) > 0.0
     imitation_accel = bool(getattr(cfg, "imitation_accel", True)) and train_heads["accel"]
     imitation_bw = bool(getattr(cfg, "imitation_bw", True)) and train_heads["bw"]
     imitation_sat = bool(getattr(cfg, "imitation_sat", False)) and train_heads["sat"]
+    imitation_coef_curr = _imitation_coef_at(0)
+    imitation_enabled_curr = imitation_enabled and imitation_coef_curr > 0.0
     bw_scale = float(getattr(cfg, "bw_logit_scale", 1.0) or 1.0)
     sat_scale = float(getattr(cfg, "sat_logit_scale", 1.0) or 1.0)
     exec_accel_source = _normalize_exec_source(getattr(cfg, "exec_accel_source", "policy"))
@@ -344,7 +364,7 @@ def train(
         obs_env = [obs_raw]
 
     def _build_imitation_target(obs_list):
-        if not imitation_enabled:
+        if not imitation_enabled_curr:
             return None
         base_accel, base_bw, base_sat = queue_aware_policy(obs_list, cfg)
         parts = []
@@ -365,6 +385,8 @@ def train(
         return np.concatenate(parts, axis=1).astype(np.float32, copy=False)
 
     for update in range(total_updates):
+        imitation_coef_curr = _imitation_coef_at(update)
+        imitation_enabled_curr = imitation_enabled and imitation_coef_curr > 0.0
         update_start = time.perf_counter()
         buffers = [RolloutBuffer(capacity=cfg.buffer_size) for _ in range(num_envs)]
         ep_reward = 0.0
@@ -713,7 +735,7 @@ def train(
         minibatch_size = max(1, batch_size // cfg.num_mini_batch)
         indices = np.arange(batch_size)
         imitation_mask = None
-        if imitation_enabled:
+        if imitation_enabled_curr:
             mask_parts = []
             mask_parts.append(np.ones((2,), dtype=np.float32) if imitation_accel else np.zeros((2,), dtype=np.float32))
             if cfg.enable_bw_action:
@@ -771,7 +793,7 @@ def train(
                         stop_early = True
 
                 imitation_loss = torch.tensor(0.0, device=device)
-                if imitation_enabled and imitation_mask is not None and imitation_mask_sum > 0:
+                if imitation_enabled_curr and imitation_mask is not None and imitation_mask_sum > 0:
                     pred_parts = [torch.tanh(out["mu"])]
                     if cfg.enable_bw_action:
                         pred_parts.append(torch.tanh(out["bw_mu"]) * bw_scale)
@@ -783,7 +805,7 @@ def train(
                     imitation_loss = (diff.pow(2).sum(-1) / (imitation_mask_sum + 1e-9)).mean()
 
                 actor_optim.zero_grad()
-                (policy_loss + imitation_coef * imitation_loss - cfg.entropy_coef * entropy.mean()).backward()
+                (policy_loss + imitation_coef_curr * imitation_loss - cfg.entropy_coef * entropy.mean()).backward()
                 for name, param in actor.named_parameters():
                     if param.grad is not None and not torch.isfinite(param.grad).all():
                         print(f"NaN/Inf detected in actor grad {name} at update={update}")
@@ -822,6 +844,7 @@ def train(
             "value_loss": float(np.mean(value_losses)),
             "entropy": float(np.mean(entropies)),
             "imitation_loss": imitation_loss_sum / max(1, len(policy_losses)),
+            "imitation_coef": imitation_coef_curr,
             "actor_lr": float(actor_optim.param_groups[0]["lr"]),
             "critic_lr": float(critic_optim.param_groups[0]["lr"]),
               "r_service_ratio": r_service_ratio_sum / steps_count,

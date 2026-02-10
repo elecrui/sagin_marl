@@ -324,6 +324,10 @@ sudo shutdown -h now
 - 训练命令是否用了 `--run_id` 或 `--run_dir`。
 - 每次训练先记录终端输出的 run 目录。
 
+5. 判断机器运行状态
+- htop判断多核状态
+- nvidia-smi判断GPU利用率
+
 ## 14. 最短闭环命令（可直接复用）
 
 ```bash

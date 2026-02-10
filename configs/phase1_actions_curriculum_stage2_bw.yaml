@@ -4,7 +4,7 @@
 # Notes:
 #   - exec_accel_source=teacher uses exec_teacher_actor_path if set, otherwise falls back to --init_actor.
 seed: 42
-map_size: 3000.0
+map_size: 2200.0
 tau0: 1.0
 T_steps: 400
 
@@ -31,7 +31,7 @@ boundary_mode: reflect
 candidate_mode: "nearest"
 candidate_k: 20
 
-uav_spawn_curriculum_enabled: true
+uav_spawn_curriculum_enabled: false
 uav_spawn_radius_start: 100.0
 uav_spawn_radius_end: 1000.0
 uav_spawn_curriculum_steps: 200
@@ -91,18 +91,22 @@ omega_q_gu: 1.0
 omega_q_uav: 0.0
 omega_q_sat: 0.0
 eta_drop: 1.3
-eta_service: 1.25
+eta_drop_step: 10.0
+eta_service: 0.0
 eta_assoc: 0.25
 eta_q_delta: 0.8
 eta_throughput_access: 0.4
 eta_throughput_backhaul: 0.0
 eta_accel: 0.02
 eta_centroid: 0.3
+eta_centroid_final: 0.0
+eta_centroid_decay_steps: 120000
 centroid_dist_scale: 400.0
 eta_bw_align: 0.7
 eta_sat_score: 0.0
 eta_dist_delta: 0.0
-queue_log_k: 6.0
+queue_penalty_mode: linear
+queue_log_k: 0.0
 queue_delta_use_active: true
 
 input_norm_enabled: true
@@ -117,6 +121,8 @@ critic_hidden: 256
 
 imitation_enabled: true
 imitation_coef: 0.2
+imitation_coef_final: 0.08
+imitation_coef_decay_updates: 500
 imitation_accel: false
 imitation_bw: true
 imitation_sat: false

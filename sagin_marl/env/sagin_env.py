@@ -223,6 +223,7 @@ class SaginParallelEnv(ParallelEnv):
         self.last_reward_parts = {
             "service_ratio": 0.0,
             "drop_ratio": 0.0,
+            "drop_event": 0.0,
             "queue_pen": 0.0,
             "queue_pen_gu": 0.0,
             "queue_pen_uav": 0.0,
@@ -230,6 +231,7 @@ class SaginParallelEnv(ParallelEnv):
             "queue_topk": 0.0,
             "assoc_ratio": 0.0,
             "queue_delta": 0.0,
+            "centroid_eta": 0.0,
             "centroid_reward": 0.0,
             "centroid_dist_mean": 0.0,
             "bw_align": 0.0,
@@ -240,6 +242,7 @@ class SaginParallelEnv(ParallelEnv):
             "fail_penalty": 0.0,
             "term_service": 0.0,
             "term_drop": 0.0,
+            "term_drop_step": 0.0,
             "term_queue": 0.0,
             "term_topk": 0.0,
             "term_assoc": 0.0,
@@ -837,6 +840,12 @@ class SaginParallelEnv(ParallelEnv):
             fallback_attr="reward_tanh_enabled",
             default=False,
         )
+        use_queue_log_smoothing = ablation_flag(
+            cfg,
+            "use_queue_log_smoothing",
+            default=False,
+        )
+        queue_penalty_mode = str(getattr(cfg, "queue_penalty_mode", "quadratic") or "quadratic").lower()
 
         if cfg.energy_enabled:
             p_max = self._energy_scale()
@@ -865,10 +874,15 @@ class SaginParallelEnv(ParallelEnv):
 
         def _queue_smooth(q_norm: float) -> float:
             q_norm = float(np.clip(q_norm, 0.0, 1.0))
-            k = float(getattr(cfg, "queue_log_k", 0.0) or 0.0)
-            if k > 0:
-                return math.log1p(k * q_norm) / math.log1p(k)
-            return q_norm
+            if use_queue_log_smoothing or queue_penalty_mode == "log":
+                k = float(getattr(cfg, "queue_log_k", 0.0) or 0.0)
+                if k > 0:
+                    return math.log1p(k * q_norm) / math.log1p(k)
+                return q_norm
+            if queue_penalty_mode == "linear":
+                return q_norm
+            # Default to quadratic queue penalty to amplify congestion gradients near full queues.
+            return q_norm * q_norm
 
         queue_gu = _queue_smooth(q_gu_norm)
         queue_uav = _queue_smooth(q_uav_norm)
@@ -900,6 +914,7 @@ class SaginParallelEnv(ParallelEnv):
         arrival_scale = max(arrival_ref * float(cfg.num_gu) * float(cfg.tau0), 1e-9)
         service_norm = outflow_sum / arrival_scale
         drop_norm = drop_sum / arrival_scale
+        drop_event = 1.0 if drop_sum > 1e-9 else 0.0
         throughput_access_norm = outflow_sum / arrival_scale
         throughput_backhaul_norm = backhaul_sum / arrival_scale
 
@@ -920,15 +935,23 @@ class SaginParallelEnv(ParallelEnv):
             accel_norm2 = 0.0
 
         centroid_reward, centroid_dist_mean = self._compute_centroid_stats()
+        centroid_eta_start = float(getattr(cfg, "eta_centroid", 0.0) or 0.0)
+        centroid_eta_final = getattr(cfg, "eta_centroid_final", None)
+        centroid_eta_decay_steps = int(getattr(cfg, "eta_centroid_decay_steps", 0) or 0)
+        centroid_eta = centroid_eta_start
+        if centroid_eta_final is not None and centroid_eta_decay_steps > 0:
+            progress = min(1.0, float(self.global_step) / float(max(centroid_eta_decay_steps, 1)))
+            centroid_eta = centroid_eta_start + (float(centroid_eta_final) - centroid_eta_start) * progress
         dist_delta = 0.0
         queue_topk = 0.0
         bw_align = float(getattr(self, "last_bw_align", 0.0))
         sat_score = float(getattr(self, "last_sat_score", 0.0))
         term_service = cfg.eta_service * service_norm
-        term_drop = -cfg.eta_drop * drop_norm
+        term_drop_step = -float(getattr(cfg, "eta_drop_step", 0.0) or 0.0) * drop_event
+        term_drop = -cfg.eta_drop * drop_norm + term_drop_step
         term_queue = -cfg.omega_q * queue_term
         term_q_delta = cfg.eta_q_delta * queue_delta
-        term_centroid = cfg.eta_centroid * centroid_reward
+        term_centroid = centroid_eta * centroid_reward
         term_accel = -cfg.eta_accel * accel_norm2
         term_energy = cfg.omega_e * r_energy if use_energy_reward else 0.0
         raw_reward = (
@@ -965,6 +988,7 @@ class SaginParallelEnv(ParallelEnv):
         self.last_reward_parts = {
             "service_ratio": service_ratio,
             "drop_ratio": drop_ratio,
+            "drop_event": drop_event,
             "arrival_sum": arrival_sum,
             "outflow_sum": outflow_sum,
             "backhaul_sum": backhaul_sum,
@@ -981,6 +1005,7 @@ class SaginParallelEnv(ParallelEnv):
             "queue_total_active": q_total_active,
             "assoc_ratio": assoc_ratio,
             "queue_delta": queue_delta,
+            "centroid_eta": centroid_eta,
             "dist_reward": dist_reward,
             "dist_delta": dist_delta,
             "centroid_reward": centroid_reward,
@@ -992,6 +1017,7 @@ class SaginParallelEnv(ParallelEnv):
             "arrival_rate_eff": float(getattr(self, "last_arrival_rate", cfg.task_arrival_rate)),
             "term_service": term_service,
             "term_drop": term_drop,
+            "term_drop_step": term_drop_step,
             "term_queue": term_queue,
             "term_topk": term_topk,
             "term_assoc": term_assoc,
