@@ -131,9 +131,9 @@ python scripts/train.py \
   --config configs/phase1_actions_curriculum_stage1_accel.yaml \
   --log_dir runs/phase1_actions \
   --run_id stage1_accel \
-  --num_envs 8 \
+  --num_envs 16 \
   --vec_backend subproc \
-  --torch_threads 8 \
+  --torch_threads 2 \
   --updates 400
 ```
 
@@ -146,9 +146,9 @@ python scripts/train.py \
   --run_id stage2_bw \
   --init_actor runs/phase1_actions/stage1_accel/actor.pt \
   --init_critic runs/phase1_actions/stage1_accel/critic.pt \
-  --num_envs 8 \
+  --num_envs 16 \
   --vec_backend subproc \
-  --torch_threads 8 \
+  --torch_threads 2 \
   --updates 500
 ```
 
@@ -161,16 +161,16 @@ python scripts/train.py \
   --run_id stage3_sat \
   --init_actor runs/phase1_actions/stage2_bw/actor.pt \
   --init_critic runs/phase1_actions/stage2_bw/critic.pt \
-  --num_envs 8 \
+  --num_envs 16 \
   --vec_backend subproc \
-  --torch_threads 8 \
+  --torch_threads 2 \
   --updates 500
 ```
 
 参数建议（按 CPU 核数调整）：
-- 8 vCPU：`--num_envs 4 --torch_threads 4`
-- 16 vCPU：`--num_envs 8 --torch_threads 8`
-- 24+ vCPU：从 `--num_envs 8` 逐步加到 `12` 或 `16`，实测吞吐后再定
+- 8 vCPU：`--num_envs 16 --torch_threads 2`
+- 16 vCPU：`--num_envs 16 --torch_threads 2`
+- 24+ vCPU：从 `--num_envs 16` 逐步加到 `12` 或 `16`，实测吞吐后再定
 
 tmux 常用：
 - 退出不停止：`Ctrl+b` 然后按 `d`
@@ -336,7 +336,7 @@ sudo shutdown -h now
 
 ```bash
 source .venv/bin/activate
-python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --log_dir runs/phase1_actions --run_id exp_cloud_001 --num_envs 8 --vec_backend subproc --torch_threads 8 --updates 400
+python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --log_dir runs/phase1_actions --run_id exp_cloud_001 --num_envs 16 --vec_backend subproc --torch_threads 2 --updates 400
 python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir runs/phase1_actions/exp_cloud_001 --episodes 20
 python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --run_dir runs/phase1_actions/exp_cloud_001 --episodes 20 --baseline queue_aware
 python scripts/analyze_metrics.py --run_dir runs/phase1_actions/exp_cloud_001 --window 20

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -31,6 +32,10 @@ class SaginParallelEnv(ParallelEnv):
             earth_rotation_rate=cfg.earth_rotation_rate,
         )
         self._uav_height_sq = cfg.uav_height ** 2
+        self._uav_orbit_radius = cfg.r_earth + cfg.uav_height
+        self._sat_orbit_radius = cfg.r_earth + cfg.sat_height
+        self._uav_orbit_radius_sq = self._uav_orbit_radius ** 2
+        self._sat_orbit_radius_sq = self._sat_orbit_radius ** 2
         self._backhaul_gain_const = (
             (cfg.speed_of_light / (4.0 * math.pi * cfg.carrier_freq)) ** 2
             * cfg.uav_tx_gain
@@ -236,6 +241,18 @@ class SaginParallelEnv(ParallelEnv):
             }
         )
 
+    def _empty_step_profile(self) -> Dict[str, float]:
+        return {
+            "dynamics_time_sec": 0.0,
+            "orbit_visible_time_sec": 0.0,
+            "assoc_access_time_sec": 0.0,
+            "backhaul_queue_time_sec": 0.0,
+            "reward_time_sec": 0.0,
+            "obs_time_sec": 0.0,
+            "state_time_sec": 0.0,
+            "step_total_time_sec": 0.0,
+        }
+
     def observation_space(self, agent):
         return self._obs_space
 
@@ -295,6 +312,7 @@ class SaginParallelEnv(ParallelEnv):
         self.last_bw_align = 0.0
         self.last_sat_score = 0.0
         self.last_arrival_rate = float(getattr(self, "effective_task_arrival_rate", cfg.task_arrival_rate))
+        self.last_step_profile = self._empty_step_profile()
 
         self.last_association = np.full((cfg.num_gu,), -1, dtype=np.int32)
         self.prev_association = self.last_association.copy()
@@ -355,6 +373,7 @@ class SaginParallelEnv(ParallelEnv):
         self._cached_eta = np.zeros((cfg.num_uav, cfg.users_obs_max), dtype=np.float32)
         self._cached_sat_obs = np.zeros((cfg.num_uav, cfg.sats_obs_max, self.sat_dim), dtype=np.float32)
         self._cached_sat_mask = np.zeros((cfg.num_uav, cfg.sats_obs_max), dtype=np.float32)
+        self._cached_global_state = None
         self._invalidate_step_caches()
         self._refresh_uav_cache()
 
@@ -389,10 +408,13 @@ class SaginParallelEnv(ParallelEnv):
             }
             for agent in self.agents
         }
+        self._refresh_global_state_cache()
         return obs, infos
 
     def step(self, actions: Dict[str, Dict]):
         cfg = self.cfg
+        step_start = time.perf_counter()
+        step_profile = self._empty_step_profile()
         self.global_step = int(getattr(self, "global_step", 0)) + 1
         self.prev_queue_sum = float(
             np.sum(self.gu_queue) + np.sum(self.uav_queue) + np.sum(self.sat_queue)
@@ -406,20 +428,26 @@ class SaginParallelEnv(ParallelEnv):
             self.prev_d_min = float(np.min(d2d))
         else:
             self.prev_d_min = 0.0
+        profile_start = time.perf_counter()
         self._apply_uav_dynamics(actions)
+        step_profile["dynamics_time_sec"] = time.perf_counter() - profile_start
 
         self.prev_association = self.last_association.copy()
         # Satellite states
+        profile_start = time.perf_counter()
         sat_pos, sat_vel = self._get_orbit_states()
         visible = self._visible_sats_sorted(sat_pos)
+        step_profile["orbit_visible_time_sec"] = time.perf_counter() - profile_start
 
         # Compute associations and rates
+        profile_start = time.perf_counter()
         assoc = self._associate_users()
         candidate_lists = self._build_candidate_users(assoc)
-
         access_rates, eta = self._compute_access_rates(assoc, candidate_lists, actions)
+        step_profile["assoc_access_time_sec"] = time.perf_counter() - profile_start
 
         # Update GU queues
+        profile_start = time.perf_counter()
         gu_outflow = self._update_gu_queues(access_rates, assoc)
 
         # Backhaul selection and rates
@@ -430,13 +458,17 @@ class SaginParallelEnv(ParallelEnv):
         # Update UAV queues and satellite queues
         outflow_matrix = self._update_uav_queues(gu_outflow, rate_matrix)
         self._update_sat_queues(outflow_matrix)
+        step_profile["backhaul_queue_time_sec"] = time.perf_counter() - profile_start
 
         # Cache for obs
+        profile_start = time.perf_counter()
         self._cached_candidates = candidate_lists
         self._cache_sat_obs(sat_pos, sat_vel, visible)
         self._cached_eta = eta
+        step_profile["obs_time_sec"] = time.perf_counter() - profile_start
 
         # Rewards and done
+        profile_start = time.perf_counter()
         reward = self._compute_reward()
         collision = bool(getattr(self, "last_reward_parts", {}).get("collision_event", 0.0) > 0.5)
         if not collision:
@@ -449,8 +481,16 @@ class SaginParallelEnv(ParallelEnv):
         truncated = self.t >= (cfg.T_steps - 1)
 
         self.t += 1
+        step_profile["reward_time_sec"] = time.perf_counter() - profile_start
 
+        profile_start = time.perf_counter()
         obs = {agent: self._get_obs(idx) for idx, agent in enumerate(self.agents)}
+        step_profile["obs_time_sec"] += time.perf_counter() - profile_start
+        profile_start = time.perf_counter()
+        self._refresh_global_state_cache()
+        step_profile["state_time_sec"] = time.perf_counter() - profile_start
+        step_profile["step_total_time_sec"] = time.perf_counter() - step_start
+        self.last_step_profile = step_profile
         rewards = {agent: reward for agent in self.agents}
         terminations = {agent: terminated for agent in self.agents}
         truncations = {agent: truncated for agent in self.agents}
@@ -549,6 +589,8 @@ class SaginParallelEnv(ParallelEnv):
         self._cached_orbit_t = None
         self._cached_orbit_pos = None
         self._cached_orbit_vel = None
+        self._cached_elevation_t = None
+        self._cached_elevation_matrix = None
         self._cached_uav_ecef = None
         self._cached_uav_vel_ecef = None
         self._cached_uav_neighbor_t = None
@@ -590,6 +632,8 @@ class SaginParallelEnv(ParallelEnv):
             )
         self._cached_uav_ecef = uav_ecef
         self._cached_uav_vel_ecef = uav_vel_ecef
+        self._cached_elevation_t = None
+        self._cached_elevation_matrix = None
         self._cached_uav_neighbor_t = None
         self._cached_uav_neighbor_order = None
 
@@ -1250,14 +1294,32 @@ class SaginParallelEnv(ParallelEnv):
         return t @ np.array([east, north, up], dtype=np.float32)
 
     def _elevation_angle(self, u: int, l: int, sat_pos: np.ndarray) -> float:
-        cfg = self.cfg
-        r_u = cfg.r_earth + cfg.uav_height
-        r_s = cfg.r_earth + cfg.sat_height
         q = self._uav_ecef(u)
         d = np.linalg.norm(sat_pos[l] - q)
-        arg = (r_s ** 2 - r_u ** 2 - d ** 2) / (2.0 * r_u * d + 1e-9)
+        arg = (self._sat_orbit_radius_sq - self._uav_orbit_radius_sq - d ** 2) / (
+            2.0 * self._uav_orbit_radius * d + 1e-9
+        )
         arg = np.clip(arg, -1.0, 1.0)
         return float(math.asin(arg))
+
+    def _get_elevation_matrix(self, sat_pos: np.ndarray | None = None) -> np.ndarray:
+        if self._cached_elevation_t == self.t and self._cached_elevation_matrix is not None:
+            return self._cached_elevation_matrix
+
+        if sat_pos is None:
+            sat_pos, _ = self._get_orbit_states()
+        if self._cached_uav_ecef is None:
+            self._refresh_uav_cache()
+
+        rel = sat_pos[None, :, :] - self._cached_uav_ecef[:, None, :]
+        dist = np.linalg.norm(rel, axis=2)
+        arg = (self._sat_orbit_radius_sq - self._uav_orbit_radius_sq - dist * dist) / (
+            2.0 * self._uav_orbit_radius * dist + 1e-9
+        )
+        np.clip(arg, -1.0, 1.0, out=arg)
+        self._cached_elevation_matrix = np.arcsin(arg).astype(np.float32, copy=False)
+        self._cached_elevation_t = self.t
+        return self._cached_elevation_matrix
 
     def _fly_power(self, speed: np.ndarray | float) -> np.ndarray:
         cfg = self.cfg
@@ -1287,24 +1349,22 @@ class SaginParallelEnv(ParallelEnv):
 
     def _visible_sats_sorted(self, sat_pos: np.ndarray) -> List[List[int]]:
         cfg = self.cfg
+        elev_matrix = self._get_elevation_matrix(sat_pos)
+        order = np.argsort(-elev_matrix, axis=1, kind="stable")
         visible: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        max_keep = cfg.visible_sats_max if cfg.visible_sats_max is not None else cfg.sats_obs_max
+        min_keep = cfg.visible_sats_min
         for u in range(cfg.num_uav):
-            elev_list = []
-            for l in range(cfg.num_sat):
-                theta = self._elevation_angle(u, l, sat_pos)
-                elev_list.append((l, theta))
-            elev_list.sort(key=lambda x: x[1], reverse=True)
-
-            above = [l for l, th in elev_list if th >= cfg.theta_min_rad]
-            min_keep = cfg.visible_sats_min
-            if min_keep is not None and len(above) < min_keep:
+            sat_order = order[u]
+            elev_sorted = elev_matrix[u, sat_order]
+            above = sat_order[elev_sorted >= cfg.theta_min_rad]
+            if min_keep is not None and above.size < min_keep:
                 # Include highest-elevation satellites even if below theta_min to enforce minimum visibility.
-                needed = min_keep - len(above)
-                extra = [l for l, th in elev_list if th < cfg.theta_min_rad][:needed]
-                above.extend(extra)
-
-            max_keep = cfg.visible_sats_max if cfg.visible_sats_max is not None else cfg.sats_obs_max
-            visible[u] = above[: max_keep]
+                needed = min_keep - int(above.size)
+                extra = sat_order[elev_sorted < cfg.theta_min_rad][:needed]
+                if extra.size > 0:
+                    above = np.concatenate((above, extra), axis=0)
+            visible[u] = above[:max_keep].tolist()
         return visible
 
     def _uav_ecef(self, u: int) -> np.ndarray:
@@ -1419,21 +1479,15 @@ class SaginParallelEnv(ParallelEnv):
             "nbrs_mask": nbrs_mask,
         }
 
-    def get_global_state(self) -> np.ndarray:
+    def _build_global_state(self) -> np.ndarray:
         cfg = self.cfg
         # Flatten global state for critic
         sat_pos, sat_vel = self._get_orbit_states()
         sat_idx = None
         if cfg.sat_state_max is not None and cfg.sat_state_max < cfg.num_sat:
-            scores = np.full((cfg.num_sat,), -np.inf, dtype=np.float32)
-            for l in range(cfg.num_sat):
-                max_theta = -1e9
-                for u in range(cfg.num_uav):
-                    theta = self._elevation_angle(u, l, sat_pos)
-                    if theta > max_theta:
-                        max_theta = theta
-                scores[l] = max_theta
-            sat_idx = np.argsort(scores)[::-1][: cfg.sat_state_max]
+            elev_matrix = self._get_elevation_matrix(sat_pos)
+            scores = np.max(elev_matrix, axis=0)
+            sat_idx = np.argsort(-scores, kind="stable")[: cfg.sat_state_max]
             sat_pos = sat_pos[sat_idx]
             sat_vel = sat_vel[sat_idx]
             sat_queue = self.sat_queue[sat_idx]
@@ -1451,7 +1505,16 @@ class SaginParallelEnv(ParallelEnv):
             sat_queue / cfg.queue_max_sat,
             np.array([self.t / max(cfg.T_steps, 1)], dtype=np.float32),
         ]
-        return np.concatenate(parts).astype(np.float32)
+        return np.concatenate(parts).astype(np.float32, copy=False)
+
+    def _refresh_global_state_cache(self) -> np.ndarray:
+        self._cached_global_state = self._build_global_state()
+        return self._cached_global_state
+
+    def get_global_state(self) -> np.ndarray:
+        if self._cached_global_state is None:
+            return self._refresh_global_state_cache()
+        return self._cached_global_state
 
     def render(self, mode="rgb_array"):
         if mode == "human":

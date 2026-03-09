@@ -48,6 +48,7 @@ def _single_env_step_stats(env) -> Dict[str, object]:
     num_agents = len(getattr(env, "agents", []))
     default_accel = np.zeros((num_agents, 2), dtype=np.float32)
     parts = getattr(env, "last_reward_parts", None) or {}
+    profile = getattr(env, "last_step_profile", None) or {}
     sat_processed = getattr(env, "last_sat_processed", None)
     sat_incoming = getattr(env, "last_sat_incoming", None)
 
@@ -64,11 +65,22 @@ def _single_env_step_stats(env) -> Dict[str, object]:
         "sat_processed_sum": _safe_sum(sat_processed) if sat_processed is not None else 0.0,
         "sat_incoming_sum": _safe_sum(sat_incoming) if sat_incoming is not None else 0.0,
         "energy_mean": _safe_mean(getattr(env, "uav_energy", 0.0)),
+        "dynamics_time_sec": float(profile.get("dynamics_time_sec", 0.0)),
+        "orbit_visible_time_sec": float(profile.get("orbit_visible_time_sec", 0.0)),
+        "assoc_access_time_sec": float(profile.get("assoc_access_time_sec", 0.0)),
+        "backhaul_queue_time_sec": float(profile.get("backhaul_queue_time_sec", 0.0)),
+        "reward_time_sec": float(profile.get("reward_time_sec", 0.0)),
+        "obs_time_sec": float(profile.get("obs_time_sec", 0.0)),
+        "state_time_sec": float(profile.get("state_time_sec", 0.0)),
+        "step_total_time_sec": float(profile.get("step_total_time_sec", 0.0)),
         "reward_parts": dict(parts),
     }
 
 
 def _get_state_batch(env) -> np.ndarray:
+    cached_states = getattr(env, "last_state_batch", None)
+    if cached_states is not None:
+        return np.asarray(cached_states, dtype=np.float32)
     if hasattr(env, "get_global_state_batch"):
         states = env.get_global_state_batch()
         return np.asarray(states, dtype=np.float32)
@@ -145,7 +157,8 @@ def train(
 
     num_agents = len(env.agents)
     obs_dim = batch_flatten_obs(list(obs_sample_env[0].values()), cfg).shape[1]
-    global_state = _get_state_batch(env)[0]
+    state_batch_np = _get_state_batch(env)
+    global_state = state_batch_np[0]
     state_dim = global_state.shape[0]
 
     actor = ActorNet(obs_dim, cfg).to(device)
@@ -318,6 +331,18 @@ def train(
         "sat_processed_sum",
         "sat_incoming_sum",
         "energy_mean",
+        "env_dynamics_time_sec",
+        "env_orbit_visible_time_sec",
+        "env_assoc_access_time_sec",
+        "env_backhaul_queue_time_sec",
+        "env_reward_time_sec",
+        "env_obs_time_sec",
+        "env_state_time_sec",
+        "env_step_total_time_sec",
+        "state_fetch_time_sec",
+        "policy_forward_time_sec",
+        "action_pack_time_sec",
+        "env_step_time_sec",
         "update_time_sec",
         "rollout_time_sec",
         "optim_time_sec",
@@ -396,13 +421,7 @@ def train(
         f"accel={exec_accel_source}, bw={exec_bw_source}, sat={exec_sat_source}"
     )
 
-    obs_raw, _ = env.reset()
-    if num_envs > 1:
-        if not isinstance(obs_raw, list) or len(obs_raw) != num_envs:
-            raise ValueError("Vectorized env reset() must return a list of per-env observations.")
-        obs_env = obs_raw
-    else:
-        obs_env = [obs_raw]
+    obs_env = list(obs_sample_env) if num_envs > 1 else [obs_sample_raw]
 
     def _build_imitation_target(obs_list):
         if not imitation_enabled_curr:
@@ -443,6 +462,14 @@ def train(
         sat_processed_sum = 0.0
         sat_incoming_sum = 0.0
         energy_mean_sum = 0.0
+        dynamics_time_sum = 0.0
+        orbit_visible_time_sum = 0.0
+        assoc_access_time_sum = 0.0
+        backhaul_queue_time_sum = 0.0
+        reward_time_sum = 0.0
+        obs_time_sum = 0.0
+        state_time_sum = 0.0
+        step_total_time_sum = 0.0
         r_service_ratio_sum = 0.0
         r_drop_ratio_sum = 0.0
         r_queue_pen_sum = 0.0
@@ -504,7 +531,20 @@ def train(
         queue_total_active_max = 0.0
 
         rollout_start = time.perf_counter()
+        state_fetch_time = 0.0
+        policy_forward_time = 0.0
+        action_pack_time = 0.0
+        env_step_time = 0.0
         for step in range(cfg.buffer_size):
+            state_fetch_start = time.perf_counter()
+            curr_state_batch_np = np.asarray(state_batch_np, dtype=np.float32)
+            if curr_state_batch_np.shape[0] != num_envs:
+                raise ValueError(
+                    f"Expected {num_envs} states from env, got {curr_state_batch_np.shape[0]}"
+                )
+            state_fetch_time += time.perf_counter() - state_fetch_start
+
+            action_pack_start = time.perf_counter()
             per_env_obs_lists = [list(obs_e.values()) for obs_e in obs_env]
             per_env_obs_batch = [batch_flatten_obs(obs_list, cfg) for obs_list in per_env_obs_lists]
             obs_batch = np.concatenate(per_env_obs_batch, axis=0)
@@ -512,22 +552,15 @@ def train(
                 print(f"NaN/Inf detected in obs_batch at update={update}, step={step}")
                 raise ValueError("obs_batch contains NaN/Inf")
             obs_tensor = torch.from_numpy(obs_batch).to(device)
+            action_pack_time += time.perf_counter() - action_pack_start
 
-            state_batch_np = _get_state_batch(env)
-            if state_batch_np.shape[0] != num_envs:
-                raise ValueError(
-                    f"Expected {num_envs} states from env, got {state_batch_np.shape[0]}"
-                )
+            policy_forward_start = time.perf_counter()
             with torch.inference_mode():
                 policy_out = actor.act(obs_tensor)
-                value = critic(torch.from_numpy(state_batch_np).to(device))
+                value = critic(torch.from_numpy(curr_state_batch_np).to(device))
             if not torch.isfinite(policy_out.dist_out["mu"]).all():
                 print(f"NaN/Inf detected in actor mu at update={update}, step={step}")
                 raise ValueError("actor mu contains NaN/Inf")
-
-            accel_actions = policy_out.accel.cpu().numpy()
-            bw_logits_all = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
-            sat_logits_all = policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
             teacher_accel_all = None
             teacher_bw_all = None
             teacher_sat_all = None
@@ -537,6 +570,12 @@ def train(
                 teacher_accel_all = teacher_out.accel.cpu().numpy()
                 teacher_bw_all = teacher_out.bw_logits.cpu().numpy() if teacher_out.bw_logits is not None else None
                 teacher_sat_all = teacher_out.sat_logits.cpu().numpy() if teacher_out.sat_logits is not None else None
+            policy_forward_time += time.perf_counter() - policy_forward_start
+
+            action_pack_start = time.perf_counter()
+            accel_actions = policy_out.accel.cpu().numpy()
+            bw_logits_all = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
+            sat_logits_all = policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
 
             action_dicts = []
             accel_cmd_list: List[np.ndarray] = []
@@ -606,7 +645,9 @@ def train(
                 accel_cmd_list.append(accel_cmd)
                 bw_exec_list.append(bw_exec)
                 sat_exec_list.append(sat_exec)
+            action_pack_time += time.perf_counter() - action_pack_start
 
+            env_step_start = time.perf_counter()
             if num_envs > 1:
                 next_obs_env, rewards_env, terms_env, truncs_env, _ = env.step(action_dicts, auto_reset=True)
                 step_stats = getattr(env, "last_step_stats", None)
@@ -622,6 +663,15 @@ def train(
                 rewards_env = [rewards]
                 terms_env = [terms]
                 truncs_env = [truncs]
+            env_step_time += time.perf_counter() - env_step_start
+
+            state_fetch_start = time.perf_counter()
+            next_state_batch_np = _get_state_batch(env)
+            if next_state_batch_np.shape[0] != num_envs:
+                raise ValueError(
+                    f"Expected {num_envs} next states from env, got {next_state_batch_np.shape[0]}"
+                )
+            state_fetch_time += time.perf_counter() - state_fetch_start
 
             value_np = value.detach().cpu().numpy().reshape(num_envs)
 
@@ -670,6 +720,14 @@ def train(
                 sat_incoming_sum += float(stats.get("sat_incoming_sum", 0.0))
                 if cfg.energy_enabled:
                     energy_mean_sum += float(stats.get("energy_mean", 0.0))
+                dynamics_time_sum += float(stats.get("dynamics_time_sec", 0.0))
+                orbit_visible_time_sum += float(stats.get("orbit_visible_time_sec", 0.0))
+                assoc_access_time_sum += float(stats.get("assoc_access_time_sec", 0.0))
+                backhaul_queue_time_sum += float(stats.get("backhaul_queue_time_sec", 0.0))
+                reward_time_sum += float(stats.get("reward_time_sec", 0.0))
+                obs_time_sum += float(stats.get("obs_time_sec", 0.0))
+                state_time_sum += float(stats.get("state_time_sec", 0.0))
+                step_total_time_sum += float(stats.get("step_total_time_sec", 0.0))
 
                 parts = stats.get("reward_parts", None)
                 if parts:
@@ -746,11 +804,12 @@ def train(
                     reward_scalar,
                     float(value_np[env_idx]),
                     done_scalar,
-                    state_batch_np[env_idx],
+                    curr_state_batch_np[env_idx],
                     _build_imitation_target(per_env_obs_lists[env_idx]),
                 )
 
             obs_env = list(next_obs_env)
+            state_batch_np = next_state_batch_np
         rollout_time = time.perf_counter() - rollout_start
 
         # Prepare batches
@@ -1080,6 +1139,18 @@ def train(
             "sat_processed_sum": sat_processed_sum,
             "sat_incoming_sum": sat_incoming_sum,
             "energy_mean": (energy_mean_sum / steps_count) if cfg.energy_enabled else 0.0,
+            "env_dynamics_time_sec": dynamics_time_sum / steps_count,
+            "env_orbit_visible_time_sec": orbit_visible_time_sum / steps_count,
+            "env_assoc_access_time_sec": assoc_access_time_sum / steps_count,
+            "env_backhaul_queue_time_sec": backhaul_queue_time_sum / steps_count,
+            "env_reward_time_sec": reward_time_sum / steps_count,
+            "env_obs_time_sec": obs_time_sum / steps_count,
+            "env_state_time_sec": state_time_sum / steps_count,
+            "env_step_total_time_sec": step_total_time_sum / steps_count,
+            "state_fetch_time_sec": state_fetch_time,
+            "policy_forward_time_sec": policy_forward_time,
+            "action_pack_time_sec": action_pack_time,
+            "env_step_time_sec": env_step_time,
             "update_time_sec": update_time,
             "rollout_time_sec": rollout_time,
             "optim_time_sec": optim_time,

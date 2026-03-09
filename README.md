@@ -46,7 +46,7 @@ python scripts/estimate_throughput.py --config configs/phase1_actions_curriculum
 说明：脚本会同时输出 `Arrival raw`（`num_gu * task_arrival_rate * tau0`）与 `Arrival eff`（与环境 `effective_task_arrival_rate` 一致的训练口径）。
 2. 训练（自动生成独立目录，避免多次流程数据堆在一起）
 ```powershell
-python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --log_dir runs/phase1_actions --run_id auto --num_envs 8 --vec_backend subproc --torch_threads 8 --updates 400
+python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --log_dir runs/phase1_actions --run_id auto --num_envs 16 --vec_backend subproc --torch_threads 2 --updates 400
 ```
 说明：终端会输出 `Run dir: runs/phase1_actions/20260204_121530`，下文用 `<RUN_DIR>` 指代该目录。
 如需手动指定目录，可用 `--run_dir runs/phase1_actions/exp1`。
@@ -108,7 +108,7 @@ tensorboard --logdir runs/phase1_actions
 
 训练：
 ```powershell
-python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --log_dir runs/phase1_actions --run_id auto --num_envs 8 --vec_backend subproc --torch_threads 8 --updates 400
+python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --log_dir runs/phase1_actions --run_id auto --num_envs 16 --vec_backend subproc --torch_threads 2 --updates 400
 ```
 
 评估（输出 CSV）：
