@@ -40,6 +40,10 @@ def _collect_step_stats(env: SaginParallelEnv) -> Dict[str, object]:
 
     return {
         "last_exec_accel": np.asarray(getattr(env, "last_exec_accel", default_accel), dtype=np.float32),
+        "danger_imitation_mask": np.asarray(
+            getattr(env, "last_danger_imitation_mask", np.zeros((num_agents,), dtype=np.float32)),
+            dtype=np.float32,
+        ),
         "gu_queue_mean": _safe_mean(getattr(env, "gu_queue", 0.0)),
         "uav_queue_mean": _safe_mean(getattr(env, "uav_queue", 0.0)),
         "sat_queue_mean": _safe_mean(getattr(env, "sat_queue", 0.0)),

@@ -73,7 +73,12 @@ class MetricLogger:
                     "Multiline",
                     [
                         "r_term_service",
+                        "r_term_throughput_access",
+                        "r_term_throughput_backhaul",
                         "r_term_drop",
+                        "r_term_drop_gu",
+                        "r_term_drop_uav",
+                        "r_term_drop_sat",
                         "r_term_queue",
                         "r_term_assoc",
                         "r_term_q_delta",
@@ -108,11 +113,43 @@ class MetricLogger:
                         "adv_clip_frac",
                     ],
                 ],
+                "DangerImitation": [
+                    "Multiline",
+                    [
+                        "danger_imitation_loss",
+                        "danger_imitation_coef",
+                        "danger_imitation_active_rate",
+                    ],
+                ],
                 "RewardNorm": ["Multiline", ["reward_rms_sigma", "reward_clip_frac"]],
             },
             "Training/Queues": {
                 "QueueMean": ["Multiline", ["gu_queue_mean", "uav_queue_mean", "sat_queue_mean"]],
                 "QueueMax": ["Multiline", ["gu_queue_max", "uav_queue_max", "sat_queue_max"]],
+                "QueueFill": [
+                    "Multiline",
+                    [
+                        "gu_queue_fill_fraction",
+                        "uav_queue_fill_fraction",
+                        "sat_queue_fill_fraction",
+                    ],
+                ],
+                "QueueArrivalSteps": [
+                    "Multiline",
+                    [
+                        "gu_queue_arrival_steps",
+                        "uav_queue_arrival_steps",
+                        "sat_queue_arrival_steps",
+                    ],
+                ],
+                "QueueLayerDelta": [
+                    "Multiline",
+                    [
+                        "queue_delta_gu",
+                        "queue_delta_uav",
+                        "queue_delta_sat",
+                    ],
+                ],
                 "QueueNorm": [
                     "Multiline",
                     [
@@ -140,13 +177,33 @@ class MetricLogger:
                 ],
             },
             "Training/Drops": {
-                "Drops": ["Multiline", ["drop_sum", "gu_drop_sum", "uav_drop_sum"]],
+                "Drops": ["Multiline", ["drop_sum", "gu_drop_sum", "uav_drop_sum", "sat_drop_sum"]],
+                "DropNorms": [
+                    "Multiline",
+                    [
+                        "gu_drop_norm",
+                        "uav_drop_norm",
+                        "sat_drop_norm",
+                    ],
+                ],
+                "DropRatios": [
+                    "Multiline",
+                    [
+                        "gu_drop_ratio_step",
+                        "uav_drop_ratio_step",
+                        "sat_drop_ratio_step",
+                    ],
+                ],
             },
             "Training/Safety": {
                 "Collision": ["Multiline", ["collision_rate", "r_collision_penalty"]],
                 "Avoidance": [
                     "Multiline",
                     [
+                        "danger_imitation_active_rate",
+                        "intervention_norm",
+                        "intervention_rate",
+                        "intervention_norm_top1",
                         "avoidance_eta_eff",
                         "avoidance_eta_exec",
                         "avoidance_collision_rate_ema",
@@ -158,6 +215,23 @@ class MetricLogger:
             },
             "Training/Satellite": {
                 "SatFlow": ["Multiline", ["sat_incoming_sum", "sat_processed_sum"]],
+                "ThroughputNorm": [
+                    "Multiline",
+                    [
+                        "throughput_access_norm",
+                        "throughput_backhaul_norm",
+                        "sat_processed_norm",
+                    ],
+                ],
+                "LinkRatios": [
+                    "Multiline",
+                    [
+                        "outflow_arrival_ratio_step",
+                        "sat_incoming_arrival_ratio_step",
+                        "sat_processed_arrival_ratio_step",
+                        "sat_processed_incoming_ratio_step",
+                    ],
+                ],
             },
             "Training/Performance": {
                 "Throughput": ["Multiline", ["env_steps_per_sec", "update_steps_per_sec"]],

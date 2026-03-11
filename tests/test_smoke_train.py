@@ -37,4 +37,10 @@ def test_smoke_train(tmp_path, actor_encoder_type):
     assert "r_term_close_risk" in header
     assert "r_collision_penalty" in header
     assert "r_battery_penalty" in header
+    assert "danger_imitation_loss" in header
+    assert "danger_imitation_coef" in header
+    assert "danger_imitation_active_rate" in header
+    assert "intervention_norm" in header
+    assert "intervention_rate" in header
+    assert "intervention_norm_top1" in header
     assert "q_norm_tail_hit_rate" in header

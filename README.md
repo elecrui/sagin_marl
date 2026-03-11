@@ -295,3 +295,9 @@ python scripts/evaluate.py --config configs/phase1_actions_effect_test.yaml --ep
 ```powershell
 python scripts/summarize_policy_kpi.py --input uniform=runs/stage1_accel/eval_uniform_sat_n20.csv random=runs/stage1_accel/eval_random_sat_n20.csv queue_aware=runs/stage1_accel/eval_queue_aware_sat_n20.csv
 ```
+
+## 当前实验记录
+
+- Stage 1 accel 防撞/队列权衡实验当前暂定主线配置为 `configs/phase1_actions_curriculum_stage1_accel_setpool_prealert_top1gain_close_risk_danger_imitation_intervention_thresh005_danger_nbr_layered_reward_satrebalance.yaml`
+- 当前 accel 候选 checkpoint 暂定为 `0.10@u12`：`runs/reward_compare_stage1_vec16/new_reward_danger_imitation_intervention_thresh005_u12/actor.pt`
+- 说明：这是当前实验结论，用于后续对照和续训决策；`u24/u36` 长训 checkpoint 暂不作为默认推荐

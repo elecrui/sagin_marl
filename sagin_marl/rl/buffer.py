@@ -19,6 +19,8 @@ class RolloutBuffer:
         self._dones: Optional[np.ndarray] = None
         self._global_states: Optional[np.ndarray] = None
         self._imitation: Optional[np.ndarray] = None
+        self._danger_imitation_target: Optional[np.ndarray] = None
+        self._danger_imitation_mask: Optional[np.ndarray] = None
 
         if self._use_list:
             self.obs: List[np.ndarray] = []
@@ -29,6 +31,8 @@ class RolloutBuffer:
             self.dones: List[bool] = []
             self.global_states: List[np.ndarray] = []
             self.imitation: List[np.ndarray] = []
+            self.danger_imitation_target: List[np.ndarray] = []
+            self.danger_imitation_mask: List[np.ndarray] = []
 
     def _allocate(
         self,
@@ -37,6 +41,8 @@ class RolloutBuffer:
         logprobs: np.ndarray,
         global_state: np.ndarray,
         imitation: np.ndarray,
+        danger_imitation_target: np.ndarray,
+        danger_imitation_mask: np.ndarray,
     ) -> None:
         if self.capacity is None:
             return
@@ -49,6 +55,8 @@ class RolloutBuffer:
         self._dones = np.empty((cap,), dtype=np.float32)
         self._global_states = np.empty((cap,) + global_state.shape, dtype=np.float32)
         self._imitation = np.empty((cap,) + imitation.shape, dtype=np.float32)
+        self._danger_imitation_target = np.empty((cap,) + danger_imitation_target.shape, dtype=np.float32)
+        self._danger_imitation_mask = np.empty((cap,) + danger_imitation_mask.shape, dtype=np.float32)
 
     def add(
         self,
@@ -60,9 +68,15 @@ class RolloutBuffer:
         done: bool,
         global_state: np.ndarray,
         imitation: np.ndarray | None = None,
+        danger_imitation_target: np.ndarray | None = None,
+        danger_imitation_mask: np.ndarray | None = None,
     ) -> None:
         if imitation is None:
             imitation = np.zeros_like(actions, dtype=np.float32)
+        if danger_imitation_target is None:
+            danger_imitation_target = np.zeros((actions.shape[0], 2), dtype=np.float32)
+        if danger_imitation_mask is None:
+            danger_imitation_mask = np.zeros((actions.shape[0], 2), dtype=np.float32)
         if self._use_list:
             self.obs.append(obs)
             self.actions.append(actions)
@@ -72,10 +86,12 @@ class RolloutBuffer:
             self.dones.append(bool(done))
             self.global_states.append(global_state)
             self.imitation.append(imitation)
+            self.danger_imitation_target.append(danger_imitation_target)
+            self.danger_imitation_mask.append(danger_imitation_mask)
             return
 
         if self._obs is None:
-            self._allocate(obs, actions, logprobs, global_state, imitation)
+            self._allocate(obs, actions, logprobs, global_state, imitation, danger_imitation_target, danger_imitation_mask)
 
         if self.capacity is not None and self._idx >= self.capacity:
             raise IndexError("RolloutBuffer capacity exceeded.")
@@ -88,6 +104,8 @@ class RolloutBuffer:
         self._dones[self._idx] = float(done)
         self._global_states[self._idx] = global_state
         self._imitation[self._idx] = imitation
+        self._danger_imitation_target[self._idx] = danger_imitation_target
+        self._danger_imitation_mask[self._idx] = danger_imitation_mask
         self._idx += 1
 
     def as_arrays(self):
@@ -101,6 +119,8 @@ class RolloutBuffer:
                 np.array(self.dones, dtype=np.float32),
                 np.stack(self.global_states, axis=0),
                 np.stack(self.imitation, axis=0),
+                np.stack(self.danger_imitation_target, axis=0),
+                np.stack(self.danger_imitation_mask, axis=0),
             )
         end = self._idx
         return (
@@ -112,4 +132,6 @@ class RolloutBuffer:
             self._dones[:end],
             self._global_states[:end],
             self._imitation[:end],
+            self._danger_imitation_target[:end],
+            self._danger_imitation_mask[:end],
         )

@@ -20,18 +20,31 @@ from sagin_marl.rl.action_assembler import assemble_actions
 from sagin_marl.rl.policy import ActorNet, batch_flatten_obs
 
 
-def _resolve_paths(run_dir: str | None, checkpoint: str | None, out_csv: str | None, out_md: str | None, episode_index: int) -> tuple[str, str, str]:
+def _resolve_paths(
+    run_dir: str | None,
+    checkpoint: str | None,
+    out_dir: str | None,
+) -> tuple[str, str]:
     if run_dir:
         checkpoint = checkpoint or os.path.join(run_dir, "actor.pt")
-        base_dir = os.path.join(run_dir, "debug_exports")
+        base_dir = out_dir or os.path.join(run_dir, "debug_exports")
     else:
         checkpoint = checkpoint or "runs/phase1/actor.pt"
-        base_dir = "runs/phase1/debug_exports"
+        base_dir = out_dir or "runs/phase1/debug_exports"
     os.makedirs(base_dir, exist_ok=True)
+    return checkpoint, base_dir
+
+
+def _resolve_episode_outputs(
+    base_dir: str,
+    out_csv: str | None,
+    out_md: str | None,
+    episode_index: int,
+) -> tuple[str, str]:
     stem = f"debug_ep{episode_index:02d}"
     out_csv = out_csv or os.path.join(base_dir, f"{stem}.csv")
     out_md = out_md or os.path.join(base_dir, f"{stem}.md")
-    return checkpoint, out_csv, out_md
+    return out_csv, out_md
 
 
 def _episode_seed(seed_base: int | None, episode_index: int) -> int | None:
@@ -477,15 +490,41 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--run_dir", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--episode_index", type=int, required=True)
+    parser.add_argument("--episode_index", type=int, default=None)
+    parser.add_argument(
+        "--episode_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Export multiple episode indices in one sequential replay pass.",
+    )
     parser.add_argument("--episode_seed_base", type=int, default=None)
+    parser.add_argument(
+        "--out_dir",
+        type=str,
+        default=None,
+        help="Output directory for exported files. Default: <run_dir>/debug_exports",
+    )
     parser.add_argument("--out_csv", type=str, default=None)
     parser.add_argument("--out_md", type=str, default=None)
     args = parser.parse_args()
 
-    checkpoint, out_csv, out_md = _resolve_paths(
-        args.run_dir, args.checkpoint, args.out_csv, args.out_md, args.episode_index
-    )
+    episode_targets: set[int] = set()
+    if args.episode_index is not None:
+        episode_targets.add(int(args.episode_index))
+    if args.episode_indices:
+        episode_targets.update(int(ep) for ep in args.episode_indices)
+    if not episode_targets:
+        parser.error("Specify at least one target via --episode_index or --episode_indices.")
+    if min(episode_targets) < 0:
+        parser.error("Episode indices must be non-negative.")
+
+    target_indices = sorted(episode_targets)
+    multi_export = len(target_indices) > 1
+    if multi_export and (args.out_csv or args.out_md):
+        parser.error("--out_csv/--out_md are only supported for a single target episode.")
+
+    checkpoint, base_dir = _resolve_paths(args.run_dir, args.checkpoint, args.out_dir)
 
     cfg = load_config(args.config)
     env = SaginParallelEnv(cfg)
@@ -499,27 +538,38 @@ def main() -> None:
     actor.load_state_dict(torch.load(checkpoint, map_location=device))
     actor.eval()
 
-    # Replay prior episodes in the same order as evaluate.py so episode_idx,
+    target_lookup = set(target_indices)
+    max_target = target_indices[-1]
+
+    # Replay episodes in the same order as evaluate.py so episode_idx,
     # curriculum state, and adaptive avoidance evolve identically.
-    for ep in range(args.episode_index):
+    for ep in range(max_target + 1):
         env.reset(seed=_episode_seed(args.episode_seed_base, ep))
-        _run_episode(env, actor, device, record=False)
+        record = ep in target_lookup
+        rows, summary = _run_episode(env, actor, device, record=record)
+        if not record:
+            continue
 
-    env.reset(seed=_episode_seed(args.episode_seed_base, args.episode_index))
-    rows, summary = _run_episode(env, actor, device, record=True)
-    _write_csv(rows, out_csv)
-    _write_summary_md(out_md, args.run_dir, checkpoint, args.config, args.episode_index, args.episode_seed_base, rows, summary, cfg)
+        out_csv, out_md = _resolve_episode_outputs(
+            base_dir,
+            args.out_csv if not multi_export else None,
+            args.out_md if not multi_export else None,
+            ep,
+        )
+        _write_csv(rows, out_csv)
+        _write_summary_md(out_md, args.run_dir, checkpoint, args.config, ep, args.episode_seed_base, rows, summary, cfg)
 
-    print(f"Saved debug CSV to {out_csv}")
-    print(f"Saved summary MD to {out_md}")
-    print(
-        "Episode metrics: "
-        f"steps={summary['steps']} "
-        f"termination={summary['termination_reason']} "
-        f"collision={int(bool(summary['collision']))} "
-        f"min_inter_uav_dist={float(summary['min_inter_uav_dist']):.6f} "
-        f"final_queue_total_active={float(summary['final_queue_total_active']):.6f}"
-    )
+        print(f"Saved debug CSV to {out_csv}")
+        print(f"Saved summary MD to {out_md}")
+        print(
+            "Episode metrics: "
+            f"episode={ep} "
+            f"steps={summary['steps']} "
+            f"termination={summary['termination_reason']} "
+            f"collision={int(bool(summary['collision']))} "
+            f"min_inter_uav_dist={float(summary['min_inter_uav_dist']):.6f} "
+            f"final_queue_total_active={float(summary['final_queue_total_active']):.6f}"
+        )
 
 
 if __name__ == "__main__":

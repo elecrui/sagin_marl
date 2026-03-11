@@ -54,6 +54,10 @@ def _single_env_step_stats(env) -> Dict[str, object]:
 
     return {
         "last_exec_accel": np.asarray(getattr(env, "last_exec_accel", default_accel), dtype=np.float32),
+        "danger_imitation_mask": np.asarray(
+            getattr(env, "last_danger_imitation_mask", np.zeros((num_agents,), dtype=np.float32)),
+            dtype=np.float32,
+        ),
         "gu_queue_mean": _safe_mean(getattr(env, "gu_queue", 0.0)),
         "uav_queue_mean": _safe_mean(getattr(env, "uav_queue", 0.0)),
         "sat_queue_mean": _safe_mean(getattr(env, "sat_queue", 0.0)),
@@ -62,6 +66,7 @@ def _single_env_step_stats(env) -> Dict[str, object]:
         "sat_queue_max": _safe_max(getattr(env, "sat_queue", 0.0)),
         "gu_drop_sum": _safe_sum(getattr(env, "gu_drop", 0.0)),
         "uav_drop_sum": _safe_sum(getattr(env, "uav_drop", 0.0)),
+        "sat_drop_sum": _safe_sum(getattr(env, "sat_drop", 0.0)),
         "sat_processed_sum": _safe_sum(sat_processed) if sat_processed is not None else 0.0,
         "sat_incoming_sum": _safe_sum(sat_incoming) if sat_incoming is not None else 0.0,
         "energy_mean": _safe_mean(getattr(env, "uav_energy", 0.0)),
@@ -132,6 +137,22 @@ def _select_exec_values(
     if source == "heuristic" and heuristic_values is not None:
         return np.asarray(heuristic_values, dtype=np.float32)
     return np.zeros(shape, dtype=np.float32)
+
+
+def _build_danger_imitation_step_data(stats: Dict[str, object], cfg, num_agents: int) -> Tuple[np.ndarray, np.ndarray]:
+    accel_exec = np.asarray(
+        stats.get("last_exec_accel", np.zeros((num_agents, 2), dtype=np.float32)),
+        dtype=np.float32,
+    )
+    accel_exec_norm = accel_exec / max(float(cfg.a_max), 1e-6)
+    accel_exec_norm = np.clip(accel_exec_norm, -1.0, 1.0).astype(np.float32, copy=False)
+    mask_uav = np.asarray(
+        stats.get("danger_imitation_mask", np.zeros((num_agents,), dtype=np.float32)),
+        dtype=np.float32,
+    ).reshape(num_agents)
+    mask_uav = (mask_uav > 0.5).astype(np.float32, copy=False)
+    mask = np.repeat(mask_uav[:, None], 2, axis=1).astype(np.float32, copy=False)
+    return accel_exec_norm, mask
 
 
 def _save_checkpoints(log_dir: str, actor, critic, suffix: str | None = None) -> None:
@@ -287,7 +308,12 @@ def train(
         "r_battery_penalty",
         "r_fail_penalty",
         "r_term_service",
+        "r_term_throughput_access",
+        "r_term_throughput_backhaul",
         "r_term_drop",
+        "r_term_drop_gu",
+        "r_term_drop_uav",
+        "r_term_drop_sat",
         "r_term_queue",
         "r_term_topk",
         "r_term_assoc",
@@ -304,8 +330,30 @@ def train(
         "arrival_sum",
         "outflow_sum",
         "service_norm",
+        "throughput_access_norm",
+        "throughput_backhaul_norm",
+        "sat_processed_norm",
         "drop_norm",
+        "gu_drop_norm",
+        "uav_drop_norm",
+        "sat_drop_norm",
+        "outflow_arrival_ratio_step",
+        "sat_incoming_arrival_ratio_step",
+        "sat_processed_arrival_ratio_step",
+        "sat_processed_incoming_ratio_step",
+        "gu_drop_ratio_step",
+        "uav_drop_ratio_step",
+        "sat_drop_ratio_step",
         "drop_sum",
+        "queue_pen_gu",
+        "queue_pen_uav",
+        "queue_pen_sat",
+        "gu_queue_fill_fraction",
+        "uav_queue_fill_fraction",
+        "sat_queue_fill_fraction",
+        "gu_queue_arrival_steps",
+        "uav_queue_arrival_steps",
+        "sat_queue_arrival_steps",
         "queue_total",
         "queue_total_active",
         "queue_total_active_p95",
@@ -319,12 +367,21 @@ def train(
         "q_norm_tail_hit_rate",
         "prev_q_norm_active",
         "q_norm_delta",
+        "queue_delta_gu",
+        "queue_delta_uav",
+        "queue_delta_sat",
         "q_norm_tail_q0",
         "q_norm_tail_excess",
         "queue_weight",
         "q_delta_weight",
         "crash_weight",
         "centroid_transfer_ratio",
+        "danger_imitation_loss",
+        "danger_imitation_coef",
+        "danger_imitation_active_rate",
+        "intervention_norm",
+        "intervention_rate",
+        "intervention_norm_top1",
         "collision_rate",
         "avoidance_eta_eff",
         "avoidance_eta_exec",
@@ -348,6 +405,7 @@ def train(
         "sat_queue_max",
         "gu_drop_sum",
         "uav_drop_sum",
+        "sat_drop_sum",
         "sat_processed_sum",
         "sat_incoming_sum",
         "energy_mean",
@@ -411,6 +469,10 @@ def train(
     imitation_sat = bool(getattr(cfg, "imitation_sat", False)) and train_heads["sat"]
     imitation_coef_curr = _imitation_coef_at(0)
     imitation_enabled_curr = imitation_enabled and imitation_coef_curr > 0.0
+    danger_imitation_coef = max(float(getattr(cfg, "danger_imitation_coef", 0.0) or 0.0), 0.0)
+    danger_imitation_enabled = bool(getattr(cfg, "danger_imitation_enabled", False)) and danger_imitation_coef > 0.0
+    if danger_imitation_enabled and not train_heads["accel"]:
+        raise ValueError("danger_imitation_enabled=true requires train_accel=true")
     bw_scale = float(getattr(cfg, "bw_logit_scale", 1.0) or 1.0)
     sat_scale = float(getattr(cfg, "sat_logit_scale", 1.0) or 1.0)
     exec_accel_source = _normalize_exec_source(getattr(cfg, "exec_accel_source", "policy"))
@@ -437,6 +499,7 @@ def train(
     print(
         "Train heads: "
         f"accel={train_heads['accel']}, bw={train_heads['bw']}, sat={train_heads['sat']} | "
+        f"danger_imitation={danger_imitation_enabled} | "
         "Exec sources: "
         f"accel={exec_accel_source}, bw={exec_bw_source}, sat={exec_sat_source}"
     )
@@ -479,6 +542,7 @@ def train(
         sat_queue_max = 0.0
         gu_drop_sum = 0.0
         uav_drop_sum = 0.0
+        sat_drop_sum = 0.0
         sat_processed_sum = 0.0
         sat_incoming_sum = 0.0
         energy_mean_sum = 0.0
@@ -508,7 +572,12 @@ def train(
         r_battery_penalty_sum = 0.0
         r_fail_penalty_sum = 0.0
         r_term_service_sum = 0.0
+        r_term_throughput_access_sum = 0.0
+        r_term_throughput_backhaul_sum = 0.0
         r_term_drop_sum = 0.0
+        r_term_drop_gu_sum = 0.0
+        r_term_drop_uav_sum = 0.0
+        r_term_drop_sat_sum = 0.0
         r_term_queue_sum = 0.0
         r_term_topk_sum = 0.0
         r_term_assoc_sum = 0.0
@@ -522,23 +591,53 @@ def train(
         r_term_accel_sum = 0.0
         r_term_close_risk_sum = 0.0
         imitation_loss_sum = 0.0
+        danger_imitation_loss_sum = 0.0
         reward_raw_sum = 0.0
         arrival_sum_sum = 0.0
         outflow_sum_sum = 0.0
         service_norm_sum = 0.0
+        throughput_access_norm_sum = 0.0
+        throughput_backhaul_norm_sum = 0.0
+        sat_processed_norm_sum = 0.0
         drop_norm_sum = 0.0
+        gu_drop_norm_sum = 0.0
+        uav_drop_norm_sum = 0.0
+        sat_drop_norm_sum = 0.0
+        outflow_arrival_ratio_step_sum = 0.0
+        sat_incoming_arrival_ratio_step_sum = 0.0
+        sat_processed_arrival_ratio_step_sum = 0.0
+        sat_processed_incoming_ratio_step_sum = 0.0
+        gu_drop_ratio_step_sum = 0.0
+        uav_drop_ratio_step_sum = 0.0
+        sat_drop_ratio_step_sum = 0.0
         drop_sum_total = 0.0
+        queue_pen_gu_sum = 0.0
+        queue_pen_uav_sum = 0.0
+        queue_pen_sat_sum = 0.0
+        gu_queue_fill_fraction_sum = 0.0
+        uav_queue_fill_fraction_sum = 0.0
+        sat_queue_fill_fraction_sum = 0.0
+        gu_queue_arrival_steps_sum = 0.0
+        uav_queue_arrival_steps_sum = 0.0
+        sat_queue_arrival_steps_sum = 0.0
         queue_total_sum = 0.0
         queue_total_active_sum = 0.0
         q_norm_active_sum = 0.0
         prev_q_norm_active_sum = 0.0
         q_norm_delta_sum = 0.0
+        queue_delta_gu_sum = 0.0
+        queue_delta_uav_sum = 0.0
+        queue_delta_sat_sum = 0.0
         q_norm_tail_q0_sum = 0.0
         q_norm_tail_excess_sum = 0.0
         queue_weight_sum = 0.0
         q_delta_weight_sum = 0.0
         crash_weight_sum = 0.0
         centroid_transfer_ratio_sum = 0.0
+        danger_imitation_active_rate_sum = 0.0
+        intervention_norm_sum = 0.0
+        intervention_rate_sum = 0.0
+        intervention_norm_top1_sum = 0.0
         collision_event_sum = 0.0
         avoidance_eta_eff_sum = 0.0
         avoidance_eta_exec_sum = 0.0
@@ -747,6 +846,7 @@ def train(
                 sat_queue_max = max(sat_queue_max, float(stats.get("sat_queue_max", 0.0)))
                 gu_drop_sum += float(stats.get("gu_drop_sum", 0.0))
                 uav_drop_sum += float(stats.get("uav_drop_sum", 0.0))
+                sat_drop_sum += float(stats.get("sat_drop_sum", 0.0))
                 sat_processed_sum += float(stats.get("sat_processed_sum", 0.0))
                 sat_incoming_sum += float(stats.get("sat_incoming_sum", 0.0))
                 if cfg.energy_enabled:
@@ -767,8 +867,32 @@ def train(
                     arrival_sum_sum += float(parts.get("arrival_sum", 0.0))
                     outflow_sum_sum += float(parts.get("outflow_sum", 0.0))
                     service_norm_sum += float(parts.get("service_norm", 0.0))
+                    throughput_access_norm_sum += float(parts.get("throughput_access_norm", 0.0))
+                    throughput_backhaul_norm_sum += float(parts.get("throughput_backhaul_norm", 0.0))
+                    sat_processed_norm_sum += float(parts.get("sat_processed_norm", 0.0))
                     drop_norm_sum += float(parts.get("drop_norm", 0.0))
+                    gu_drop_norm_sum += float(parts.get("gu_drop_norm", 0.0))
+                    uav_drop_norm_sum += float(parts.get("uav_drop_norm", 0.0))
+                    sat_drop_norm_sum += float(parts.get("sat_drop_norm", 0.0))
+                    outflow_arrival_ratio_step_sum += float(parts.get("outflow_arrival_ratio_step", 0.0))
+                    sat_incoming_arrival_ratio_step_sum += float(parts.get("sat_incoming_arrival_ratio_step", 0.0))
+                    sat_processed_arrival_ratio_step_sum += float(parts.get("sat_processed_arrival_ratio_step", 0.0))
+                    sat_processed_incoming_ratio_step_sum += float(
+                        parts.get("sat_processed_incoming_ratio_step", 0.0)
+                    )
+                    gu_drop_ratio_step_sum += float(parts.get("gu_drop_ratio_step", 0.0))
+                    uav_drop_ratio_step_sum += float(parts.get("uav_drop_ratio_step", 0.0))
+                    sat_drop_ratio_step_sum += float(parts.get("sat_drop_ratio_step", 0.0))
                     drop_sum_total += float(parts.get("drop_sum", 0.0))
+                    queue_pen_gu_sum += float(parts.get("queue_pen_gu", 0.0))
+                    queue_pen_uav_sum += float(parts.get("queue_pen_uav", 0.0))
+                    queue_pen_sat_sum += float(parts.get("queue_pen_sat", 0.0))
+                    gu_queue_fill_fraction_sum += float(parts.get("gu_queue_fill_fraction", 0.0))
+                    uav_queue_fill_fraction_sum += float(parts.get("uav_queue_fill_fraction", 0.0))
+                    sat_queue_fill_fraction_sum += float(parts.get("sat_queue_fill_fraction", 0.0))
+                    gu_queue_arrival_steps_sum += float(parts.get("gu_queue_arrival_steps", 0.0))
+                    uav_queue_arrival_steps_sum += float(parts.get("uav_queue_arrival_steps", 0.0))
+                    sat_queue_arrival_steps_sum += float(parts.get("sat_queue_arrival_steps", 0.0))
                     queue_total_sum += float(parts.get("queue_total", 0.0))
                     queue_total_active_step = float(parts.get("queue_total_active", 0.0))
                     q_norm_active_step = float(parts.get("q_norm_active", 0.0))
@@ -777,6 +901,9 @@ def train(
                     q_norm_active_sum += q_norm_active_step
                     prev_q_norm_active_sum += float(parts.get("prev_q_norm_active", 0.0))
                     q_norm_delta_sum += float(parts.get("q_norm_delta", 0.0))
+                    queue_delta_gu_sum += float(parts.get("queue_delta_gu", 0.0))
+                    queue_delta_uav_sum += float(parts.get("queue_delta_uav", 0.0))
+                    queue_delta_sat_sum += float(parts.get("queue_delta_sat", 0.0))
                     q_norm_tail_q0_sum += q_norm_tail_q0_step
                     q_norm_tail_excess_sum += float(parts.get("q_norm_tail_excess", 0.0))
                     queue_weight_sum += float(parts.get("queue_weight", 0.0))
@@ -826,7 +953,12 @@ def train(
                     r_battery_penalty_sum += float(parts.get("battery_penalty", 0.0))
                     r_fail_penalty_sum += float(parts.get("fail_penalty", 0.0))
                     r_term_service_sum += float(parts.get("term_service", 0.0))
+                    r_term_throughput_access_sum += float(parts.get("term_throughput_access", 0.0))
+                    r_term_throughput_backhaul_sum += float(parts.get("term_throughput_backhaul", 0.0))
                     r_term_drop_sum += float(parts.get("term_drop", 0.0))
+                    r_term_drop_gu_sum += float(parts.get("term_drop_gu", 0.0))
+                    r_term_drop_uav_sum += float(parts.get("term_drop_uav", 0.0))
+                    r_term_drop_sat_sum += float(parts.get("term_drop_sat", 0.0))
                     r_term_queue_sum += float(parts.get("term_queue", 0.0))
                     r_term_topk_sum += float(parts.get("term_topk", 0.0))
                     r_term_assoc_sum += float(parts.get("term_assoc", 0.0))
@@ -840,7 +972,12 @@ def train(
                     r_term_accel_sum += float(parts.get("term_accel", 0.0))
                     r_term_close_risk_sum += float(parts.get("term_close_risk", 0.0))
                     reward_raw_sum += float(parts.get("reward_raw", 0.0))
+                    danger_imitation_active_rate_sum += float(parts.get("danger_imitation_active_rate", 0.0))
+                    intervention_norm_sum += float(parts.get("intervention_norm", 0.0))
+                    intervention_rate_sum += float(parts.get("intervention_rate", 0.0))
+                    intervention_norm_top1_sum += float(parts.get("intervention_norm_top1", 0.0))
 
+                danger_target_env, danger_mask_env = _build_danger_imitation_step_data(stats, cfg, num_agents)
                 buffers[env_idx].add(
                     per_env_obs_batch[env_idx],
                     action_vec_exec_env[env_idx],
@@ -850,6 +987,8 @@ def train(
                     done_scalar,
                     curr_state_batch_np[env_idx],
                     _build_imitation_target(per_env_obs_lists[env_idx]),
+                    danger_target_env,
+                    danger_mask_env,
                 )
 
             obs_env = list(next_obs_env)
@@ -867,12 +1006,25 @@ def train(
         logp_arr_list = []
         state_arr_list = []
         imitation_arr_list = []
+        danger_imitation_target_list = []
+        danger_imitation_mask_list = []
         adv_list = []
         rets_list = []
         clip_val = float(getattr(cfg, "reward_norm_clip", 0.0) or 0.0)
         reward_clip_hits = 0
         reward_clip_total = 0
-        for obs_arr_e, act_arr_e, logp_arr_e, rewards_e, values_e, dones_e, state_arr_e, imitation_arr_e in buffer_data:
+        for (
+            obs_arr_e,
+            act_arr_e,
+            logp_arr_e,
+            rewards_e,
+            values_e,
+            dones_e,
+            state_arr_e,
+            imitation_arr_e,
+            danger_imitation_target_e,
+            danger_imitation_mask_e,
+        ) in buffer_data:
             rewards_proc = rewards_e
             if getattr(cfg, "reward_norm_enabled", False) and reward_rms is not None:
                 rewards_proc = (rewards_proc - reward_rms.mean) / (np.sqrt(reward_rms.var) + 1e-8)
@@ -886,6 +1038,8 @@ def train(
             logp_arr_list.append(logp_arr_e)
             state_arr_list.append(state_arr_e)
             imitation_arr_list.append(imitation_arr_e)
+            danger_imitation_target_list.append(danger_imitation_target_e)
+            danger_imitation_mask_list.append(danger_imitation_mask_e)
             adv_list.append(adv_e)
             rets_list.append(rets_e)
 
@@ -894,6 +1048,8 @@ def train(
         logp_arr = np.concatenate(logp_arr_list, axis=0)
         state_arr = np.concatenate(state_arr_list, axis=0)
         imitation_arr = np.concatenate(imitation_arr_list, axis=0)
+        danger_imitation_target_arr = np.concatenate(danger_imitation_target_list, axis=0)
+        danger_imitation_mask_arr = np.concatenate(danger_imitation_mask_list, axis=0)
         adv = np.concatenate(adv_list, axis=0)
         rets = np.concatenate(rets_list, axis=0)
         adv_raw_mean = float(np.mean(adv))
@@ -918,6 +1074,8 @@ def train(
         act_flat = act_arr.reshape(T * N, -1)
         logp_flat = logp_arr.reshape(T * N)
         imitation_flat = imitation_arr.reshape(T * N, -1)
+        danger_imitation_target_flat = danger_imitation_target_arr.reshape(T * N, -1)
+        danger_imitation_mask_flat = danger_imitation_mask_arr.reshape(T * N, -1)
         adv_flat = np.repeat(adv, N)
 
         # Convert to torch
@@ -928,6 +1086,8 @@ def train(
         state_t = torch.from_numpy(state_arr).to(device)
         ret_t = torch.from_numpy(rets).to(device)
         imitation_flat_t = torch.from_numpy(imitation_flat).to(device)
+        danger_imitation_target_flat_t = torch.from_numpy(danger_imitation_target_flat).to(device)
+        danger_imitation_mask_flat_t = torch.from_numpy(danger_imitation_mask_flat).to(device)
         if not torch.isfinite(obs_flat_t).all():
             print(f"NaN/Inf detected in obs_flat_t at update={update}")
             raise ValueError("obs_flat_t contains NaN/Inf")
@@ -1024,8 +1184,25 @@ def train(
                     diff = (pred_action - target_action) * imitation_mask
                     imitation_loss = (diff.pow(2).sum(-1) / (imitation_mask_sum + 1e-9)).mean()
 
+                danger_imitation_loss = torch.tensor(0.0, device=device)
+                if danger_imitation_enabled:
+                    pred_accel = torch.tanh(out["mu"])
+                    target_accel = danger_imitation_target_flat_t[mb_idx]
+                    danger_mask = danger_imitation_mask_flat_t[mb_idx]
+                    active = torch.sum(danger_mask, dim=-1) > 0.0
+                    if torch.any(active):
+                        diff = (pred_accel - target_accel) * danger_mask
+                        denom = torch.sum(danger_mask, dim=-1) + 1e-9
+                        per_row = diff.pow(2).sum(-1) / denom
+                        danger_imitation_loss = per_row[active].mean()
+
                 actor_optim.zero_grad()
-                (policy_loss + imitation_coef_curr * imitation_loss - cfg.entropy_coef * entropy.mean()).backward()
+                (
+                    policy_loss
+                    + imitation_coef_curr * imitation_loss
+                    + danger_imitation_coef * danger_imitation_loss
+                    - cfg.entropy_coef * entropy.mean()
+                ).backward()
                 for name, param in actor.named_parameters():
                     if param.grad is not None and not torch.isfinite(param.grad).all():
                         print(f"NaN/Inf detected in actor grad {name} at update={update}")
@@ -1042,6 +1219,7 @@ def train(
                 approx_kls.append(float(approx_kl.item()))
                 clip_fracs.append(float(clip_frac.item()))
                 imitation_loss_sum += float(imitation_loss.item())
+                danger_imitation_loss_sum += float(danger_imitation_loss.item())
                 if stop_early:
                     break
             if stop_early:
@@ -1124,7 +1302,12 @@ def train(
             "r_battery_penalty": r_battery_penalty_sum / steps_count,
             "r_fail_penalty": r_fail_penalty_sum / steps_count,
             "r_term_service": r_term_service_sum / steps_count,
+            "r_term_throughput_access": r_term_throughput_access_sum / steps_count,
+            "r_term_throughput_backhaul": r_term_throughput_backhaul_sum / steps_count,
             "r_term_drop": r_term_drop_sum / steps_count,
+            "r_term_drop_gu": r_term_drop_gu_sum / steps_count,
+            "r_term_drop_uav": r_term_drop_uav_sum / steps_count,
+            "r_term_drop_sat": r_term_drop_sat_sum / steps_count,
             "r_term_queue": r_term_queue_sum / steps_count,
             "r_term_topk": r_term_topk_sum / steps_count,
             "r_term_assoc": r_term_assoc_sum / steps_count,
@@ -1141,8 +1324,30 @@ def train(
             "arrival_sum": arrival_sum_sum / steps_count,
             "outflow_sum": outflow_sum_sum / steps_count,
             "service_norm": service_norm_sum / steps_count,
+            "throughput_access_norm": throughput_access_norm_sum / steps_count,
+            "throughput_backhaul_norm": throughput_backhaul_norm_sum / steps_count,
+            "sat_processed_norm": sat_processed_norm_sum / steps_count,
             "drop_norm": drop_norm_sum / steps_count,
+            "gu_drop_norm": gu_drop_norm_sum / steps_count,
+            "uav_drop_norm": uav_drop_norm_sum / steps_count,
+            "sat_drop_norm": sat_drop_norm_sum / steps_count,
+            "outflow_arrival_ratio_step": outflow_arrival_ratio_step_sum / steps_count,
+            "sat_incoming_arrival_ratio_step": sat_incoming_arrival_ratio_step_sum / steps_count,
+            "sat_processed_arrival_ratio_step": sat_processed_arrival_ratio_step_sum / steps_count,
+            "sat_processed_incoming_ratio_step": sat_processed_incoming_ratio_step_sum / steps_count,
+            "gu_drop_ratio_step": gu_drop_ratio_step_sum / steps_count,
+            "uav_drop_ratio_step": uav_drop_ratio_step_sum / steps_count,
+            "sat_drop_ratio_step": sat_drop_ratio_step_sum / steps_count,
             "drop_sum": drop_sum_total / steps_count,
+            "queue_pen_gu": queue_pen_gu_sum / steps_count,
+            "queue_pen_uav": queue_pen_uav_sum / steps_count,
+            "queue_pen_sat": queue_pen_sat_sum / steps_count,
+            "gu_queue_fill_fraction": gu_queue_fill_fraction_sum / steps_count,
+            "uav_queue_fill_fraction": uav_queue_fill_fraction_sum / steps_count,
+            "sat_queue_fill_fraction": sat_queue_fill_fraction_sum / steps_count,
+            "gu_queue_arrival_steps": gu_queue_arrival_steps_sum / steps_count,
+            "uav_queue_arrival_steps": uav_queue_arrival_steps_sum / steps_count,
+            "sat_queue_arrival_steps": sat_queue_arrival_steps_sum / steps_count,
             "queue_total": queue_total_sum / steps_count,
             "queue_total_active": queue_total_active_sum / steps_count,
             "queue_total_active_p95": (
@@ -1160,12 +1365,21 @@ def train(
             "q_norm_tail_hit_rate": float(q_norm_tail_hit_count) / float(steps_count),
             "prev_q_norm_active": prev_q_norm_active_sum / steps_count,
             "q_norm_delta": q_norm_delta_sum / steps_count,
+            "queue_delta_gu": queue_delta_gu_sum / steps_count,
+            "queue_delta_uav": queue_delta_uav_sum / steps_count,
+            "queue_delta_sat": queue_delta_sat_sum / steps_count,
             "q_norm_tail_q0": q_norm_tail_q0_sum / steps_count,
             "q_norm_tail_excess": q_norm_tail_excess_sum / steps_count,
             "queue_weight": queue_weight_sum / steps_count,
             "q_delta_weight": q_delta_weight_sum / steps_count,
             "crash_weight": crash_weight_sum / steps_count,
             "centroid_transfer_ratio": centroid_transfer_ratio_sum / steps_count,
+            "danger_imitation_loss": danger_imitation_loss_sum / max(1, len(policy_losses)),
+            "danger_imitation_coef": danger_imitation_coef,
+            "danger_imitation_active_rate": danger_imitation_active_rate_sum / steps_count,
+            "intervention_norm": intervention_norm_sum / steps_count,
+            "intervention_rate": intervention_rate_sum / steps_count,
+            "intervention_norm_top1": intervention_norm_top1_sum / steps_count,
             "collision_rate": collision_event_sum / steps_count,
             "avoidance_eta_eff": avoidance_eta_eff_sum / steps_count,
             "avoidance_eta_exec": avoidance_eta_exec_sum / steps_count,
@@ -1191,6 +1405,7 @@ def train(
             "sat_queue_max": sat_queue_max,
             "gu_drop_sum": gu_drop_sum,
             "uav_drop_sum": uav_drop_sum,
+            "sat_drop_sum": sat_drop_sum,
             "sat_processed_sum": sat_processed_sum,
             "sat_incoming_sum": sat_incoming_sum,
             "energy_mean": (energy_mean_sum / steps_count) if cfg.energy_enabled else 0.0,

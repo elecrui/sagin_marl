@@ -1,81 +1,300 @@
-我的目标不是让每层队列在 400 步里单调下降，而是让系统在持续到达业务下，三层队列长期维持在一个非零、非满的稳态工作区间；总出流大致匹配总到达，链路各层都持续有业务通过，从而体现系统持续通信能力。
+对，这个现象可以叫：**“安全守住了，但策略没有真正收敛到一个内化的稳定解。”**
 
+而且从你给的数据看，**不是随机波动，是有结构原因的**。
 
-思路我已经按你这次的修正改了，而且落到工具里了。现在不是只靠固定顺序判断，而是同时区分：
-- 哪层 backlog 最重
-- 哪层最接近自身 `max`
-- 哪层先开始 drop
-- 当前层该联调哪一对参数
+## 先说结论
 
-这些都在 [diagnose_queue_regime.py#L428](/d:/研三上/毕设/sagin_marl/scripts/diagnose_queue_regime.py#L428) 之后加进去了；阈值和 CLI 参数在 [diagnose_queue_regime.py#L721](/d:/研三上/毕设/sagin_marl/scripts/diagnose_queue_regime.py#L721)。
+你这条 `0.10` 线现在更像是：
 
-现在三层各自都有对应你目标的指标了，不再只看 `active_queue_empty_step_fraction_mean`：
-- 空载：`gu/uav/sat_empty_step_fraction_mean`
-- 全程非空占比：`gu/uav/sat_nonempty_all_episode_share`
-- 压力接近上限：`gu/uav/sat_buffer_fill_fraction_mean/p95`
-- 丢弃：`gu/uav/sat_drop_ratio_mean`
-- 持续有货：`gu/uav/sat_backlog_equiv_steps_mean/p95`
+* 在 `u12` 附近找到了一个**不错的早期工作点**
+* 继续训练后，policy 没有“越来越学会”，而是开始在
 
-`active_queue_empty_step_fraction_mean` 我保留了，因为它是系统级护栏，回答的是“前两层这条在途链有没有被抽空”；更严格的三层联合指标现在是 `all_layers_nonempty_step_fraction_mean`，见 [diagnose_queue_regime.py#L327](/d:/研三上/毕设/sagin_marl/scripts/diagnose_queue_regime.py#L327)。
+  * 前端性能
+  * 后端健康
+  * teacher 介入依赖
+    之间来回漂
 
-“目标阈值 + 打分函数”也已经做了。默认是：
-- 全局：`active_empty <= 0.25`，`all_layers_nonempty >= 0.20`，`total_drop <= 0.05`，`outflow/arrival in [0.90, 1.10]`
-- 每层：`empty <= 0.25`，`backlog >= 0.25` 步，`fill_p95 <= 0.20`，`drop <= 0.02`
+所以它不是传统意义上的“稳态收敛”，更像是：
 
-这些都能按层单独覆盖。脚本现在会输出：
-- `passes_thresholds`
-- `failed_thresholds`
-- `score_total`
-- `recommended_tuning_pair`
+> **PPO 在一个被 danger imitation 强约束的非平滑、多目标训练问题里，进入了长期振荡/漂移。**
 
-当前主线 3-episode 验证在 [tmp_score_current_n3_summary.csv](/d:/研三上/毕设/sagin_marl/runs/queue_diag/tmp_score_current_n3_summary.csv)：
-- `passes_thresholds = 0`
-- `failed_thresholds = active_queue_empty_step_fraction, all_layers_nonempty_step_fraction, total_drop_fraction, gu_empty_step_fraction, uav_empty_step_fraction, uav_drop_fraction, sat_empty_step_fraction`
-- `recommended_tuning_pair = b_acc + b_sat_total`
+这和你观察到的：
 
-这直接回答了你的问题：`GU` 现在当然有自己的指标，而且阈值也是按层分开的。
+* `u24` 前端变差
+* `u36` 前端部分回来，但后端更坏
+* `danger_imitation_active_rate`、`intervention_rate` 不退场，甚至后期略升
 
-我还按你的新思路做了一个把 `sat_cpu_freq` 纳入的候选验证：
-[`tmp_score_uavpair_satcpu_n3_summary.csv`](/d:/研三上/毕设/sagin_marl/runs/queue_diag/tmp_score_uavpair_satcpu_n3_summary.csv)
-参数是 `b_sat_total=1.30e6, b_acc=3.0e6, sat_cpu_freq=2.8e9`。结果没有更好：
-- `score_total` 从 `27.499` 变成 `28.292`
-- `sat_backlog_equiv_steps_mean` 掉到 `0.129`
+是完全一致的。
 
-这说明在这个点上，单纯把 `sat_cpu_freq` 往上提，会把末端抽得过轻，不是当前最优方向。
+---
 
-这次我没有回写主线配置，因为新工具已经能稳定告诉我们“哪个点过线、没过哪条、该调哪一对参数”，但我还没找到一个比当前主线明显更平衡的点。下一步最合理的是直接用这套阈值和分数去跑一个小网格：
-- 固定 `task_arrival_rate=1.30e5`
-- 扫 `b_acc x b_sat_total`
-- 每个网格只补 2 个 `sat_cpu_freq` 近邻
-- 用 `passes_thresholds + score_total + tuning_priority_layer` 排序
+## 为什么会这样
 
-验证我已经跑过：
-- `python -m py_compile scripts\diagnose_queue_regime.py`
+我觉得至少有 4 个原因，而且是叠加的。
 
+### 1. 你的 teacher 不是静态标签，而是“状态依赖的安全修正器”
 
+danger imitation 虽然有效，但它不是普通 supervised learning。
 
-**三层串联系统调参准则**
+你现在模仿的是：
 
-1. 先调**能力匹配**，后调**队列参数**。
-2. 能力匹配按相邻两端看，不把三层完全独立拆开：
+* 在某些危险状态下的 `a_exec`
 
-   * GU：`task_arrival_rate ↔ b_acc`
-   * UAV：`b_acc ↔ b_sat_total`
-   * SAT：`b_sat_total ↔ sat_cpu_freq`
-3. 先把该层队列调到**长期不持续上升、也不持续衰减到空**，只在目标区间内波动。
-4. 这一阶段优先看：`backlog_equiv_steps`、`empty_step_fraction`、`buffer_fill_fraction`、`drop_ratio`。
-5. 当前问题在 **GU/SAT** 时，通常先改单边；问题在 **UAV** 时，通常要联调两边。
-6. 当队列变化趋势已经合理后，再调 `queue_init_*`，作用是修正**开局太空、早期断流**。
-7. 当能力匹配已基本合理、但仍因短时波动溢出时，再调 `queue_max_*`，作用是增加**缓冲容忍度**，不是替代能力提升。
-8. 最后用系统级护栏收口：总 `drop` 不过高，`active/all_layers_nonempty` 不过差，三层都保持“非零、非满、可流动”。
+而 `a_exec` 不是固定答案，它取决于：
 
-你这句“**每一层变化量数值合适之后，才调初始化值和 max**”是合理的，应该保留。
+* 当前 pairwise 几何关系
+* 当前 close risk
+* top1 danger neighbor
+* avoidance/safety layer 的实时修正
 
-按顺序是不是应该：
-1.固定task_arrival_rate，调b_acc GU初始化队列量 和 GU队列max
-1.1优先考虑队列变化量，让队列在400步内保持稳定，不一直增，更间接的是看空不空、到没到上限那些。
-1.2 队列变化量合适之后，如果空的多，加初始化队列量，如果drop多，加队列max
-2.固定task_arrival_rate b_acc和GU队列相关，调b_sat_total UAV初始化队列量和MAX
-2.1 2.2类似
-3.固定前面的，调sat_cpu_freq SAT初始化队列量 和 GU队列max
-3.1 3.2类似
+这意味着 teacher 本身是**状态依赖、非线性的、局部激活的**。
+policy 一变，访问到的状态分布就变，teacher 目标也跟着变。
+
+所以训练并不是在逼近一个固定函数，更像是在追一个**跟自己一起动的目标**。
+
+这非常容易导致：
+
+* 早期有效
+* 中后期漂
+* intervention 不退反升
+
+---
+
+### 2. imitation 只在危险状态激活，会改变状态分布本身
+
+这点很关键。
+
+danger imitation 不是全局 loss，而是 masked loss。
+一旦它生效，它会把 policy 往更安全的局部动作区推。
+但这又会改变：
+
+* UAV 的空间位置分布
+* 哪些 episode 进入高风险区
+* 哪些 SAT/GU/UAV queue 状态更常出现
+
+结果就是：
+
+* imitation 本来是为了解决安全
+* 但它也在持续改写通信训练分布
+* 通信 reward 又反过来推策略去另一边
+
+于是 PPO 在两个吸引子之间反复拉扯：
+
+* 更安全、更保守
+* 更积极、更高 outflow，但更推 SAT
+
+这就是你看到的“前端回来一点，后端更坏”那种漂。
+
+---
+
+### 3. 你的目标本来就不是单峰的
+
+你现在已经不是单一目标训练了，而是至少同时在优化：
+
+* 安全不撞
+* 前端 outflow/queue
+* 后端 drop/drift
+* 还有 danger imitation 的局部监督
+
+这些目标之间不是天然一致的。
+尤其在 accel-only 阶段，动作自由度有限，更容易形成：
+
+> 一个指标改善，另一个指标恶化。
+
+所以中后期不是“朝一个点收敛”，而是在不同 trade-off 之间移动。
+
+---
+
+### 4. PPO 本身对这种 masked auxiliary loss 不一定稳
+
+PPO 比较擅长的是：
+
+* policy gradient 主目标
+* 辅助项不要太强、不要太非平滑
+
+而你这个 danger imitation：
+
+* 只在局部危险状态触发
+* 样本比例会变
+* target 会变
+* 还会通过环境影响未来数据分布
+
+这很像一个**动态 curriculum + 局部 teacher forcing**。
+对 PPO 来说，本来就不容易表现成“单调收敛”。
+
+---
+
+## 所以“完全不收敛”怎么理解
+
+我不会说它“完全不收敛”，更准确是：
+
+### 它在安全上已经收敛到可行区
+
+因为：
+
+* `collision=0`
+* `near_collision_ratio` 很低
+* 长训也没崩掉安全
+
+这说明安全底线是稳住了。
+
+### 但它在“综合最优点”上没有收敛
+
+因为：
+
+* `u12` 更像最好 checkpoint
+* `u24/u36` 没有稳定改进
+* imitation/intervention 没退场
+
+这说明它没有学成一个“自己就会安全又高效”的稳定策略，而是在持续依赖 safety teacher / safety regime。
+
+---
+
+## 这是不是坏事
+
+不完全是坏事，但它告诉你一件很重要的事：
+
+> **这条线更适合“早停选最好 checkpoint”，不适合默认训越久越好。**
+
+也就是说，当前这套：
+
+* `coef=0.10`
+* `intervention_threshold=0.05`
+* danger imitation
+
+更像一个**有效的训练稳定器 / 引导器**，不是一个能长时间持续提升的最终训练配方。
+
+---
+
+## 接下来该怎么做
+
+不是继续把 `0.10` 拉更长。你这点已经试出来了。
+
+### 现在最合理的两条路
+
+## 路线 A：接受“早停最优”
+
+这条是最实际的。
+
+把当前结论定下来：
+
+* `0.10@u12` 是这条线目前最好的 checkpoint
+* 后面长训会漂，不值得继续硬推
+* danger imitation 的价值在于**把你带到一个安全可用的点**，不是后期持续增益
+
+这意味着你接下来应该：
+
+* 把 `u12` 作为 accel 阶段候选成果
+* 用它去衔接下一阶段
+* 而不是继续试图把它磨成一个长期单调收敛方案
+
+这其实很正常，很多 RL 配方本来就靠 early stopping。
+
+---
+
+## 路线 B：如果你还想解决“长训漂移”，那就不是简单调参了
+
+那需要改训练结构，而不是再调 `coef`。
+
+我认为真正可能有用的结构改法有两个：
+
+### B1. imitation 系数退火
+
+你现在的 danger imitation 很像一直在“强监管”。
+
+如果中后期它不退场，策略就容易一直被 teacher 牵着走。
+更合理的是：
+
+* 前期 `coef` 高一点，帮助建立安全行为
+* 中后期逐步衰减，让 policy 更多靠主 reward 自己定型
+
+比如：
+
+* `u0~u12` 用 `0.10`
+* 后面逐步降到 `0.05` 或更低
+
+这比固定 `0.10` 更符合你现在的现象。
+
+### B2. 两阶段训练
+
+先安全成型，再通信微调。
+
+也就是：
+
+1. 用 danger imitation 训到 `u12` 附近，拿到安全策略
+2. 从这个 checkpoint 出发，关掉或显著减弱 imitation，只用主 reward 短训微调
+
+目的不是再长时间训练，而是：
+
+* 保住安全习惯
+* 看能不能把前端/后端 trade-off 拉回一点
+
+这比从头一直混着训到 `u36` 更有希望。
+
+---
+
+## 我现在最推荐哪条
+
+### 最推荐：先走路线 A
+
+也就是先承认：
+
+**当前 `0.10@u12` 就是这条线的最好点。**
+
+先别再追求“它为什么不能越训越好”，因为你已经有证据表明：
+
+* 这不是暂时波动
+* 是结构性漂移
+
+### 如果你后面还想再优化
+
+优先试 **B1：imitation 退火**，不是继续固定系数长训。
+
+因为你现在最明显的问题就是：
+
+* imitation 没退场
+* intervention 也没退场
+
+这非常像“辅助监督在中后期过强”。
+
+---
+
+## 你现在最该做什么
+
+我建议按这个顺序：
+
+### 第一步
+
+把这轮结论整理进实验记录：
+
+* `0.10@u12` 最佳
+* `u24/u36` 不优
+* 原因是安全稳住但中后段漂移，danger imitation / intervention 不退场
+
+### 第二步
+
+把 `0.10@u12` 暂定为 accel 候选 checkpoint
+
+### 第三步
+
+如果还要继续研究，不要再做固定 `coef` 长训，改试：
+
+* **imitation coef 退火**
+  或者
+* **从 `u12` 出发关闭/减弱 imitation 的短微调**
+
+---
+
+## 一句话总结
+
+你感觉“完全不收敛”，本质上不是模型彻底坏了，而是：
+
+**这套 danger imitation 更像一个前期引导器，而不是一个适合长时间固定开启的训练目标。**
+
+所以现在最正确的做法不是继续硬训，而是：
+
+* **接受 `u12` 早停最优**
+* 把长训漂移当成这套配方的已知性质
+* 后续若要改，只改成“前强后弱”的 imitation 训练结构。**
+
+如果你愿意，我下一条可以直接帮你把“imitation 退火”或“从 `u12` 出发的二阶段微调”设计成一个很具体的实验方案。
