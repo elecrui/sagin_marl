@@ -16,8 +16,10 @@ class RolloutBuffer:
         self._logprobs: Optional[np.ndarray] = None
         self._rewards: Optional[np.ndarray] = None
         self._values: Optional[np.ndarray] = None
-        self._dones: Optional[np.ndarray] = None
+        self._terminated: Optional[np.ndarray] = None
+        self._truncated: Optional[np.ndarray] = None
         self._global_states: Optional[np.ndarray] = None
+        self._next_global_states: Optional[np.ndarray] = None
         self._imitation: Optional[np.ndarray] = None
         self._danger_imitation_target: Optional[np.ndarray] = None
         self._danger_imitation_mask: Optional[np.ndarray] = None
@@ -28,8 +30,10 @@ class RolloutBuffer:
             self.logprobs: List[np.ndarray] = []
             self.rewards: List[float] = []
             self.values: List[float] = []
-            self.dones: List[bool] = []
+            self.terminated: List[bool] = []
+            self.truncated: List[bool] = []
             self.global_states: List[np.ndarray] = []
+            self.next_global_states: List[np.ndarray] = []
             self.imitation: List[np.ndarray] = []
             self.danger_imitation_target: List[np.ndarray] = []
             self.danger_imitation_mask: List[np.ndarray] = []
@@ -40,6 +44,7 @@ class RolloutBuffer:
         actions: np.ndarray,
         logprobs: np.ndarray,
         global_state: np.ndarray,
+        next_global_state: np.ndarray,
         imitation: np.ndarray,
         danger_imitation_target: np.ndarray,
         danger_imitation_mask: np.ndarray,
@@ -52,8 +57,10 @@ class RolloutBuffer:
         self._logprobs = np.empty((cap,) + logprobs.shape, dtype=np.float32)
         self._rewards = np.empty((cap,), dtype=np.float32)
         self._values = np.empty((cap,), dtype=np.float32)
-        self._dones = np.empty((cap,), dtype=np.float32)
+        self._terminated = np.empty((cap,), dtype=np.float32)
+        self._truncated = np.empty((cap,), dtype=np.float32)
         self._global_states = np.empty((cap,) + global_state.shape, dtype=np.float32)
+        self._next_global_states = np.empty((cap,) + next_global_state.shape, dtype=np.float32)
         self._imitation = np.empty((cap,) + imitation.shape, dtype=np.float32)
         self._danger_imitation_target = np.empty((cap,) + danger_imitation_target.shape, dtype=np.float32)
         self._danger_imitation_mask = np.empty((cap,) + danger_imitation_mask.shape, dtype=np.float32)
@@ -65,8 +72,10 @@ class RolloutBuffer:
         logprobs: np.ndarray,
         reward: float,
         value: float,
-        done: bool,
+        terminated: bool,
+        truncated: bool,
         global_state: np.ndarray,
+        next_global_state: np.ndarray,
         imitation: np.ndarray | None = None,
         danger_imitation_target: np.ndarray | None = None,
         danger_imitation_mask: np.ndarray | None = None,
@@ -83,26 +92,39 @@ class RolloutBuffer:
             self.logprobs.append(logprobs)
             self.rewards.append(float(reward))
             self.values.append(float(value))
-            self.dones.append(bool(done))
+            self.terminated.append(bool(terminated))
+            self.truncated.append(bool(truncated))
             self.global_states.append(global_state)
+            self.next_global_states.append(next_global_state)
             self.imitation.append(imitation)
             self.danger_imitation_target.append(danger_imitation_target)
             self.danger_imitation_mask.append(danger_imitation_mask)
             return
 
         if self._obs is None:
-            self._allocate(obs, actions, logprobs, global_state, imitation, danger_imitation_target, danger_imitation_mask)
+            self._allocate(
+                obs,
+                actions,
+                logprobs,
+                global_state,
+                next_global_state,
+                imitation,
+                danger_imitation_target,
+                danger_imitation_mask,
+            )
 
         if self.capacity is not None and self._idx >= self.capacity:
-            raise IndexError("RolloutBuffer capacity exceeded.")
+            raise IndexError('RolloutBuffer capacity exceeded.')
 
         self._obs[self._idx] = obs
         self._actions[self._idx] = actions
         self._logprobs[self._idx] = logprobs
         self._rewards[self._idx] = float(reward)
         self._values[self._idx] = float(value)
-        self._dones[self._idx] = float(done)
+        self._terminated[self._idx] = float(terminated)
+        self._truncated[self._idx] = float(truncated)
         self._global_states[self._idx] = global_state
+        self._next_global_states[self._idx] = next_global_state
         self._imitation[self._idx] = imitation
         self._danger_imitation_target[self._idx] = danger_imitation_target
         self._danger_imitation_mask[self._idx] = danger_imitation_mask
@@ -116,8 +138,10 @@ class RolloutBuffer:
                 np.stack(self.logprobs, axis=0),
                 np.array(self.rewards, dtype=np.float32),
                 np.array(self.values, dtype=np.float32),
-                np.array(self.dones, dtype=np.float32),
+                np.array(self.terminated, dtype=np.float32),
+                np.array(self.truncated, dtype=np.float32),
                 np.stack(self.global_states, axis=0),
+                np.stack(self.next_global_states, axis=0),
                 np.stack(self.imitation, axis=0),
                 np.stack(self.danger_imitation_target, axis=0),
                 np.stack(self.danger_imitation_mask, axis=0),
@@ -129,8 +153,10 @@ class RolloutBuffer:
             self._logprobs[:end],
             self._rewards[:end],
             self._values[:end],
-            self._dones[:end],
+            self._terminated[:end],
+            self._truncated[:end],
             self._global_states[:end],
+            self._next_global_states[:end],
             self._imitation[:end],
             self._danger_imitation_target[:end],
             self._danger_imitation_mask[:end],

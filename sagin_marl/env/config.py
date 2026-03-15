@@ -66,6 +66,10 @@ class SaginConfig:
     danger_nbr_enabled: bool = False
     visible_sats_max: int | None = None
     visible_sats_min: int | None = None
+    sat_candidate_mode: str = "elevation"  # "elevation" or "score"
+    sat_candidate_elevation_weight: float = 1.0
+    sat_candidate_se_weight: float = 1.0
+    sat_candidate_queue_weight: float = 1.0
 
     # Geometry
     uav_height: float = 100.0
@@ -101,6 +105,11 @@ class SaginConfig:
     uav_spawn_radius_end: float | None = None
     uav_spawn_curriculum_steps: int = 0
     uav_spawn_full_random_final: bool = True
+    uav_safe_random_init_enabled: bool = False
+    uav_init_boundary_margin_steps: float = 3.0
+    uav_init_speed_frac: float = 0.2
+    uav_init_min_spacing: float | None = None
+    uav_init_max_tries: int = 256
 
     # Queues (bits)
     queue_max_gu: float = 5e6
@@ -217,13 +226,19 @@ class SaginConfig:
     # Baseline heuristics (queue_aware)
     baseline_accel_gain: float = 2.0
     baseline_assoc_bonus: float = 0.3
-    baseline_sat_queue_penalty: float = 0.5
+    baseline_sat_se_weight: float = 0.75
+    baseline_sat_queue_penalty: float = 0.25
+    baseline_sat_load_penalty: float = 0.75
+    baseline_sat_bw_reward: float = 0.75
+    baseline_sat_stay_bonus: float = 1.0
+    baseline_sat_switch_margin: float = 0.35
     baseline_repulse_gain: float = 1.0
     baseline_repulse_radius_factor: float = 1.5
     baseline_energy_low: float = 0.3
     baseline_energy_weight: float = 1.0
 
     # Reward shaping
+    reward_mode: str = "dense"  # "dense" or "throughput_only"
     omega_q: float = 0.6
     omega_q_gu: float = 1.0
     omega_q_uav: float = 0.0
@@ -267,6 +282,7 @@ class SaginConfig:
     queue_log_k: float = 0.0
     queue_norm_K: float = 1.0
     queue_norm_arrival_floor: float = 0.0
+    queue_reward_use_arrival_norm: bool = False
     q_norm_tail_q0: float = 0.0
     omega_q_tail: float | None = None
     queue_topk_k: int = 0
@@ -336,6 +352,16 @@ class SaginConfig:
     early_stop_window: int = 5
     early_stop_patience: int = 10
     early_stop_min_delta: float = 1e-3
+    checkpoint_eval_enabled: bool = False
+    checkpoint_eval_interval_updates: int = 0
+    checkpoint_eval_start_update: int = 0
+    checkpoint_eval_episodes: int = 20
+    checkpoint_eval_episode_seed_base: int | None = None
+    checkpoint_eval_fixed_policy: str = "zero"  # "zero" or "queue_aware"
+    checkpoint_eval_sat_drop_worsen_delta: float = 5e-4
+    checkpoint_eval_front_queue_rel_improve_tol: float = 0.05
+    checkpoint_eval_worsen_patience: int = 2
+    checkpoint_eval_early_stop_enabled: bool = True
 
     @property
     def theta_min_rad(self) -> float:

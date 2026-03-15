@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 import time
 from typing import Dict, List, Tuple
@@ -13,21 +14,20 @@ from .critic import CriticNet
 from .buffer import RolloutBuffer
 from .action_assembler import assemble_actions
 from .baselines import queue_aware_policy
+from ..utils.checkpoint import load_checkpoint_forgiving, load_state_dict_forgiving
 from ..utils.normalization import RunningMeanStd
 from ..env.config import ablation_flag
 
 
-def compute_gae(rewards, values, dones, gamma, lam):
+def compute_gae(rewards, values, bootstrap_values, episode_boundaries, gamma, lam):
     T = len(rewards)
     advantages = np.zeros(T, dtype=np.float32)
-    last_adv = 0.0
-    last_value = 0.0
+    next_adv = 0.0
     for t in reversed(range(T)):
-        mask = 1.0 - dones[t]
-        delta = rewards[t] + gamma * last_value * mask - values[t]
-        last_adv = delta + gamma * lam * mask * last_adv
-        advantages[t] = last_adv
-        last_value = values[t]
+        delta = rewards[t] + gamma * bootstrap_values[t] - values[t]
+        continue_mask = 1.0 if (t < T - 1 and not bool(episode_boundaries[t])) else 0.0
+        next_adv = delta + gamma * lam * continue_mask * next_adv
+        advantages[t] = next_adv
     returns = advantages + values
     return advantages, returns
 
@@ -58,6 +58,15 @@ def _single_env_step_stats(env) -> Dict[str, object]:
             getattr(env, "last_danger_imitation_mask", np.zeros((num_agents,), dtype=np.float32)),
             dtype=np.float32,
         ),
+        "visible_raw_counts": np.asarray(
+            getattr(env, "last_visible_raw_counts", np.zeros((num_agents,), dtype=np.float32)),
+            dtype=np.float32,
+        ),
+        "visible_kept_counts": np.asarray(
+            getattr(env, "last_visible_kept_counts", np.zeros((num_agents,), dtype=np.float32)),
+            dtype=np.float32,
+        ),
+        "visible_stats": dict(getattr(env, "last_visible_stats", {}) or {}),
         "gu_queue_mean": _safe_mean(getattr(env, "gu_queue", 0.0)),
         "uav_queue_mean": _safe_mean(getattr(env, "uav_queue", 0.0)),
         "sat_queue_mean": _safe_mean(getattr(env, "sat_queue", 0.0)),
@@ -123,6 +132,14 @@ def _normalize_exec_source(raw: str | None) -> str:
     return src
 
 
+def _normalize_checkpoint_eval_fixed_policy(raw: str | None) -> str:
+    policy = str("zero" if raw is None else raw).strip().lower()
+    allowed = {"zero", "queue_aware"}
+    if policy not in allowed:
+        raise ValueError(f"Invalid checkpoint-eval fixed policy '{raw}'. Allowed: {sorted(allowed)}")
+    return policy
+
+
 def _select_exec_values(
     source: str,
     policy_values: np.ndarray | None,
@@ -155,12 +172,404 @@ def _build_danger_imitation_step_data(stats: Dict[str, object], cfg, num_agents:
     return accel_exec_norm, mask
 
 
+def _format_checkpoint_load(prefix: str, info: Dict[str, object]) -> str:
+    adapted = info.get("adapted_keys", [])
+    skipped = info.get("skipped_keys", [])
+    missing = info.get("missing_keys", [])
+    unexpected = info.get("unexpected_keys", [])
+    parts = [prefix]
+    if adapted:
+        parts.append(f"adapted={len(adapted)}")
+    if skipped:
+        parts.append(f"skipped={len(skipped)}")
+    if missing:
+        parts.append(f"missing={len(missing)}")
+    if unexpected:
+        parts.append(f"unexpected={len(unexpected)}")
+    return ", ".join(parts)
+
+
 def _save_checkpoints(log_dir: str, actor, critic, suffix: str | None = None) -> None:
     os.makedirs(log_dir, exist_ok=True)
     actor_name = "actor.pt" if suffix is None else f"actor_{suffix}.pt"
     critic_name = "critic.pt" if suffix is None else f"critic_{suffix}.pt"
     torch.save(actor.state_dict(), os.path.join(log_dir, actor_name))
     torch.save(critic.state_dict(), os.path.join(log_dir, critic_name))
+
+
+def _reward_rms_state(reward_rms: RunningMeanStd | None) -> Dict[str, float] | None:
+    if reward_rms is None:
+        return None
+    return {
+        "mean": float(reward_rms.mean),
+        "var": float(reward_rms.var),
+        "count": float(reward_rms.count),
+    }
+
+
+def _restore_reward_rms(reward_rms: RunningMeanStd | None, state: Dict[str, object] | None) -> None:
+    if reward_rms is None or not isinstance(state, dict):
+        return
+    if "mean" in state:
+        reward_rms.mean = float(state["mean"])
+    if "var" in state:
+        reward_rms.var = float(state["var"])
+    if "count" in state:
+        reward_rms.count = float(state["count"])
+
+
+def _save_train_state(
+    log_dir: str,
+    actor,
+    critic,
+    actor_optim,
+    critic_optim,
+    actor_sched,
+    critic_sched,
+    reward_rms: RunningMeanStd | None,
+    update: int,
+    planned_total_updates: int,
+    total_env_steps: int,
+    reward_history: List[float],
+    best_ma: float,
+    no_improve: int,
+    checkpoint_eval_state: Dict[str, float],
+    checkpoint_eval_fixed_summary: Dict[str, float] | None,
+    total_time_sec: float,
+    suffix: str | None = None,
+) -> None:
+    os.makedirs(log_dir, exist_ok=True)
+    state_name = "train_state.pt" if suffix is None else f"train_state_{suffix}.pt"
+    payload = {
+        "actor_state_dict": actor.state_dict(),
+        "critic_state_dict": critic.state_dict(),
+        "actor_optimizer_state_dict": actor_optim.state_dict(),
+        "critic_optimizer_state_dict": critic_optim.state_dict(),
+        "actor_scheduler_state_dict": actor_sched.state_dict() if actor_sched is not None else None,
+        "critic_scheduler_state_dict": critic_sched.state_dict() if critic_sched is not None else None,
+        "reward_rms": _reward_rms_state(reward_rms),
+        "update": int(update),
+        "planned_total_updates": int(planned_total_updates),
+        "total_env_steps": int(total_env_steps),
+        "reward_history": [float(x) for x in reward_history],
+        "best_ma": float(best_ma),
+        "no_improve": int(no_improve),
+        "checkpoint_eval_state": {str(k): float(v) for k, v in checkpoint_eval_state.items()},
+        "checkpoint_eval_fixed_summary": checkpoint_eval_fixed_summary,
+        "total_time_sec": float(total_time_sec),
+    }
+    torch.save(payload, os.path.join(log_dir, state_name))
+
+
+def _load_train_state(
+    path: str,
+    actor,
+    critic,
+    actor_optim,
+    critic_optim,
+    actor_sched,
+    critic_sched,
+    reward_rms: RunningMeanStd | None,
+    device: torch.device,
+) -> Dict[str, object]:
+    payload = torch.load(path, map_location=device)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Train state '{path}' did not contain a dictionary payload.")
+    actor_state = payload.get("actor_state_dict")
+    critic_state = payload.get("critic_state_dict")
+    if not isinstance(actor_state, dict) or not isinstance(critic_state, dict):
+        raise KeyError(
+            f"Train state '{path}' is missing 'actor_state_dict' or 'critic_state_dict'."
+        )
+    actor_info = load_state_dict_forgiving(actor, actor_state, strict=False)
+    critic_info = load_state_dict_forgiving(critic, critic_state, strict=False)
+
+    actor_optim_state = payload.get("actor_optimizer_state_dict")
+    critic_optim_state = payload.get("critic_optimizer_state_dict")
+    if actor_optim_state is not None:
+        actor_optim.load_state_dict(actor_optim_state)
+    if critic_optim_state is not None:
+        critic_optim.load_state_dict(critic_optim_state)
+
+    actor_sched_state = payload.get("actor_scheduler_state_dict")
+    critic_sched_state = payload.get("critic_scheduler_state_dict")
+    if actor_sched is not None and actor_sched_state is not None:
+        actor_sched.load_state_dict(actor_sched_state)
+    if critic_sched is not None and critic_sched_state is not None:
+        critic_sched.load_state_dict(critic_sched_state)
+
+    _restore_reward_rms(reward_rms, payload.get("reward_rms"))
+
+    return {
+        "path": path,
+        "actor_info": actor_info,
+        "critic_info": critic_info,
+        "update": int(payload.get("update", 0) or 0),
+        "planned_total_updates": int(payload.get("planned_total_updates", 0) or 0),
+        "total_env_steps": int(payload.get("total_env_steps", 0) or 0),
+        "reward_history": [float(x) for x in (payload.get("reward_history", []) or [])],
+        "best_ma": float(payload.get("best_ma", -float("inf"))),
+        "no_improve": int(payload.get("no_improve", 0) or 0),
+        "checkpoint_eval_state": {
+            str(k): float(v) for k, v in dict(payload.get("checkpoint_eval_state", {}) or {}).items()
+        },
+        "checkpoint_eval_fixed_summary": (
+            dict(payload["checkpoint_eval_fixed_summary"])
+            if payload.get("checkpoint_eval_fixed_summary") is not None
+            else None
+        ),
+        "total_time_sec": float(payload.get("total_time_sec", 0.0) or 0.0),
+    }
+
+
+def _checkpoint_eval_summary(
+    cfg,
+    actor,
+    device: torch.device,
+    episodes: int,
+    episode_seed_base: int | None,
+    exec_accel_source: str,
+    exec_bw_source: str,
+    exec_sat_source: str,
+    teacher_actor,
+    teacher_deterministic: bool,
+    need_heuristic_exec: bool,
+    fixed_baseline: bool = False,
+    fixed_baseline_policy: str = "zero",
+) -> Dict[str, float]:
+    from ..env.sagin_env import SaginParallelEnv
+
+    eval_env = SaginParallelEnv(cfg)
+    try:
+        reward_sum_total = 0.0
+        throughput_access_norm_total = 0.0
+        throughput_backhaul_norm_total = 0.0
+        gu_queue_arrival_steps_total = 0.0
+        uav_queue_arrival_steps_total = 0.0
+        sat_queue_arrival_steps_total = 0.0
+        sat_drop_ratio_total = 0.0
+        collision_total = 0.0
+
+        for ep in range(max(int(episodes), 1)):
+            ep_seed = None if episode_seed_base is None else int(episode_seed_base) + ep
+            obs, _ = eval_env.reset(seed=ep_seed)
+            done = False
+            steps = 0
+            reward_sum = 0.0
+            arrival_sum_ep = 0.0
+            throughput_access_norm_sum = 0.0
+            throughput_backhaul_norm_sum = 0.0
+            gu_queue_sum_steps = 0.0
+            uav_queue_sum_steps = 0.0
+            sat_queue_sum_steps = 0.0
+            sat_drop_sum_ep = 0.0
+            collision_any = 0.0
+
+            while not done:
+                obs_list = list(obs.values())
+                if fixed_baseline:
+                    if fixed_baseline_policy == "queue_aware":
+                        heur_accel, heur_bw, heur_sat = queue_aware_policy(obs_list, cfg)
+                        actions = assemble_actions(
+                            cfg,
+                            eval_env.agents,
+                            heur_accel,
+                            bw_logits=heur_bw,
+                            sat_logits=heur_sat,
+                        )
+                    else:
+                        accel_actions = np.zeros((len(eval_env.agents), 2), dtype=np.float32)
+                        actions = assemble_actions(cfg, eval_env.agents, accel_actions)
+                else:
+                    obs_batch = batch_flatten_obs(obs_list, cfg)
+                    obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
+                    with torch.inference_mode():
+                        policy_out = actor.act(obs_tensor, deterministic=True)
+                    teacher_accel = None
+                    teacher_bw = None
+                    teacher_sat = None
+                    if teacher_actor is not None:
+                        with torch.inference_mode():
+                            teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
+                        teacher_accel = teacher_out.accel.cpu().numpy()
+                        teacher_bw = (
+                            teacher_out.bw_logits.cpu().numpy() if teacher_out.bw_logits is not None else None
+                        )
+                        teacher_sat = (
+                            teacher_out.sat_logits.cpu().numpy() if teacher_out.sat_logits is not None else None
+                        )
+                    heur_accel = None
+                    heur_bw = None
+                    heur_sat = None
+                    if need_heuristic_exec:
+                        heur_accel, heur_bw, heur_sat = queue_aware_policy(obs_list, cfg)
+                    accel_actions = _select_exec_values(
+                        exec_accel_source,
+                        policy_out.accel.cpu().numpy(),
+                        teacher_accel,
+                        heur_accel,
+                        (len(eval_env.agents), 2),
+                    )
+                    bw_logits = None
+                    sat_logits = None
+                    if cfg.enable_bw_action:
+                        policy_bw = (
+                            policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
+                        )
+                        bw_logits = _select_exec_values(
+                            exec_bw_source,
+                            policy_bw,
+                            teacher_bw,
+                            heur_bw,
+                            (len(eval_env.agents), cfg.users_obs_max),
+                        )
+                    if not cfg.fixed_satellite_strategy:
+                        policy_sat = (
+                            policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
+                        )
+                        sat_logits = _select_exec_values(
+                            exec_sat_source,
+                            policy_sat,
+                            teacher_sat,
+                            heur_sat,
+                            (len(eval_env.agents), cfg.sats_obs_max),
+                        )
+                    actions = assemble_actions(
+                        cfg,
+                        eval_env.agents,
+                        accel_actions,
+                        bw_logits=bw_logits,
+                        sat_logits=sat_logits,
+                    )
+
+                obs, rewards, terms, truncs, _ = eval_env.step(actions)
+                reward_sum += float(list(rewards.values())[0])
+                done = bool(list(terms.values())[0] or list(truncs.values())[0])
+                steps += 1
+                gu_queue_sum_steps += float(np.sum(eval_env.gu_queue))
+                uav_queue_sum_steps += float(np.sum(eval_env.uav_queue))
+                sat_queue_sum_steps += float(np.sum(eval_env.sat_queue))
+                sat_drop_sum_ep += float(np.sum(getattr(eval_env, 'sat_drop', 0.0)))
+                parts = dict(getattr(eval_env, 'last_reward_parts', {}) or {})
+                arrival_sum_ep += float(parts.get('arrival_sum', 0.0))
+                throughput_access_norm_sum += float(parts.get('throughput_access_norm', 0.0))
+                throughput_backhaul_norm_sum += float(parts.get('throughput_backhaul_norm', 0.0))
+                collision_any = max(collision_any, float(parts.get('collision_event', 0.0)))
+
+            steps = max(steps, 1)
+            arrival_per_step = arrival_sum_ep / float(steps)
+            arrival_denom = max(arrival_per_step, 1e-9)
+            reward_sum_total += reward_sum
+            throughput_access_norm_total += throughput_access_norm_sum / float(steps)
+            throughput_backhaul_norm_total += throughput_backhaul_norm_sum / float(steps)
+            gu_queue_arrival_steps_total += (gu_queue_sum_steps / float(steps)) / arrival_denom
+            uav_queue_arrival_steps_total += (uav_queue_sum_steps / float(steps)) / arrival_denom
+            sat_queue_arrival_steps_total += (sat_queue_sum_steps / float(steps)) / arrival_denom
+            sat_drop_ratio_total += sat_drop_sum_ep / max(arrival_sum_ep, 1e-9)
+            collision_total += collision_any
+
+        denom = float(max(int(episodes), 1))
+        return {
+            'episodes': denom,
+            'reward_sum': reward_sum_total / denom,
+            'throughput_access_norm_mean': throughput_access_norm_total / denom,
+            'throughput_backhaul_norm_mean': throughput_backhaul_norm_total / denom,
+            'gu_queue_arrival_steps_mean': gu_queue_arrival_steps_total / denom,
+            'uav_queue_arrival_steps_mean': uav_queue_arrival_steps_total / denom,
+            'sat_queue_arrival_steps_mean': sat_queue_arrival_steps_total / denom,
+            'sat_drop_ratio': sat_drop_ratio_total / denom,
+            'collision_episode_fraction': collision_total / denom,
+        }
+    finally:
+        close_fn = getattr(eval_env, 'close', None)
+        if callable(close_fn):
+            close_fn()
+
+
+def _checkpoint_eval_fieldnames() -> List[str]:
+    return [
+        'update',
+        'checkpoint_suffix',
+        'episodes',
+        'reward_sum',
+        'throughput_access_norm_mean',
+        'throughput_backhaul_norm_mean',
+        'gu_queue_arrival_steps_mean',
+        'uav_queue_arrival_steps_mean',
+        'sat_queue_arrival_steps_mean',
+        'sat_drop_ratio',
+        'collision_episode_fraction',
+        'fixed_reward_sum',
+        'fixed_throughput_access_norm_mean',
+        'fixed_throughput_backhaul_norm_mean',
+        'fixed_gu_queue_arrival_steps_mean',
+        'fixed_uav_queue_arrival_steps_mean',
+        'fixed_sat_queue_arrival_steps_mean',
+        'fixed_sat_drop_ratio',
+        'fixed_collision_episode_fraction',
+        'gu_improved',
+        'uav_improved',
+        'front_improved',
+        'sat_drop_worsened',
+        'sat_drop_worse_streak',
+        'early_stop_triggered',
+    ]
+
+
+def _append_checkpoint_eval_row(path: str, row: Dict[str, object]) -> None:
+    fieldnames = _checkpoint_eval_fieldnames()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({name: row.get(name, "") for name in fieldnames})
+
+
+def _update_checkpoint_eval_state(
+    state: Dict[str, float],
+    summary: Dict[str, float],
+    cfg,
+) -> Dict[str, object]:
+    sat_drop = float(summary["sat_drop_ratio"])
+    gu_queue = float(summary["gu_queue_arrival_steps_mean"])
+    uav_queue = float(summary["uav_queue_arrival_steps_mean"])
+    rel_tol = max(float(getattr(cfg, "checkpoint_eval_front_queue_rel_improve_tol", 0.05) or 0.0), 0.0)
+    worsen_delta = max(float(getattr(cfg, "checkpoint_eval_sat_drop_worsen_delta", 0.0) or 0.0), 0.0)
+    patience = max(int(getattr(cfg, "checkpoint_eval_worsen_patience", 2) or 0), 1)
+
+    best_gu_prev = float(state.get("best_gu_queue_arrival_steps_mean", float("inf")))
+    best_uav_prev = float(state.get("best_uav_queue_arrival_steps_mean", float("inf")))
+    prev_sat_drop = state.get("prev_sat_drop_ratio", None)
+
+    gu_improved = not np.isfinite(best_gu_prev) or gu_queue < best_gu_prev * (1.0 - rel_tol)
+    uav_improved = not np.isfinite(best_uav_prev) or uav_queue < best_uav_prev * (1.0 - rel_tol)
+    front_improved = bool(gu_improved or uav_improved)
+    sat_drop_worsened = prev_sat_drop is not None and sat_drop > float(prev_sat_drop) + worsen_delta
+
+    if gu_queue < best_gu_prev:
+        state["best_gu_queue_arrival_steps_mean"] = gu_queue
+    if uav_queue < best_uav_prev:
+        state["best_uav_queue_arrival_steps_mean"] = uav_queue
+
+    prev_streak = int(state.get("sat_drop_worse_streak", 0))
+    if sat_drop_worsened and not front_improved:
+        sat_drop_worse_streak = prev_streak + 1
+    else:
+        sat_drop_worse_streak = 0
+    state["sat_drop_worse_streak"] = float(sat_drop_worse_streak)
+    state["prev_sat_drop_ratio"] = sat_drop
+
+    should_stop = sat_drop_worse_streak >= patience
+    return {
+        "gu_improved": float(gu_improved),
+        "uav_improved": float(uav_improved),
+        "front_improved": float(front_improved),
+        "sat_drop_worsened": float(sat_drop_worsened),
+        "sat_drop_worse_streak": float(sat_drop_worse_streak),
+        "early_stop_triggered": float(should_stop),
+    }
 
 
 def train(
@@ -171,9 +580,11 @@ def train(
     save_interval_updates: int = 0,
     init_actor_path: str | None = None,
     init_critic_path: str | None = None,
+    resume_state_path: str | None = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     save_interval_updates = max(0, int(save_interval_updates or 0))
+    total_updates = max(0, int(total_updates or 0))
 
     num_envs = int(getattr(env, "num_envs", 1))
 
@@ -194,18 +605,18 @@ def train(
 
     actor = ActorNet(obs_dim, cfg).to(device)
     critic = CriticNet(state_dim, cfg).to(device)
+    if resume_state_path and (init_actor_path or init_critic_path):
+        raise ValueError("--resume_state cannot be combined with --init_actor/--init_critic.")
     if init_actor_path:
         try:
-            state = torch.load(init_actor_path, map_location=device)
-            actor.load_state_dict(state, strict=False)
-            print(f"Loaded actor init from {init_actor_path} (strict=False)")
+            info = load_checkpoint_forgiving(actor, init_actor_path, map_location=device)
+            print(_format_checkpoint_load(f"Loaded actor init from {init_actor_path}", info))
         except Exception as exc:
             print(f"Warning: failed to load actor init from {init_actor_path}: {exc}")
     if init_critic_path:
         try:
-            state = torch.load(init_critic_path, map_location=device)
-            critic.load_state_dict(state, strict=False)
-            print(f"Loaded critic init from {init_critic_path} (strict=False)")
+            info = load_checkpoint_forgiving(critic, init_critic_path, map_location=device)
+            print(_format_checkpoint_load(f"Loaded critic init from {init_critic_path}", info))
         except Exception as exc:
             print(f"Warning: failed to load critic init from {init_critic_path}: {exc}")
 
@@ -250,18 +661,60 @@ def train(
 
     actor_optim = torch.optim.Adam(actor_params, lr=cfg.actor_lr)
     critic_optim = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
+    reward_rms = RunningMeanStd() if getattr(cfg, "reward_norm_enabled", False) else None
+    resume_meta: Dict[str, object] | None = None
+    resume_update = 0
+    total_env_steps = 0
+    best_ma = -float("inf")
+    no_improve = 0
+    reward_history: List[float] = []
+    resumed_total_time_sec = 0.0
+    planned_total_updates = total_updates
+    if resume_state_path:
+        resume_payload = torch.load(resume_state_path, map_location=device)
+        if not isinstance(resume_payload, dict):
+            raise TypeError(f"Train state '{resume_state_path}' did not contain a dictionary payload.")
+        resume_update = int(resume_payload.get("update", 0) or 0)
+        saved_planned_total_updates = int(resume_payload.get("planned_total_updates", 0) or 0)
+        if saved_planned_total_updates > 0:
+            planned_total_updates = saved_planned_total_updates
+
     lr_decay_enabled = bool(getattr(cfg, "lr_decay_enabled", False))
     lr_final_factor = float(getattr(cfg, "lr_final_factor", 0.1) or 0.1)
     lr_final_factor = float(np.clip(lr_final_factor, 0.0, 1.0))
     actor_sched = None
     critic_sched = None
-    if lr_decay_enabled and total_updates > 1 and lr_final_factor < 1.0:
+    if lr_decay_enabled and planned_total_updates > 1 and lr_final_factor < 1.0:
         def _linear_lr(step_idx: int) -> float:
-            progress = min(max(step_idx, 0), total_updates - 1) / max(total_updates - 1, 1)
+            progress = min(max(step_idx, 0), planned_total_updates - 1) / max(planned_total_updates - 1, 1)
             return 1.0 - (1.0 - lr_final_factor) * progress
 
         actor_sched = torch.optim.lr_scheduler.LambdaLR(actor_optim, lr_lambda=_linear_lr)
         critic_sched = torch.optim.lr_scheduler.LambdaLR(critic_optim, lr_lambda=_linear_lr)
+    if resume_state_path:
+        resume_meta = _load_train_state(
+            resume_state_path,
+            actor=actor,
+            critic=critic,
+            actor_optim=actor_optim,
+            critic_optim=critic_optim,
+            actor_sched=actor_sched,
+            critic_sched=critic_sched,
+            reward_rms=reward_rms,
+            device=device,
+        )
+        resume_update = int(resume_meta.get("update", 0) or 0)
+        total_env_steps = int(resume_meta.get("total_env_steps", 0) or 0)
+        reward_history = [float(x) for x in (resume_meta.get("reward_history", []) or [])]
+        best_ma = float(resume_meta.get("best_ma", -float("inf")))
+        no_improve = int(resume_meta.get("no_improve", 0) or 0)
+        resumed_total_time_sec = float(resume_meta.get("total_time_sec", 0.0) or 0.0)
+        print(
+            f"Resumed train state from {resume_state_path}: "
+            f"completed_updates={resume_update}, total_env_steps={total_env_steps}"
+        )
+        print(_format_checkpoint_load(f"Resumed actor from {resume_state_path}", resume_meta["actor_info"]))
+        print(_format_checkpoint_load(f"Resumed critic from {resume_state_path}", resume_meta["critic_info"]))
 
     from ..utils.logging import MetricLogger
     from ..utils.progress import Progress
@@ -270,6 +723,7 @@ def train(
         "episode_reward",
         "policy_loss",
         "value_loss",
+        "explained_variance",
         "entropy",
         "reward_rms_sigma",
         "reward_clip_frac",
@@ -314,6 +768,7 @@ def train(
         "r_term_drop_gu",
         "r_term_drop_uav",
         "r_term_drop_sat",
+        "r_term_drop_step",
         "r_term_queue",
         "r_term_topk",
         "r_term_assoc",
@@ -345,6 +800,9 @@ def train(
         "uav_drop_ratio_step",
         "sat_drop_ratio_step",
         "drop_sum",
+        "drop_sum_active",
+        "sat_drop_sum_step",
+        "drop_event_rate",
         "queue_pen_gu",
         "queue_pen_uav",
         "queue_pen_sat",
@@ -432,12 +890,7 @@ def train(
     ]
     logger = MetricLogger(log_dir, fieldnames=metric_fields)
     progress = Progress(total_updates, desc="Train")
-    training_start = time.perf_counter()
-    total_env_steps = 0
-    best_ma = -float("inf")
-    no_improve = 0
-    reward_history = []
-    reward_rms = RunningMeanStd() if getattr(cfg, "reward_norm_enabled", False) else None
+    training_start = time.perf_counter() - resumed_total_time_sec
     imitation_coef_start = float(getattr(cfg, "imitation_coef", 0.0) or 0.0)
     imitation_coef_final_cfg = getattr(cfg, "imitation_coef_final", None)
     imitation_coef_final = (
@@ -467,7 +920,7 @@ def train(
     imitation_accel = bool(getattr(cfg, "imitation_accel", True)) and train_heads["accel"]
     imitation_bw = bool(getattr(cfg, "imitation_bw", True)) and train_heads["bw"]
     imitation_sat = bool(getattr(cfg, "imitation_sat", False)) and train_heads["sat"]
-    imitation_coef_curr = _imitation_coef_at(0)
+    imitation_coef_curr = _imitation_coef_at(resume_update)
     imitation_enabled_curr = imitation_enabled and imitation_coef_curr > 0.0
     danger_imitation_coef = max(float(getattr(cfg, "danger_imitation_coef", 0.0) or 0.0), 0.0)
     danger_imitation_enabled = bool(getattr(cfg, "danger_imitation_enabled", False)) and danger_imitation_coef > 0.0
@@ -491,8 +944,8 @@ def train(
                 "Set exec_teacher_actor_path or pass --init_actor."
             )
         teacher_actor = ActorNet(obs_dim, cfg).to(device)
-        state = torch.load(teacher_path, map_location=device)
-        teacher_actor.load_state_dict(state, strict=False)
+        info = load_checkpoint_forgiving(teacher_actor, teacher_path, map_location=device)
+        print(_format_checkpoint_load(f"Loaded teacher actor from {teacher_path}", info))
         teacher_actor.eval()
         for p in teacher_actor.parameters():
             p.requires_grad = False
@@ -505,6 +958,68 @@ def train(
     )
 
     obs_env = list(obs_sample_env) if num_envs > 1 else [obs_sample_raw]
+    checkpoint_eval_interval = max(int(getattr(cfg, "checkpoint_eval_interval_updates", 0) or 0), 0)
+    checkpoint_eval_enabled = (
+        bool(getattr(cfg, "checkpoint_eval_enabled", False))
+        and checkpoint_eval_interval > 0
+        and int(getattr(cfg, "checkpoint_eval_episodes", 0) or 0) > 0
+    )
+    checkpoint_eval_start_update = max(int(getattr(cfg, "checkpoint_eval_start_update", 0) or 0), 0)
+    if checkpoint_eval_enabled and checkpoint_eval_start_update <= 0:
+        checkpoint_eval_start_update = checkpoint_eval_interval
+    checkpoint_eval_episodes = max(int(getattr(cfg, "checkpoint_eval_episodes", 20) or 0), 1)
+    checkpoint_eval_episode_seed_base = getattr(cfg, "checkpoint_eval_episode_seed_base", None)
+    checkpoint_eval_fixed_policy = _normalize_checkpoint_eval_fixed_policy(
+        getattr(cfg, "checkpoint_eval_fixed_policy", "zero")
+    )
+    checkpoint_eval_csv_path = os.path.join(log_dir, "checkpoint_eval.csv")
+    checkpoint_eval_state: Dict[str, float] = (
+        dict(resume_meta.get("checkpoint_eval_state", {}) or {}) if resume_meta is not None else {}
+    )
+    checkpoint_eval_fixed_summary: Dict[str, float] | None = (
+        dict(resume_meta.get("checkpoint_eval_fixed_summary", {}) or {})
+        if resume_meta is not None and resume_meta.get("checkpoint_eval_fixed_summary") is not None
+        else None
+    )
+    checkpoint_eval_early_stop_enabled = bool(getattr(cfg, "checkpoint_eval_early_stop_enabled", True))
+    if checkpoint_eval_enabled:
+        if resume_meta is None and os.path.exists(checkpoint_eval_csv_path):
+            os.remove(checkpoint_eval_csv_path)
+        if checkpoint_eval_fixed_summary is None:
+            checkpoint_eval_fixed_summary = _checkpoint_eval_summary(
+                cfg,
+                actor=None,
+                device=device,
+                episodes=checkpoint_eval_episodes,
+                episode_seed_base=checkpoint_eval_episode_seed_base,
+                exec_accel_source=exec_accel_source,
+                exec_bw_source=exec_bw_source,
+                exec_sat_source=exec_sat_source,
+                teacher_actor=teacher_actor,
+                teacher_deterministic=teacher_deterministic,
+                need_heuristic_exec=need_heuristic_exec,
+                fixed_baseline=True,
+                fixed_baseline_policy=checkpoint_eval_fixed_policy,
+            )
+            print(
+                f"Checkpoint eval {checkpoint_eval_fixed_policy} reference: "
+                f"reward={checkpoint_eval_fixed_summary['reward_sum']:.4f}, "
+                f"T_access={checkpoint_eval_fixed_summary['throughput_access_norm_mean']:.4f}, "
+                f"T_backhaul={checkpoint_eval_fixed_summary['throughput_backhaul_norm_mean']:.4f}, "
+                f"GU={checkpoint_eval_fixed_summary['gu_queue_arrival_steps_mean']:.4f}, "
+                f"UAV={checkpoint_eval_fixed_summary['uav_queue_arrival_steps_mean']:.4f}, "
+                f"collision={checkpoint_eval_fixed_summary['collision_episode_fraction']:.4f}"
+            )
+        else:
+            print(
+                f"Reused checkpoint eval {checkpoint_eval_fixed_policy} reference from {resume_state_path}: "
+                f"reward={checkpoint_eval_fixed_summary['reward_sum']:.4f}, "
+                f"T_access={checkpoint_eval_fixed_summary['throughput_access_norm_mean']:.4f}, "
+                f"T_backhaul={checkpoint_eval_fixed_summary['throughput_backhaul_norm_mean']:.4f}, "
+                f"GU={checkpoint_eval_fixed_summary['gu_queue_arrival_steps_mean']:.4f}, "
+                f"UAV={checkpoint_eval_fixed_summary['uav_queue_arrival_steps_mean']:.4f}, "
+                f"collision={checkpoint_eval_fixed_summary['collision_episode_fraction']:.4f}"
+            )
 
     def _build_imitation_target(obs_list):
         if not imitation_enabled_curr:
@@ -527,7 +1042,9 @@ def train(
                 parts.append(np.zeros_like(base_sat))
         return np.concatenate(parts, axis=1).astype(np.float32, copy=False)
 
-    for update in range(total_updates):
+    completed_updates = resume_update
+    for local_update in range(total_updates):
+        update = resume_update + local_update
         imitation_coef_curr = _imitation_coef_at(update)
         imitation_enabled_curr = imitation_enabled and imitation_coef_curr > 0.0
         update_start = time.perf_counter()
@@ -578,6 +1095,7 @@ def train(
         r_term_drop_gu_sum = 0.0
         r_term_drop_uav_sum = 0.0
         r_term_drop_sat_sum = 0.0
+        r_term_drop_step_sum = 0.0
         r_term_queue_sum = 0.0
         r_term_topk_sum = 0.0
         r_term_assoc_sum = 0.0
@@ -611,6 +1129,9 @@ def train(
         uav_drop_ratio_step_sum = 0.0
         sat_drop_ratio_step_sum = 0.0
         drop_sum_total = 0.0
+        drop_sum_active_total = 0.0
+        sat_drop_sum_step_total = 0.0
+        drop_event_sum = 0.0
         queue_pen_gu_sum = 0.0
         queue_pen_uav_sum = 0.0
         queue_pen_sat_sum = 0.0
@@ -786,6 +1307,7 @@ def train(
             else:
                 next_obs, rewards, terms, truncs, _ = env.step(action_dicts[0])
                 step_stats = [_single_env_step_stats(env)]
+                step_stats[0]["post_step_global_state"] = np.asarray(env.get_global_state(), dtype=np.float32)
                 done_scalar = list(terms.values())[0] or list(truncs.values())[0]
                 if done_scalar:
                     next_obs, _ = env.reset()
@@ -832,7 +1354,9 @@ def train(
                 truncs = truncs_env[env_idx]
 
                 reward_scalar = list(rewards.values())[0]
-                done_scalar = list(terms.values())[0] or list(truncs.values())[0]
+                terminated_scalar = bool(list(terms.values())[0])
+                truncated_scalar = bool(list(truncs.values())[0])
+                done_scalar = terminated_scalar or truncated_scalar
                 ep_reward += reward_scalar
                 steps_count += 1
                 total_env_steps += 1
@@ -884,6 +1408,9 @@ def train(
                     uav_drop_ratio_step_sum += float(parts.get("uav_drop_ratio_step", 0.0))
                     sat_drop_ratio_step_sum += float(parts.get("sat_drop_ratio_step", 0.0))
                     drop_sum_total += float(parts.get("drop_sum", 0.0))
+                    drop_sum_active_total += float(parts.get("drop_sum_active", 0.0))
+                    sat_drop_sum_step_total += float(parts.get("sat_drop_sum", 0.0))
+                    drop_event_sum += float(parts.get("drop_event", 0.0))
                     queue_pen_gu_sum += float(parts.get("queue_pen_gu", 0.0))
                     queue_pen_uav_sum += float(parts.get("queue_pen_uav", 0.0))
                     queue_pen_sat_sum += float(parts.get("queue_pen_sat", 0.0))
@@ -959,6 +1486,7 @@ def train(
                     r_term_drop_gu_sum += float(parts.get("term_drop_gu", 0.0))
                     r_term_drop_uav_sum += float(parts.get("term_drop_uav", 0.0))
                     r_term_drop_sat_sum += float(parts.get("term_drop_sat", 0.0))
+                    r_term_drop_step_sum += float(parts.get("term_drop_step", 0.0))
                     r_term_queue_sum += float(parts.get("term_queue", 0.0))
                     r_term_topk_sum += float(parts.get("term_topk", 0.0))
                     r_term_assoc_sum += float(parts.get("term_assoc", 0.0))
@@ -978,14 +1506,20 @@ def train(
                     intervention_norm_top1_sum += float(parts.get("intervention_norm_top1", 0.0))
 
                 danger_target_env, danger_mask_env = _build_danger_imitation_step_data(stats, cfg, num_agents)
+                post_step_state = np.asarray(
+                    stats.get("post_step_global_state", next_state_batch_np[env_idx]),
+                    dtype=np.float32,
+                )
                 buffers[env_idx].add(
                     per_env_obs_batch[env_idx],
                     action_vec_exec_env[env_idx],
                     logprobs_all[sl],
                     reward_scalar,
                     float(value_np[env_idx]),
-                    done_scalar,
+                    terminated_scalar,
+                    truncated_scalar,
                     curr_state_batch_np[env_idx],
+                    post_step_state,
                     _build_imitation_target(per_env_obs_lists[env_idx]),
                     danger_target_env,
                     danger_mask_env,
@@ -1019,8 +1553,10 @@ def train(
             logp_arr_e,
             rewards_e,
             values_e,
-            dones_e,
+            terminated_e,
+            truncated_e,
             state_arr_e,
+            next_state_arr_e,
             imitation_arr_e,
             danger_imitation_target_e,
             danger_imitation_mask_e,
@@ -1032,7 +1568,20 @@ def train(
                     reward_clip_hits += int(np.count_nonzero(np.abs(rewards_proc) > clip_val))
                     reward_clip_total += int(rewards_proc.size)
                     rewards_proc = np.clip(rewards_proc, -clip_val, clip_val)
-            adv_e, rets_e = compute_gae(rewards_proc, values_e, dones_e, cfg.gamma, cfg.gae_lambda)
+            with torch.inference_mode():
+                next_state_t_e = torch.from_numpy(next_state_arr_e).to(device)
+                bootstrap_values_e = critic(next_state_t_e).detach().cpu().numpy().reshape(-1)
+            bootstrap_values_e = np.asarray(bootstrap_values_e, dtype=np.float32)
+            bootstrap_values_e = np.where(terminated_e > 0.5, 0.0, bootstrap_values_e)
+            episode_boundaries_e = np.logical_or(terminated_e > 0.5, truncated_e > 0.5)
+            adv_e, rets_e = compute_gae(
+                rewards_proc,
+                values_e,
+                bootstrap_values_e,
+                episode_boundaries_e,
+                cfg.gamma,
+                cfg.gae_lambda,
+            )
             obs_arr_list.append(obs_arr_e)
             act_arr_list.append(act_arr_e)
             logp_arr_list.append(logp_arr_e)
@@ -1260,10 +1809,19 @@ def train(
         else:
             log_std_vec = np.zeros((1,), dtype=np.float32)
         action_std_vec = np.exp(log_std_vec)
+        explained_variance = 0.0
+        returns_np = np.asarray(rets, dtype=np.float32).reshape(-1)
+        if returns_np.size > 1:
+            with torch.inference_mode():
+                value_pred_eval = critic(state_t).detach().cpu().numpy().reshape(-1)
+            returns_var = float(np.var(returns_np))
+            if returns_var > 1e-8:
+                explained_variance = 1.0 - float(np.var(returns_np - value_pred_eval)) / returns_var
         metrics = {
             "episode_reward": episode_reward,
             "policy_loss": float(np.mean(policy_losses)),
             "value_loss": float(np.mean(value_losses)),
+            "explained_variance": explained_variance,
             "entropy": float(np.mean(entropies)),
             "reward_rms_sigma": reward_rms_sigma,
             "reward_clip_frac": reward_clip_frac,
@@ -1308,6 +1866,7 @@ def train(
             "r_term_drop_gu": r_term_drop_gu_sum / steps_count,
             "r_term_drop_uav": r_term_drop_uav_sum / steps_count,
             "r_term_drop_sat": r_term_drop_sat_sum / steps_count,
+            "r_term_drop_step": r_term_drop_step_sum / steps_count,
             "r_term_queue": r_term_queue_sum / steps_count,
             "r_term_topk": r_term_topk_sum / steps_count,
             "r_term_assoc": r_term_assoc_sum / steps_count,
@@ -1339,6 +1898,9 @@ def train(
             "uav_drop_ratio_step": uav_drop_ratio_step_sum / steps_count,
             "sat_drop_ratio_step": sat_drop_ratio_step_sum / steps_count,
             "drop_sum": drop_sum_total / steps_count,
+            "drop_sum_active": drop_sum_active_total / steps_count,
+            "sat_drop_sum_step": sat_drop_sum_step_total / steps_count,
+            "drop_event_rate": drop_event_sum / steps_count,
             "queue_pen_gu": queue_pen_gu_sum / steps_count,
             "queue_pen_uav": queue_pen_uav_sum / steps_count,
             "queue_pen_sat": queue_pen_sat_sum / steps_count,
@@ -1439,9 +2001,126 @@ def train(
             actor_sched.step()
         if critic_sched is not None:
             critic_sched.step()
-        progress.update(update + 1)
+        completed_updates = update + 1
+        progress.update(local_update + 1)
         if save_interval_updates > 0 and (update + 1) % save_interval_updates == 0:
-            _save_checkpoints(log_dir, actor, critic, suffix=f"u{update + 1:04d}")
+            checkpoint_suffix = f"u{update + 1:04d}"
+            _save_checkpoints(log_dir, actor, critic, suffix=checkpoint_suffix)
+            _save_train_state(
+                log_dir,
+                actor,
+                critic,
+                actor_optim,
+                critic_optim,
+                actor_sched,
+                critic_sched,
+                reward_rms,
+                update=update + 1,
+                planned_total_updates=planned_total_updates,
+                total_env_steps=total_env_steps,
+                reward_history=reward_history,
+                best_ma=best_ma,
+                no_improve=no_improve,
+                checkpoint_eval_state=checkpoint_eval_state,
+                checkpoint_eval_fixed_summary=checkpoint_eval_fixed_summary,
+                total_time_sec=time.perf_counter() - training_start,
+                suffix=checkpoint_suffix,
+            )
+
+        checkpoint_eval_due = (
+            checkpoint_eval_enabled
+            and (update + 1) >= checkpoint_eval_start_update
+            and ((update + 1 - checkpoint_eval_start_update) % checkpoint_eval_interval == 0)
+        )
+        if checkpoint_eval_due and checkpoint_eval_fixed_summary is not None:
+            checkpoint_suffix = f"u{update + 1:04d}"
+            _save_checkpoints(log_dir, actor, critic, suffix=checkpoint_suffix)
+            _save_train_state(
+                log_dir,
+                actor,
+                critic,
+                actor_optim,
+                critic_optim,
+                actor_sched,
+                critic_sched,
+                reward_rms,
+                update=update + 1,
+                planned_total_updates=planned_total_updates,
+                total_env_steps=total_env_steps,
+                reward_history=reward_history,
+                best_ma=best_ma,
+                no_improve=no_improve,
+                checkpoint_eval_state=checkpoint_eval_state,
+                checkpoint_eval_fixed_summary=checkpoint_eval_fixed_summary,
+                total_time_sec=time.perf_counter() - training_start,
+                suffix=checkpoint_suffix,
+            )
+            checkpoint_eval_summary = _checkpoint_eval_summary(
+                cfg,
+                actor=actor,
+                device=device,
+                episodes=checkpoint_eval_episodes,
+                episode_seed_base=checkpoint_eval_episode_seed_base,
+                exec_accel_source=exec_accel_source,
+                exec_bw_source=exec_bw_source,
+                exec_sat_source=exec_sat_source,
+                teacher_actor=teacher_actor,
+                teacher_deterministic=teacher_deterministic,
+                need_heuristic_exec=need_heuristic_exec,
+                fixed_baseline=False,
+            )
+            checkpoint_eval_flags = _update_checkpoint_eval_state(
+                checkpoint_eval_state,
+                checkpoint_eval_summary,
+                cfg,
+            )
+            checkpoint_eval_row = {
+                "update": update + 1,
+                "checkpoint_suffix": checkpoint_suffix,
+                "episodes": checkpoint_eval_summary["episodes"],
+                "reward_sum": checkpoint_eval_summary["reward_sum"],
+                "throughput_access_norm_mean": checkpoint_eval_summary["throughput_access_norm_mean"],
+                "throughput_backhaul_norm_mean": checkpoint_eval_summary["throughput_backhaul_norm_mean"],
+                "gu_queue_arrival_steps_mean": checkpoint_eval_summary["gu_queue_arrival_steps_mean"],
+                "uav_queue_arrival_steps_mean": checkpoint_eval_summary["uav_queue_arrival_steps_mean"],
+                "sat_queue_arrival_steps_mean": checkpoint_eval_summary["sat_queue_arrival_steps_mean"],
+                "sat_drop_ratio": checkpoint_eval_summary["sat_drop_ratio"],
+                "collision_episode_fraction": checkpoint_eval_summary["collision_episode_fraction"],
+                "fixed_reward_sum": checkpoint_eval_fixed_summary["reward_sum"],
+                "fixed_throughput_access_norm_mean": checkpoint_eval_fixed_summary["throughput_access_norm_mean"],
+                "fixed_throughput_backhaul_norm_mean": checkpoint_eval_fixed_summary["throughput_backhaul_norm_mean"],
+                "fixed_gu_queue_arrival_steps_mean": checkpoint_eval_fixed_summary["gu_queue_arrival_steps_mean"],
+                "fixed_uav_queue_arrival_steps_mean": checkpoint_eval_fixed_summary["uav_queue_arrival_steps_mean"],
+                "fixed_sat_queue_arrival_steps_mean": checkpoint_eval_fixed_summary["sat_queue_arrival_steps_mean"],
+                "fixed_sat_drop_ratio": checkpoint_eval_fixed_summary["sat_drop_ratio"],
+                "fixed_collision_episode_fraction": checkpoint_eval_fixed_summary["collision_episode_fraction"],
+            }
+            checkpoint_eval_row.update(checkpoint_eval_flags)
+            _append_checkpoint_eval_row(checkpoint_eval_csv_path, checkpoint_eval_row)
+            print(
+                "Checkpoint eval "
+                f"{checkpoint_suffix}: "
+                f"reward={checkpoint_eval_summary['reward_sum']:.4f} "
+                f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['reward_sum']:.4f}), "
+                f"T_access={checkpoint_eval_summary['throughput_access_norm_mean']:.4f} "
+                f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['throughput_access_norm_mean']:.4f}), "
+                f"T_backhaul={checkpoint_eval_summary['throughput_backhaul_norm_mean']:.4f} "
+                f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['throughput_backhaul_norm_mean']:.4f}), "
+                f"GU={checkpoint_eval_summary['gu_queue_arrival_steps_mean']:.4f} "
+                f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['gu_queue_arrival_steps_mean']:.4f}), "
+                f"UAV={checkpoint_eval_summary['uav_queue_arrival_steps_mean']:.4f} "
+                f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['uav_queue_arrival_steps_mean']:.4f}), "
+                f"collision={checkpoint_eval_summary['collision_episode_fraction']:.4f} "
+                f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['collision_episode_fraction']:.4f}), "
+                f"front_improved={int(checkpoint_eval_flags['front_improved'])}, "
+                f"worse_streak={int(checkpoint_eval_flags['sat_drop_worse_streak'])}"
+            )
+            if checkpoint_eval_early_stop_enabled and checkpoint_eval_flags["early_stop_triggered"] > 0.5:
+                print(
+                    f"Checkpoint-eval early stopping at update {update + 1}: "
+                    "sat_drop_ratio kept worsening without meaningful GU/UAV improvement."
+                )
+                break
 
         if cfg.early_stop_enabled:
             reward_history.append(episode_reward)
@@ -1460,6 +2139,25 @@ def train(
                     break
 
     _save_checkpoints(log_dir, actor, critic)
+    _save_train_state(
+        log_dir,
+        actor,
+        critic,
+        actor_optim,
+        critic_optim,
+        actor_sched,
+        critic_sched,
+        reward_rms,
+        update=completed_updates,
+        planned_total_updates=planned_total_updates,
+        total_env_steps=total_env_steps,
+        reward_history=reward_history,
+        best_ma=best_ma,
+        no_improve=no_improve,
+        checkpoint_eval_state=checkpoint_eval_state,
+        checkpoint_eval_fixed_summary=checkpoint_eval_fixed_summary,
+        total_time_sec=time.perf_counter() - training_start,
+    )
 
     progress.close()
     logger.close()

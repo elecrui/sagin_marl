@@ -48,7 +48,7 @@ class SaginParallelEnv(ParallelEnv):
         # Dimensions
         self.own_dim = 7
         self.user_dim = 5
-        self.sat_dim = 9
+        self.sat_dim = 12
         self.nbr_dim = 4
         self.danger_nbr_dim = 5
 
@@ -169,10 +169,66 @@ class SaginParallelEnv(ParallelEnv):
         ratio = self._traffic_level_ratio()
         self.effective_task_arrival_rate = base_rate * ratio
 
+    def _uav_init_boundary_margin(self) -> float:
+        cfg = self.cfg
+        steps = max(float(getattr(cfg, "uav_init_boundary_margin_steps", 0.0) or 0.0), 0.0)
+        margin = steps * float(cfg.v_max) * float(cfg.tau0)
+        max_margin = max(0.0, 0.5 * float(cfg.map_size) - 1e-6)
+        return float(min(margin, max_margin))
+
+    def _sample_uav_safe_random_positions(self) -> np.ndarray:
+        cfg = self.cfg
+        if cfg.num_uav <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        margin = self._uav_init_boundary_margin()
+        low = float(margin)
+        high = float(cfg.map_size) - float(margin)
+        min_spacing_cfg = getattr(cfg, "uav_init_min_spacing", None)
+        min_spacing = float(cfg.d_safe) if min_spacing_cfg is None else max(float(min_spacing_cfg), 0.0)
+        max_tries = max(int(getattr(cfg, "uav_init_max_tries", 256) or 256), 1)
+
+        positions = np.zeros((cfg.num_uav, 2), dtype=np.float32)
+        for i in range(cfg.num_uav):
+            placed = False
+            for _ in range(max_tries):
+                candidate = self.rng.uniform(low, high, size=(2,)).astype(np.float32)
+                if i > 0:
+                    dist = np.linalg.norm(positions[:i] - candidate[None, :], axis=1)
+                    if not np.all(dist >= min_spacing - 1e-6):
+                        continue
+                positions[i] = candidate
+                placed = True
+                break
+            if not placed:
+                raise RuntimeError(
+                    "Could not sample UAV initial positions satisfying boundary margin "
+                    "and minimum spacing constraints."
+                )
+        return positions
+
+    def _sample_uav_initial_velocities(self) -> np.ndarray:
+        cfg = self.cfg
+        if cfg.num_uav <= 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if not bool(getattr(cfg, "uav_safe_random_init_enabled", False)):
+            return np.zeros((cfg.num_uav, 2), dtype=np.float32)
+
+        speed_frac = max(float(getattr(cfg, "uav_init_speed_frac", 0.0) or 0.0), 0.0)
+        speed = min(speed_frac, 1.0) * float(cfg.v_max)
+        if speed <= 0.0:
+            return np.zeros((cfg.num_uav, 2), dtype=np.float32)
+
+        angles = self.rng.uniform(0.0, 2.0 * math.pi, size=(cfg.num_uav,))
+        vel = np.stack([np.cos(angles), np.sin(angles)], axis=1) * speed
+        return vel.astype(np.float32, copy=False)
+
     def _sample_uav_positions(self) -> np.ndarray:
         cfg = self.cfg
         if cfg.num_uav <= 0:
             return np.zeros((0, 2), dtype=np.float32)
+        if bool(getattr(cfg, "uav_safe_random_init_enabled", False)):
+            return self._sample_uav_safe_random_positions()
         use_curriculum_spawn = ablation_flag(
             cfg,
             "use_curriculum_spawn",
@@ -345,7 +401,7 @@ class SaginParallelEnv(ParallelEnv):
             rng=self.rng,
         )
         self.uav_pos = self._sample_uav_positions()
-        self.uav_vel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
+        self.uav_vel = self._sample_uav_initial_velocities()
         self.uav_energy = np.full((cfg.num_uav,), cfg.uav_energy_init, dtype=np.float32)
         self.last_policy_accel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
         self.last_exec_accel = np.zeros((cfg.num_uav, 2), dtype=np.float32)
@@ -383,6 +439,21 @@ class SaginParallelEnv(ParallelEnv):
         self.last_sat_incoming = np.zeros((cfg.num_sat,), dtype=np.float32)
         self.last_bw_align = 0.0
         self.last_sat_score = 0.0
+        self.last_sat_selection: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        self.last_sat_connection_counts = np.zeros((cfg.num_sat,), dtype=np.float32)
+        self.last_visible_raw_counts = np.zeros((cfg.num_uav,), dtype=np.int32)
+        self.last_visible_kept_counts = np.zeros((cfg.num_uav,), dtype=np.int32)
+        self.last_visible_raw_candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        self.last_visible_candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        self.last_visible_candidate_rank_values: List[List[float]] = [[] for _ in range(cfg.num_uav)]
+        self.last_visible_candidate_scores: List[List[float]] = [[] for _ in range(cfg.num_uav)]
+        self.last_visible_candidate_rank_gap_top1_top2 = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_visible_candidate_score_gap_top1_top2 = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_visible_candidate_dist_std = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_visible_candidate_elevation_std = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_visible_candidate_se_std = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_visible_candidate_queue_std = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_visible_stats: Dict[str, float | str] = {}
         self.last_arrival_rate = float(getattr(self, "effective_task_arrival_rate", cfg.task_arrival_rate))
         self.last_filter_active_ratio = 0.0
         self.last_projected_delta_norm_mean = 0.0
@@ -529,8 +600,9 @@ class SaginParallelEnv(ParallelEnv):
                 "traffic_level": self.traffic_level,
                 "traffic_level_ratio": self.traffic_level_ratio,
                 "effective_task_arrival_rate": self.effective_task_arrival_rate,
+                **self._agent_visible_info(idx),
             }
-            for agent in self.agents
+            for idx, agent in enumerate(self.agents)
         }
         self._refresh_global_state_cache()
         return obs, infos
@@ -581,6 +653,8 @@ class SaginParallelEnv(ParallelEnv):
         sat_selection = self._select_satellites(sat_pos, sat_vel, actions, visible)
         self._update_energy(sat_selection)
         rate_matrix, sat_loads = self._compute_backhaul_rates(sat_pos, sat_vel, sat_selection)
+        self.last_sat_selection = [list(sel) for sel in sat_selection]
+        self.last_sat_connection_counts = sat_loads.astype(np.float32, copy=False)
 
         # Update UAV queues and satellite queues
         outflow_matrix = self._update_uav_queues(gu_outflow, rate_matrix)
@@ -621,7 +695,7 @@ class SaginParallelEnv(ParallelEnv):
         rewards = {agent: reward for agent in self.agents}
         terminations = {agent: terminated for agent in self.agents}
         truncations = {agent: truncated for agent in self.agents}
-        infos = {agent: {} for agent in self.agents}
+        infos = {agent: self._agent_visible_info(idx) for idx, agent in enumerate(self.agents)}
         return obs, rewards, terminations, truncations, infos
 
     def _boundary_margin(self) -> float:
@@ -1702,7 +1776,7 @@ class SaginParallelEnv(ParallelEnv):
 
     def _compute_reward(self) -> float:
         cfg = self.cfg
-        # Core dense reward for queueing: service/drop + absolute backlog + backlog trend.
+        # Reward can use the legacy dense queue-aware shaping or a throughput-only objective.
         use_active_queue_delta = ablation_flag(
             cfg,
             "use_active_queue_delta",
@@ -1722,6 +1796,10 @@ class SaginParallelEnv(ParallelEnv):
             default=False,
         )
         queue_penalty_mode = str(getattr(cfg, "queue_penalty_mode", "quadratic") or "quadratic").lower()
+        use_arrival_norm_queue = bool(getattr(cfg, "queue_reward_use_arrival_norm", False))
+        reward_mode = str(getattr(cfg, "reward_mode", "dense") or "dense").strip().lower()
+        if reward_mode not in {"dense", "throughput_only"}:
+            raise ValueError(f"Unsupported reward_mode: {reward_mode}")
 
         if cfg.energy_enabled:
             p_max = self._energy_scale()
@@ -1790,18 +1868,9 @@ class SaginParallelEnv(ParallelEnv):
         q_norm_delta = float(prev_q_norm_active - q_norm_active)
         q_norm_tail_q0 = max(float(getattr(cfg, "q_norm_tail_q0", 0.0) or 0.0), 0.0)
         q_norm_tail_excess = 0.0
-        prev_q_gu_norm = float(
-            np.clip(float(getattr(self, "prev_queue_sum_gu", q_gu)) / q_gu_max, 0.0, 1.0)
-        )
-        prev_q_uav_norm = float(
-            np.clip(float(getattr(self, "prev_queue_sum_uav", q_uav)) / q_uav_max, 0.0, 1.0)
-        )
-        prev_q_sat_norm = float(
-            np.clip(float(getattr(self, "prev_queue_sum_sat", q_sat)) / q_sat_max, 0.0, 1.0)
-        )
-        queue_delta_gu = float(np.clip(prev_q_gu_norm - q_gu_norm, -1.0, 1.0))
-        queue_delta_uav = float(np.clip(prev_q_uav_norm - q_uav_norm, -1.0, 1.0))
-        queue_delta_sat = float(np.clip(prev_q_sat_norm - q_sat_norm, -1.0, 1.0))
+        prev_queue_sum_gu = float(getattr(self, "prev_queue_sum_gu", q_gu))
+        prev_queue_sum_uav = float(getattr(self, "prev_queue_sum_uav", q_uav))
+        prev_queue_sum_sat = float(getattr(self, "prev_queue_sum_sat", q_sat))
         queue_delta_mode = str(getattr(cfg, "queue_delta_mode", "total") or "total").strip().lower()
         if queue_delta_mode not in {"total", "weighted"}:
             queue_delta_mode = "total"
@@ -1814,9 +1883,33 @@ class SaginParallelEnv(ParallelEnv):
         gu_queue_arrival_steps = q_gu / arrival_scale
         uav_queue_arrival_steps = q_uav / arrival_scale
         sat_queue_arrival_steps = q_sat / arrival_scale
+        prev_gu_queue_arrival_steps = prev_queue_sum_gu / arrival_scale
+        prev_uav_queue_arrival_steps = prev_queue_sum_uav / arrival_scale
+        prev_sat_queue_arrival_steps = prev_queue_sum_sat / arrival_scale
+        if use_arrival_norm_queue:
+            queue_delta_gu = float(prev_gu_queue_arrival_steps - gu_queue_arrival_steps)
+            queue_delta_uav = float(prev_uav_queue_arrival_steps - uav_queue_arrival_steps)
+            queue_delta_sat = float(prev_sat_queue_arrival_steps - sat_queue_arrival_steps)
+        else:
+            prev_q_gu_norm = float(np.clip(prev_queue_sum_gu / q_gu_max, 0.0, 1.0))
+            prev_q_uav_norm = float(np.clip(prev_queue_sum_uav / q_uav_max, 0.0, 1.0))
+            prev_q_sat_norm = float(np.clip(prev_queue_sum_sat / q_sat_max, 0.0, 1.0))
+            queue_delta_gu = float(np.clip(prev_q_gu_norm - q_gu_norm, -1.0, 1.0))
+            queue_delta_uav = float(np.clip(prev_q_uav_norm - q_uav_norm, -1.0, 1.0))
+            queue_delta_sat = float(np.clip(prev_q_sat_norm - q_sat_norm, -1.0, 1.0))
 
-        def _queue_smooth(q_norm: float) -> float:
-            q_norm = float(np.clip(q_norm, 0.0, 1.0))
+        def _queue_smooth(q_value: float) -> float:
+            if use_arrival_norm_queue:
+                q_value = max(float(q_value), 0.0)
+                if use_queue_log_smoothing or queue_penalty_mode == "log":
+                    k = float(getattr(cfg, "queue_log_k", 0.0) or 0.0)
+                    if k > 0:
+                        return math.log1p(k * q_value) / math.log1p(k)
+                    return q_value
+                if queue_penalty_mode == "linear":
+                    return q_value
+                return q_value * q_value
+            q_norm = float(np.clip(q_value, 0.0, 1.0))
             if use_queue_log_smoothing or queue_penalty_mode == "log":
                 k = float(getattr(cfg, "queue_log_k", 0.0) or 0.0)
                 if k > 0:
@@ -1843,27 +1936,37 @@ class SaginParallelEnv(ParallelEnv):
             queue_weight = float(cfg.omega_q if omega_q_tail is None else omega_q_tail)
             queue_delta = float(np.clip(q_norm_delta, -1.0, 1.0))
         else:
-            queue_gu = _queue_smooth(q_gu_norm)
-            queue_uav = _queue_smooth(q_uav_norm)
-            queue_sat = _queue_smooth(q_sat_norm)
+            queue_gu_raw = gu_queue_arrival_steps if use_arrival_norm_queue else q_gu_norm
+            queue_uav_raw = uav_queue_arrival_steps if use_arrival_norm_queue else q_uav_norm
+            queue_sat_raw = sat_queue_arrival_steps if use_arrival_norm_queue else q_sat_norm
+            queue_gu = _queue_smooth(queue_gu_raw)
+            queue_uav = _queue_smooth(queue_uav_raw)
+            queue_sat = _queue_smooth(queue_sat_raw)
             w_gu = float(getattr(cfg, "omega_q_gu", 0.0) or 0.0)
             w_uav = float(getattr(cfg, "omega_q_uav", 0.0) or 0.0)
             w_sat = float(getattr(cfg, "omega_q_sat", 0.0) or 0.0)
             w_sum = abs(w_gu) + abs(w_uav) + abs(w_sat)
             if w_sum < 1e-9:
-                queue_term = _queue_smooth(q_total / q_max_total)
+                queue_total_norm = q_total / arrival_scale if use_arrival_norm_queue else q_total / q_max_total
+                queue_term = _queue_smooth(queue_total_norm)
             else:
                 queue_term = (w_gu * queue_gu + w_uav * queue_uav + w_sat * queue_sat) / w_sum
             if queue_delta_mode == "weighted" and w_sum >= 1e-9:
                 queue_delta = (w_gu * queue_delta_gu + w_uav * queue_delta_uav + w_sat * queue_delta_sat) / w_sum
-                queue_delta = float(np.clip(queue_delta, -1.0, 1.0))
+                if not use_arrival_norm_queue:
+                    queue_delta = float(np.clip(queue_delta, -1.0, 1.0))
+                else:
+                    queue_delta = float(queue_delta)
             else:
                 queue_delta_mode = "total"
                 prev_sum = self.prev_queue_sum
                 cur_sum = q_total
-                q_delta_den = q_max_total
+                q_delta_den = arrival_scale if use_arrival_norm_queue else q_max_total
                 queue_delta = (prev_sum - cur_sum) / max(q_delta_den, 1e-9)
-                queue_delta = float(np.clip(queue_delta, -1.0, 1.0))
+                if not use_arrival_norm_queue:
+                    queue_delta = float(np.clip(queue_delta, -1.0, 1.0))
+                else:
+                    queue_delta = float(queue_delta)
             queue_weight = float(cfg.omega_q)
 
         if cfg.a_max > 0:
@@ -1939,58 +2042,86 @@ class SaginParallelEnv(ParallelEnv):
         if q_total_active <= q_small:
             tail_eta_accel = tail_eta_accel * tail_eta_accel_gain
 
-        term_service = cfg.eta_service * service_norm
-        term_throughput_access = float(getattr(cfg, "eta_throughput_access", 0.0) or 0.0) * throughput_access_norm
-        term_throughput_backhaul = (
-            float(getattr(cfg, "eta_throughput_backhaul", 0.0) or 0.0) * throughput_backhaul_norm
-        )
-        eta_drop_default = float(getattr(cfg, "eta_drop", 0.0) or 0.0)
-        eta_drop_gu = float(
-            eta_drop_default
-            if getattr(cfg, "eta_drop_gu", None) is None
-            else (getattr(cfg, "eta_drop_gu", 0.0) or 0.0)
-        )
-        eta_drop_uav = float(
-            eta_drop_default
-            if getattr(cfg, "eta_drop_uav", None) is None
-            else (getattr(cfg, "eta_drop_uav", 0.0) or 0.0)
-        )
-        eta_drop_sat = float(
-            eta_drop_default
-            if getattr(cfg, "eta_drop_sat", None) is None
-            else (getattr(cfg, "eta_drop_sat", 0.0) or 0.0)
-        )
-        term_drop_gu = -eta_drop_gu * gu_drop_norm
-        term_drop_uav = -eta_drop_uav * uav_drop_norm
-        term_drop_sat = -eta_drop_sat * sat_drop_norm
-        term_drop_step = -float(getattr(cfg, "eta_drop_step", 0.0) or 0.0) * drop_event
-        term_drop = term_drop_gu + term_drop_uav + term_drop_sat + term_drop_step
-        term_queue = -queue_weight * queue_term
-        term_q_delta = q_delta_weight * queue_delta
-        term_centroid = centroid_eta * centroid_reward
-        term_accel = -tail_eta_accel * accel_norm2
-        term_close_risk = -max(float(getattr(cfg, "eta_close_risk", 0.0) or 0.0), 0.0) * close_risk
-        term_energy = cfg.omega_e * r_energy if use_energy_reward else 0.0
-        raw_reward = (
-            term_service
-            + term_throughput_access
-            + term_throughput_backhaul
-            + term_drop
-            + term_queue
-            + term_q_delta
-            + term_centroid
-            + term_accel
-            + term_close_risk
-            + term_energy
-        )
+        if reward_mode == "throughput_only":
+            term_service = 0.0
+            term_throughput_access = throughput_access_norm
+            term_throughput_backhaul = throughput_backhaul_norm
+            eta_drop_default = 0.0
+            eta_drop_gu = 0.0
+            eta_drop_uav = 0.0
+            eta_drop_sat = 0.0
+            term_drop_gu = 0.0
+            term_drop_uav = 0.0
+            term_drop_sat = 0.0
+            term_drop_step = 0.0
+            term_drop = 0.0
+            queue_weight = 0.0
+            q_delta_weight = 0.0
+            crash_weight = 0.0
+            term_queue = 0.0
+            term_q_delta = 0.0
+            term_centroid = 0.0
+            term_accel = 0.0
+            term_close_risk = 0.0
+            term_energy = 0.0
+            raw_reward = term_throughput_access + term_throughput_backhaul
+        else:
+            term_service = cfg.eta_service * service_norm
+            term_throughput_access = float(getattr(cfg, "eta_throughput_access", 0.0) or 0.0) * throughput_access_norm
+            term_throughput_backhaul = (
+                float(getattr(cfg, "eta_throughput_backhaul", 0.0) or 0.0) * throughput_backhaul_norm
+            )
+            eta_drop_default = float(getattr(cfg, "eta_drop", 0.0) or 0.0)
+            eta_drop_gu = float(
+                eta_drop_default
+                if getattr(cfg, "eta_drop_gu", None) is None
+                else (getattr(cfg, "eta_drop_gu", 0.0) or 0.0)
+            )
+            eta_drop_uav = float(
+                eta_drop_default
+                if getattr(cfg, "eta_drop_uav", None) is None
+                else (getattr(cfg, "eta_drop_uav", 0.0) or 0.0)
+            )
+            eta_drop_sat = float(
+                eta_drop_default
+                if getattr(cfg, "eta_drop_sat", None) is None
+                else (getattr(cfg, "eta_drop_sat", 0.0) or 0.0)
+            )
+            term_drop_gu = -eta_drop_gu * gu_drop_norm
+            term_drop_uav = -eta_drop_uav * uav_drop_norm
+            term_drop_sat = -eta_drop_sat * sat_drop_norm
+            term_drop_step = -float(getattr(cfg, "eta_drop_step", 0.0) or 0.0) * drop_event
+            term_drop = term_drop_gu + term_drop_uav + term_drop_sat + term_drop_step
+            term_queue = -queue_weight * queue_term
+            term_q_delta = q_delta_weight * queue_delta
+            term_centroid = centroid_eta * centroid_reward
+            term_accel = -tail_eta_accel * accel_norm2
+            term_close_risk = -max(float(getattr(cfg, "eta_close_risk", 0.0) or 0.0), 0.0) * close_risk
+            term_energy = cfg.omega_e * r_energy if use_energy_reward else 0.0
+            raw_reward = (
+                term_service
+                + term_throughput_access
+                + term_throughput_backhaul
+                + term_drop
+                + term_queue
+                + term_q_delta
+                + term_centroid
+                + term_accel
+                + term_close_risk
+                + term_energy
+            )
 
         collision_now = self._check_collision()
-        collision_penalty = -crash_weight if collision_now else 0.0
-        battery_penalty = -cfg.eta_batt if (cfg.energy_enabled and np.any(self.uav_energy <= 0.0)) else 0.0
+        if reward_mode == "throughput_only":
+            collision_penalty = 0.0
+            battery_penalty = 0.0
+        else:
+            collision_penalty = -crash_weight if collision_now else 0.0
+            battery_penalty = -cfg.eta_batt if (cfg.energy_enabled and np.any(self.uav_energy <= 0.0)) else 0.0
         fail_penalty = collision_penalty + battery_penalty
 
         reward = raw_reward
-        if use_reward_tanh:
+        if reward_mode != "throughput_only" and use_reward_tanh:
             reward = math.tanh(raw_reward)
         reward = reward + fail_penalty
 
@@ -2282,24 +2413,191 @@ class SaginParallelEnv(ParallelEnv):
         p_comm = cfg.p_comm_link * max(1, cfg.N_RF)
         return p_fly + p_comm
 
+    @staticmethod
+    def _minmax_normalize(values: np.ndarray) -> np.ndarray:
+        vals = np.asarray(values, dtype=np.float32)
+        if vals.size == 0:
+            return vals
+        v_min = float(np.min(vals))
+        v_max = float(np.max(vals))
+        if v_max - v_min <= 1e-9:
+            return np.zeros_like(vals, dtype=np.float32)
+        return ((vals - v_min) / (v_max - v_min)).astype(np.float32, copy=False)
+
+    def _sat_candidate_rank_data(
+        self,
+        u: int,
+        sat_indices: np.ndarray,
+        sat_pos: np.ndarray,
+        elev_values: np.ndarray | None = None,
+    ) -> Dict[str, np.ndarray]:
+        cfg = self.cfg
+        sat_idx = np.asarray(sat_indices, dtype=np.int32)
+        if sat_idx.size == 0:
+            empty_f = np.zeros((0,), dtype=np.float32)
+            return {
+                "elevation": empty_f,
+                "distance": empty_f,
+                "spectral_efficiency": empty_f,
+                "queue_norm": empty_f,
+                "score": empty_f,
+                "rank_value": empty_f,
+            }
+
+        if elev_values is None:
+            elev_matrix = self._get_elevation_matrix(sat_pos)
+            elev = np.asarray(elev_matrix[u, sat_idx], dtype=np.float32)
+        else:
+            elev = np.asarray(elev_values, dtype=np.float32)
+
+        rel_pos = sat_pos[sat_idx] - self._uav_ecef(u)[None, :]
+        dist = np.linalg.norm(rel_pos, axis=1) + 1e-9
+        gain = self._backhaul_gain_const / np.maximum(dist * dist, 1e-9)
+        if cfg.atm_loss_enabled:
+            atm_loss = channel.atmospheric_loss_db(elev, cfg.atm_loss_db)
+            gain = gain * (10 ** (-atm_loss / 10.0))
+        snr = channel.snr_linear(cfg.uav_tx_power, gain, cfg.noise_density, cfg.b_sat_total)
+        se = np.asarray(channel.spectral_efficiency(snr), dtype=np.float32)
+        queue_norm = (self.sat_queue[sat_idx] / max(cfg.queue_max_sat, 1e-9)).astype(np.float32, copy=False)
+
+        elev_norm = self._minmax_normalize(elev)
+        se_norm = self._minmax_normalize(se)
+        score = (
+            float(getattr(cfg, "sat_candidate_elevation_weight", 1.0) or 0.0) * elev_norm
+            + float(getattr(cfg, "sat_candidate_se_weight", 1.0) or 0.0) * se_norm
+            - float(getattr(cfg, "sat_candidate_queue_weight", 1.0) or 0.0) * queue_norm
+        ).astype(np.float32, copy=False)
+
+        mode = str(getattr(cfg, "sat_candidate_mode", "elevation") or "elevation").strip().lower()
+        if mode not in {"elevation", "score"}:
+            raise ValueError(f"Unsupported sat_candidate_mode='{cfg.sat_candidate_mode}'")
+        rank_value = elev if mode == "elevation" else score
+        return {
+            "elevation": elev,
+            "distance": dist.astype(np.float32, copy=False),
+            "spectral_efficiency": se,
+            "queue_norm": queue_norm,
+            "score": score,
+            "rank_value": rank_value.astype(np.float32, copy=False),
+        }
+
+    def _sat_candidate_order(self, rank_data: Dict[str, np.ndarray]) -> np.ndarray:
+        rank_value = np.asarray(rank_data["rank_value"], dtype=np.float32)
+        elev = np.asarray(rank_data["elevation"], dtype=np.float32)
+        if rank_value.size == 0:
+            return np.zeros((0,), dtype=np.int64)
+        return np.lexsort((-elev.astype(np.float64), -rank_value.astype(np.float64)))
+
+    def _summarize_visible_counts(self, name: str, counts: np.ndarray, out: Dict[str, float | str]) -> None:
+        vals = np.asarray(counts, dtype=np.float32)
+        if vals.size == 0:
+            out[f"{name}_mean"] = 0.0
+            out[f"{name}_p50"] = 0.0
+            out[f"{name}_p90"] = 0.0
+            out[f"{name}_fraction_le_1"] = 0.0
+            out[f"{name}_fraction_ge_3"] = 0.0
+            out[f"{name}_fraction_ge_5"] = 0.0
+            return
+        out[f"{name}_mean"] = float(np.mean(vals))
+        out[f"{name}_p50"] = float(np.percentile(vals, 50))
+        out[f"{name}_p90"] = float(np.percentile(vals, 90))
+        out[f"{name}_fraction_le_1"] = float(np.mean(vals <= 1.0))
+        out[f"{name}_fraction_ge_3"] = float(np.mean(vals >= 3.0))
+        out[f"{name}_fraction_ge_5"] = float(np.mean(vals >= 5.0))
+
+    def _agent_visible_info(self, u: int) -> Dict[str, object]:
+        return {
+            "visible_raw_count": int(self.last_visible_raw_counts[u]),
+            "visible_kept_count": int(self.last_visible_kept_counts[u]),
+            "visible_raw_candidates": list(self.last_visible_raw_candidates[u]),
+            "visible_candidates": list(self.last_visible_candidates[u]),
+            "visible_candidate_rank_values": list(self.last_visible_candidate_rank_values[u]),
+            "visible_candidate_scores": list(self.last_visible_candidate_scores[u]),
+            "visible_candidate_rank_gap_top1_top2": float(self.last_visible_candidate_rank_gap_top1_top2[u]),
+            "visible_candidate_score_gap_top1_top2": float(self.last_visible_candidate_score_gap_top1_top2[u]),
+            "visible_stats": dict(self.last_visible_stats),
+        }
+
     def _visible_sats_sorted(self, sat_pos: np.ndarray) -> List[List[int]]:
         cfg = self.cfg
         elev_matrix = self._get_elevation_matrix(sat_pos)
-        order = np.argsort(-elev_matrix, axis=1, kind="stable")
         visible: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        raw_candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
+        kept_rank_values: List[List[float]] = [[] for _ in range(cfg.num_uav)]
+        kept_scores: List[List[float]] = [[] for _ in range(cfg.num_uav)]
+        raw_counts = np.zeros((cfg.num_uav,), dtype=np.int32)
+        kept_counts = np.zeros((cfg.num_uav,), dtype=np.int32)
+        rank_gap_top1_top2 = np.zeros((cfg.num_uav,), dtype=np.float32)
+        score_gap_top1_top2 = np.zeros((cfg.num_uav,), dtype=np.float32)
+        dist_std = np.zeros((cfg.num_uav,), dtype=np.float32)
+        elev_std = np.zeros((cfg.num_uav,), dtype=np.float32)
+        se_std = np.zeros((cfg.num_uav,), dtype=np.float32)
+        queue_std = np.zeros((cfg.num_uav,), dtype=np.float32)
         max_keep = cfg.visible_sats_max if cfg.visible_sats_max is not None else cfg.sats_obs_max
+        max_keep = max(int(max_keep), 0)
         min_keep = cfg.visible_sats_min
         for u in range(cfg.num_uav):
-            sat_order = order[u]
-            elev_sorted = elev_matrix[u, sat_order]
-            above = sat_order[elev_sorted >= cfg.theta_min_rad]
+            elev_u = elev_matrix[u]
+            above = np.nonzero(elev_u >= cfg.theta_min_rad)[0].astype(np.int32, copy=False)
+            raw_counts[u] = int(above.size)
+            above_data = self._sat_candidate_rank_data(u, above, sat_pos, elev_values=elev_u[above])
+            above_order = self._sat_candidate_order(above_data)
+            above_sorted = above[above_order]
+            raw_candidates[u] = above_sorted.tolist()
+            selected = above_sorted
             if min_keep is not None and above.size < min_keep:
-                # Include highest-elevation satellites even if below theta_min to enforce minimum visibility.
                 needed = min_keep - int(above.size)
-                extra = sat_order[elev_sorted < cfg.theta_min_rad][:needed]
+                extra = np.nonzero(elev_u < cfg.theta_min_rad)[0].astype(np.int32, copy=False)
+                extra_data = self._sat_candidate_rank_data(u, extra, sat_pos, elev_values=elev_u[extra])
+                extra_order = self._sat_candidate_order(extra_data)
+                extra = extra[extra_order][:needed]
                 if extra.size > 0:
-                    above = np.concatenate((above, extra), axis=0)
-            visible[u] = above[:max_keep].tolist()
+                    selected = np.concatenate((selected, extra), axis=0)
+
+            kept = selected[:max_keep]
+            kept_counts[u] = int(kept.size)
+            visible[u] = kept.tolist()
+            kept_data = self._sat_candidate_rank_data(u, kept, sat_pos, elev_values=elev_u[kept])
+            kept_rank_values[u] = kept_data["rank_value"].astype(np.float32, copy=False).tolist()
+            kept_scores[u] = kept_data["score"].astype(np.float32, copy=False).tolist()
+            if kept.size >= 2:
+                rank_gap_top1_top2[u] = float(kept_data["rank_value"][0] - kept_data["rank_value"][1])
+                score_gap_top1_top2[u] = float(kept_data["score"][0] - kept_data["score"][1])
+            if kept.size > 0:
+                dist_std[u] = float(np.std(kept_data["distance"]))
+                elev_std[u] = float(np.std(kept_data["elevation"]))
+                se_std[u] = float(np.std(kept_data["spectral_efficiency"]))
+                queue_std[u] = float(np.std(kept_data["queue_norm"]))
+
+        self.last_visible_raw_counts = raw_counts
+        self.last_visible_kept_counts = kept_counts
+        self.last_visible_raw_candidates = raw_candidates
+        self.last_visible_candidates = [list(v) for v in visible]
+        self.last_visible_candidate_rank_values = kept_rank_values
+        self.last_visible_candidate_scores = kept_scores
+        self.last_visible_candidate_rank_gap_top1_top2 = rank_gap_top1_top2
+        self.last_visible_candidate_score_gap_top1_top2 = score_gap_top1_top2
+        self.last_visible_candidate_dist_std = dist_std
+        self.last_visible_candidate_elevation_std = elev_std
+        self.last_visible_candidate_se_std = se_std
+        self.last_visible_candidate_queue_std = queue_std
+        stats: Dict[str, float | str] = {
+            "candidate_mode": str(getattr(cfg, "sat_candidate_mode", "elevation") or "elevation").strip().lower(),
+            "visible_truncation_fraction": float(np.mean(raw_counts > kept_counts)) if raw_counts.size else 0.0,
+            "candidate_dist_std_mean": float(np.mean(dist_std)) if dist_std.size else 0.0,
+            "candidate_elevation_std_mean": float(np.mean(elev_std)) if elev_std.size else 0.0,
+            "candidate_se_std_mean": float(np.mean(se_std)) if se_std.size else 0.0,
+            "candidate_queue_std_mean": float(np.mean(queue_std)) if queue_std.size else 0.0,
+            "candidate_rank_gap_top1_top2_mean": float(np.mean(rank_gap_top1_top2))
+            if rank_gap_top1_top2.size
+            else 0.0,
+            "candidate_score_gap_top1_top2_mean": float(np.mean(score_gap_top1_top2))
+            if score_gap_top1_top2.size
+            else 0.0,
+        }
+        self._summarize_visible_counts("raw_visible_count", raw_counts, stats)
+        self._summarize_visible_counts("kept_visible_count", kept_counts, stats)
+        self.last_visible_stats = stats
         return visible
 
     def _uav_ecef(self, u: int) -> np.ndarray:
@@ -2330,6 +2628,7 @@ class SaginParallelEnv(ParallelEnv):
         sat_obs = np.zeros((cfg.num_uav, cfg.sats_obs_max, self.sat_dim), dtype=np.float32)
         sat_mask = np.zeros((cfg.num_uav, cfg.sats_obs_max), dtype=np.float32)
         for u in range(cfg.num_uav):
+            current_sats = set(self.last_sat_selection[u]) if u < len(self.last_sat_selection) else set()
             for i, l in enumerate(visible[u][: cfg.sats_obs_max]):
                 rel_pos = sat_pos[l] - self._uav_ecef(u)
                 rel_vel = sat_vel[l] - self._uav_vel_ecef(u)
@@ -2350,6 +2649,11 @@ class SaginParallelEnv(ParallelEnv):
                 sat_obs[u, i, 6] = nu / max(cfg.nu_max, 1.0)
                 sat_obs[u, i, 7] = channel.spectral_efficiency(snr)
                 sat_obs[u, i, 8] = self.sat_queue[l] / cfg.queue_max_sat
+                load_count = float(self.last_sat_connection_counts[l]) if l < self.last_sat_connection_counts.size else 0.0
+                projected_count = max(load_count + (0.0 if l in current_sats else 1.0), 1.0)
+                sat_obs[u, i, 9] = load_count / max(float(cfg.num_uav), 1.0)
+                sat_obs[u, i, 10] = 1.0 / projected_count
+                sat_obs[u, i, 11] = 1.0 if l in current_sats else 0.0
                 sat_mask[u, i] = 1.0
         self._cached_sat_obs = sat_obs
         self._cached_sat_mask = sat_mask

@@ -79,6 +79,7 @@ class MetricLogger:
                         "r_term_drop_gu",
                         "r_term_drop_uav",
                         "r_term_drop_sat",
+                        "r_term_drop_step",
                         "r_term_queue",
                         "r_term_assoc",
                         "r_term_q_delta",
@@ -94,7 +95,10 @@ class MetricLogger:
                 ],
             },
             "Training/Losses": {
-                "Losses": ["Multiline", ["policy_loss", "value_loss", "entropy", "imitation_loss"]],
+                "Losses": [
+                    "Multiline",
+                    ["policy_loss", "value_loss", "explained_variance", "entropy", "imitation_loss"],
+                ],
             },
             "Training/Diagnostics": {
                 "PPO": ["Multiline", ["approx_kl", "clip_frac"]],
@@ -178,6 +182,16 @@ class MetricLogger:
             },
             "Training/Drops": {
                 "Drops": ["Multiline", ["drop_sum", "gu_drop_sum", "uav_drop_sum", "sat_drop_sum"]],
+                "DropSplit": [
+                    "Multiline",
+                    [
+                        "drop_sum",
+                        "drop_sum_active",
+                        "sat_drop_sum_step",
+                        "drop_event_rate",
+                        "r_term_drop_step",
+                    ],
+                ],
                 "DropNorms": [
                     "Multiline",
                     [

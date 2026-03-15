@@ -30,6 +30,7 @@ from sagin_marl.rl.baselines import (
     queue_aware_sat_policy,
 )
 from sagin_marl.rl.policy import ActorNet, batch_flatten_obs
+from sagin_marl.utils.checkpoint import load_checkpoint_forgiving
 from sagin_marl.utils.progress import Progress
 
 
@@ -104,10 +105,37 @@ def _init_eval_tb_layout(writer: SummaryWriter, tag_prefix: str) -> None:
                     t("sat_drop_ratio"),
                 ],
             ],
+            "DropEvent": [
+                "Multiline",
+                [
+                    t("drop_event_step_fraction"),
+                    t("term_drop_mean"),
+                    t("term_drop_sat_mean"),
+                    t("term_drop_step_mean"),
+                ],
+            ],
         },
         "Eval/Association": {
             "AssocRatio": ["Multiline", [t("assoc_ratio_mean")]],
             "AssocDist": ["Multiline", [t("assoc_dist_mean")]],
+        },
+        "Eval/Danger": {
+            "DangerImitation": [
+                "Multiline",
+                [
+                    t("danger_imitation_active_rate_mean"),
+                    t("intervention_rate_mean"),
+                    t("intervention_norm_mean"),
+                    t("intervention_norm_top1_mean"),
+                ],
+            ],
+            "CloseRisk": [
+                "Multiline",
+                [
+                    t("close_risk_mean"),
+                    t("term_close_risk_mean"),
+                ],
+            ],
         },
         "Eval/Satellite": {
             "SatFlow": ["Multiline", [t("sat_incoming_sum"), t("sat_processed_sum")]],
@@ -222,6 +250,55 @@ def _baseline_actions(
     raise ValueError(f"Unknown baseline: {baseline}")
 
 
+def _normalize_exec_source(raw: str | None) -> str:
+    src = str("policy" if raw is None else raw).strip().lower()
+    allowed = {"policy", "teacher", "heuristic", "zero"}
+    if src not in allowed:
+        raise ValueError(f"Invalid exec source '{raw}'. Allowed: {sorted(allowed)}")
+    return src
+
+
+def _select_exec_values(
+    source: str,
+    policy_values: np.ndarray | None,
+    teacher_values: np.ndarray | None,
+    heuristic_values: np.ndarray | None,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    if source == "policy" and policy_values is not None:
+        return np.asarray(policy_values, dtype=np.float32)
+    if source == "teacher" and teacher_values is not None:
+        return np.asarray(teacher_values, dtype=np.float32)
+    if source == "heuristic" and heuristic_values is not None:
+        return np.asarray(heuristic_values, dtype=np.float32)
+    return np.zeros(shape, dtype=np.float32)
+
+
+def _hybrid_bw_sat_actions(
+    mode: str,
+    obs_list,
+    cfg,
+    num_agents: int,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if mode == "none":
+        return None, None
+    if mode in {"queue_aware", "queue_aware_bw"}:
+        _, bw_logits, sat_logits = queue_aware_policy(obs_list, cfg)
+        return bw_logits, sat_logits
+    if mode == "uniform_bw":
+        return uniform_bw_policy(num_agents, cfg.users_obs_max), None
+    if mode == "random_bw":
+        return random_bw_policy(num_agents, cfg, rng=rng), None
+    if mode == "uniform_sat":
+        return None, uniform_sat_policy(num_agents, cfg.sats_obs_max)
+    if mode == "random_sat":
+        return None, random_sat_policy(num_agents, cfg, rng=rng)
+    if mode == "queue_aware_sat":
+        return None, queue_aware_sat_policy(obs_list, cfg)
+    raise ValueError(f"Unknown hybrid_bw_sat mode: {mode}")
+
+
 def _resolve_eval_paths(
     run_dir: str | None,
     checkpoint: str | None,
@@ -292,8 +369,17 @@ def main():
         "--hybrid_bw_sat",
         type=str,
         default="none",
-        choices=["none", "queue_aware"],
-        help="Use queue_aware for bw/sat while keeping accel from the trained actor.",
+        choices=[
+            "none",
+            "queue_aware",
+            "uniform_bw",
+            "random_bw",
+            "queue_aware_bw",
+            "uniform_sat",
+            "random_sat",
+            "queue_aware_sat",
+        ],
+        help="Override bw/sat while keeping trained-model evaluation for the other action heads.",
     )
     parser.add_argument(
         "--episode_seed_base",
@@ -323,13 +409,28 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     actor = None
+    teacher_actor = None
+    exec_accel_source = _normalize_exec_source(getattr(cfg, "exec_accel_source", "policy"))
+    exec_bw_source = _normalize_exec_source(getattr(cfg, "exec_bw_source", "policy"))
+    exec_sat_source = _normalize_exec_source(getattr(cfg, "exec_sat_source", "policy"))
+    teacher_deterministic = bool(getattr(cfg, "exec_teacher_deterministic", True))
+    need_teacher_exec = "teacher" in {exec_accel_source, exec_bw_source, exec_sat_source}
+    need_heuristic_exec = "heuristic" in {exec_accel_source, exec_bw_source, exec_sat_source}
     if not use_baseline:
         obs, _ = env.reset()
         obs_dim = batch_flatten_obs(list(obs.values()), cfg).shape[1]
         actor = ActorNet(obs_dim, cfg).to(device)
-        state = torch.load(args.checkpoint, map_location=device)
-        actor.load_state_dict(state, strict=not use_hybrid)
+        info = load_checkpoint_forgiving(actor, args.checkpoint, map_location=device, strict=not use_hybrid)
+        if info.get("adapted_keys"):
+            print(f"Loaded actor with adapted tensors from {args.checkpoint}: {len(info['adapted_keys'])}")
         actor.eval()
+        if need_teacher_exec:
+            teacher_path = getattr(cfg, "exec_teacher_actor_path", None) or args.checkpoint
+            teacher_actor = ActorNet(obs_dim, cfg).to(device)
+            info = load_checkpoint_forgiving(teacher_actor, teacher_path, map_location=device)
+            if info.get("adapted_keys"):
+                print(f"Loaded teacher actor with adapted tensors from {teacher_path}: {len(info['adapted_keys'])}")
+            teacher_actor.eval()
 
     os.makedirs(out_dir, exist_ok=True)
     fieldnames = [
@@ -359,20 +460,36 @@ def main():
         "drop_sum",
         "drop_ratio",
         "drop_ratio_step_mean",
+        "drop_sum_step_mean",
         "active_drop_sum",
         "active_drop_ratio",
+        "active_drop_sum_step_mean",
         "gu_drop_sum",
         "uav_drop_sum",
         "sat_drop_sum",
+        "sat_drop_sum_step_mean",
         "gu_drop_ratio",
         "uav_drop_ratio",
         "sat_drop_ratio",
+        "drop_event_steps",
+        "drop_event_step_fraction",
+        "term_drop_mean",
+        "term_drop_gu_mean",
+        "term_drop_uav_mean",
+        "term_drop_sat_mean",
+        "term_drop_step_mean",
         "terminated_early",
         "termination_reason",
         "collision",
         "min_inter_uav_dist",
         "near_collision_steps",
         "near_collision_ratio",
+        "danger_imitation_active_rate_mean",
+        "intervention_norm_mean",
+        "intervention_rate_mean",
+        "intervention_norm_top1_mean",
+        "close_risk_mean",
+        "term_close_risk_mean",
         "centroid_dist_mean",
         "gu_queue_mean",
         "uav_queue_mean",
@@ -461,9 +578,21 @@ def main():
             active_drop_sum_ep = 0.0
             drop_sum_ep = 0.0
             drop_ratio_step_sum = 0.0
+            drop_event_steps = 0.0
+            term_drop_sum = 0.0
+            term_drop_gu_sum = 0.0
+            term_drop_uav_sum = 0.0
+            term_drop_sat_sum = 0.0
+            term_drop_step_sum = 0.0
             collision_any = 0.0
             min_inter_uav_dist = float("inf")
             near_collision_steps = 0.0
+            danger_imitation_active_rate_sum = 0.0
+            intervention_norm_sum = 0.0
+            intervention_rate_sum = 0.0
+            intervention_norm_top1_sum = 0.0
+            close_risk_sum = 0.0
+            term_close_risk_sum = 0.0
             centroid_dist_sum = 0.0
             ep_start = time.perf_counter()
             while not done:
@@ -476,16 +605,64 @@ def main():
                         cfg, env.agents, accel_actions, bw_logits=bw_logits, sat_logits=sat_logits
                     )
                 else:
+                    obs_list = list(obs.values())
                     obs_batch = batch_flatten_obs(list(obs.values()), cfg)
                     obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
                     with torch.no_grad():
                         policy_out = actor.act(obs_tensor, deterministic=True)
-                    accel_actions = policy_out.accel.cpu().numpy()
-                    bw_logits = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
-                    sat_logits = policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
+                        teacher_accel = None
+                        teacher_bw = None
+                        teacher_sat = None
+                        if teacher_actor is not None:
+                            teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
+                            teacher_accel = teacher_out.accel.cpu().numpy()
+                            teacher_bw = teacher_out.bw_logits.cpu().numpy() if teacher_out.bw_logits is not None else None
+                            teacher_sat = teacher_out.sat_logits.cpu().numpy() if teacher_out.sat_logits is not None else None
+                    heur_accel = None
+                    heur_bw = None
+                    heur_sat = None
+                    if need_heuristic_exec:
+                        heur_accel, heur_bw, heur_sat = queue_aware_policy(obs_list, cfg)
+                    policy_accel = policy_out.accel.cpu().numpy()
+                    policy_bw = policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
+                    policy_sat = policy_out.sat_logits.cpu().numpy() if policy_out.sat_logits is not None else None
                     if use_hybrid:
-                        obs_list = list(obs.values())
-                        _, bw_logits, sat_logits = queue_aware_policy(obs_list, cfg)
+                        hybrid_bw, hybrid_sat = _hybrid_bw_sat_actions(
+                            args.hybrid_bw_sat,
+                            obs_list,
+                            cfg,
+                            len(env.agents),
+                            rng=env.rng,
+                        )
+                        if hybrid_bw is not None:
+                            policy_bw = hybrid_bw
+                        if hybrid_sat is not None:
+                            policy_sat = hybrid_sat
+                    accel_actions = _select_exec_values(
+                        exec_accel_source,
+                        policy_accel,
+                        teacher_accel,
+                        heur_accel,
+                        (len(env.agents), 2),
+                    )
+                    bw_logits = None
+                    sat_logits = None
+                    if cfg.enable_bw_action:
+                        bw_logits = _select_exec_values(
+                            exec_bw_source,
+                            policy_bw,
+                            teacher_bw,
+                            heur_bw,
+                            (len(env.agents), cfg.users_obs_max),
+                        )
+                    if not cfg.fixed_satellite_strategy:
+                        sat_logits = _select_exec_values(
+                            exec_sat_source,
+                            policy_sat,
+                            teacher_sat,
+                            heur_sat,
+                            (len(env.agents), cfg.sats_obs_max),
+                        )
                     actions = assemble_actions(cfg, env.agents, accel_actions, bw_logits=bw_logits, sat_logits=sat_logits)
                 obs, rewards, terms, truncs, _ = env.step(actions)
                 reward_sum += list(rewards.values())[0]
@@ -538,7 +715,19 @@ def main():
                     active_drop_sum_ep += float(parts.get("drop_sum_active", 0.0))
                     drop_sum_ep += float(parts.get("drop_sum", 0.0))
                     drop_ratio_step_sum += float(parts.get("drop_ratio", 0.0))
+                    drop_event_steps += float(parts.get("drop_event", 0.0))
+                    term_drop_sum += float(parts.get("term_drop", 0.0))
+                    term_drop_gu_sum += float(parts.get("term_drop_gu", 0.0))
+                    term_drop_uav_sum += float(parts.get("term_drop_uav", 0.0))
+                    term_drop_sat_sum += float(parts.get("term_drop_sat", 0.0))
+                    term_drop_step_sum += float(parts.get("term_drop_step", 0.0))
                     collision_any = max(collision_any, float(parts.get("collision_event", 0.0)))
+                    danger_imitation_active_rate_sum += float(parts.get("danger_imitation_active_rate", 0.0))
+                    intervention_norm_sum += float(parts.get("intervention_norm", 0.0))
+                    intervention_rate_sum += float(parts.get("intervention_rate", 0.0))
+                    intervention_norm_top1_sum += float(parts.get("intervention_norm_top1", 0.0))
+                    close_risk_sum += float(parts.get("close_risk", 0.0))
+                    term_close_risk_sum += float(parts.get("term_close_risk", 0.0))
                     centroid_dist_sum += float(parts.get("centroid_dist_mean", 0.0))
                 if cfg.num_uav > 1 and hasattr(env, "uav_pos"):
                     diff = env.uav_pos[:, None, :] - env.uav_pos[None, :, :]
@@ -635,20 +824,36 @@ def main():
                 "drop_sum": drop_sum_ep,
                 "drop_ratio": drop_sum_ep / max(arrival_sum_ep, 1e-9),
                 "drop_ratio_step_mean": drop_ratio_step_sum / steps,
+                "drop_sum_step_mean": drop_sum_ep / steps,
                 "active_drop_sum": active_drop_sum_ep,
                 "active_drop_ratio": active_drop_sum_ep / max(arrival_sum_ep, 1e-9),
+                "active_drop_sum_step_mean": active_drop_sum_ep / steps,
                 "gu_drop_sum": gu_drop_sum,
                 "uav_drop_sum": uav_drop_sum,
                 "sat_drop_sum": sat_drop_sum,
+                "sat_drop_sum_step_mean": sat_drop_sum / steps,
                 "gu_drop_ratio": gu_drop_sum / max(arrival_sum_ep, 1e-9),
                 "uav_drop_ratio": uav_drop_sum / max(arrival_sum_ep, 1e-9),
                 "sat_drop_ratio": sat_drop_sum / max(arrival_sum_ep, 1e-9),
+                "drop_event_steps": drop_event_steps,
+                "drop_event_step_fraction": drop_event_steps / steps,
+                "term_drop_mean": term_drop_sum / steps,
+                "term_drop_gu_mean": term_drop_gu_sum / steps,
+                "term_drop_uav_mean": term_drop_uav_sum / steps,
+                "term_drop_sat_mean": term_drop_sat_sum / steps,
+                "term_drop_step_mean": term_drop_step_sum / steps,
                 "terminated_early": 1.0 if steps < int(cfg.T_steps) else 0.0,
                 "termination_reason": termination_reason,
                 "collision": collision_any,
                 "min_inter_uav_dist": 0.0 if not np.isfinite(min_inter_uav_dist) else min_inter_uav_dist,
                 "near_collision_steps": near_collision_steps,
                 "near_collision_ratio": near_collision_steps / steps,
+                "danger_imitation_active_rate_mean": danger_imitation_active_rate_sum / steps,
+                "intervention_norm_mean": intervention_norm_sum / steps,
+                "intervention_rate_mean": intervention_rate_sum / steps,
+                "intervention_norm_top1_mean": intervention_norm_top1_sum / steps,
+                "close_risk_mean": close_risk_sum / steps,
+                "term_close_risk_mean": term_close_risk_sum / steps,
                 "centroid_dist_mean": centroid_dist_sum / steps,
                 "gu_queue_mean": gu_queue_sum / steps,
                 "uav_queue_mean": uav_queue_sum / steps,

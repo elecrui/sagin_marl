@@ -12,7 +12,7 @@ from torch.distributions import Normal
 
 OWN_OBS_DIM = 7
 USER_OBS_DIM = 5
-SAT_OBS_DIM = 9
+SAT_OBS_DIM = 12
 NBR_OBS_DIM = 4
 DANGER_NBR_OBS_DIM = 5
 

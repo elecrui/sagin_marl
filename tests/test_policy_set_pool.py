@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from sagin_marl.env.config import SaginConfig
-from sagin_marl.rl.policy import ActorNet, batch_flatten_obs
+from sagin_marl.rl.policy import ActorNet, SAT_OBS_DIM, batch_flatten_obs
 
 
 def _make_obs(cfg: SaginConfig) -> dict[str, np.ndarray]:
@@ -12,7 +12,7 @@ def _make_obs(cfg: SaginConfig) -> dict[str, np.ndarray]:
         "own": np.array([0.1, -0.2, 0.05, -0.05, 0.8, 0.3, 0.4], dtype=np.float32),
         "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
         "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
-        "sats": np.zeros((cfg.sats_obs_max, 9), dtype=np.float32),
+        "sats": np.zeros((cfg.sats_obs_max, SAT_OBS_DIM), dtype=np.float32),
         "sats_mask": np.zeros((cfg.sats_obs_max,), dtype=np.float32),
         "nbrs": np.zeros((cfg.nbrs_obs_max, 4), dtype=np.float32),
         "nbrs_mask": np.zeros((cfg.nbrs_obs_max,), dtype=np.float32),
@@ -21,7 +21,7 @@ def _make_obs(cfg: SaginConfig) -> dict[str, np.ndarray]:
         obs["danger_nbr"] = np.array([0.3, 0.4, -1.0, 0.0, 1.0], dtype=np.float32)
     obs["users"][0] = np.array([0.2, -0.1, 0.6, 1.2, 1.0], dtype=np.float32)
     obs["users_mask"][0] = 1.0
-    obs["sats"][0] = np.array([0.1, 0.2, 0.3, 0.0, 0.1, -0.2, 0.4, 3.0, 0.5], dtype=np.float32)
+    obs["sats"][0] = np.array([0.1, 0.2, 0.3, 0.0, 0.1, -0.2, 0.4, 3.0, 0.5, 0.2, 1.0, 1.0], dtype=np.float32)
     obs["sats_mask"][0] = 1.0
     obs["nbrs"][0] = np.array([-0.3, 0.2, 0.1, -0.1], dtype=np.float32)
     obs["nbrs_mask"][0] = 1.0
@@ -46,7 +46,10 @@ def test_set_pool_actor_ignores_masked_slots():
     obs_a = _make_obs(cfg)
     obs_b = _make_obs(cfg)
     obs_b["users"][1] = np.array([99.0, -88.0, 77.0, -66.0, 55.0], dtype=np.float32)
-    obs_b["sats"][1] = np.array([11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0], dtype=np.float32)
+    obs_b["sats"][1] = np.array(
+        [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0],
+        dtype=np.float32,
+    )
     obs_b["nbrs"][1] = np.array([-9.0, -8.0, -7.0, -6.0], dtype=np.float32)
 
     batch = batch_flatten_obs([obs_a, obs_b], cfg)

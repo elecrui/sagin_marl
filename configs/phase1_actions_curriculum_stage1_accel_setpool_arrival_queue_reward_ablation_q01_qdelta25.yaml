@@ -1,11 +1,7 @@
-# Stage 2 bw-only on top of the stage1 total-backlog accel checkpoint.
-# Warm-start:
-#   python scripts/train.py --config configs/phase1_actions_curriculum_stage2_bw.yaml --updates 30 --log_dir runs/phase1_actions --run_id stage2_bw_probe --init_actor runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/actor.pt --init_critic runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/critic.pt
-# Notes:
-#   - Keep the actor architecture aligned with the stage1 checkpoint so shared backbone + accel head warm-start works.
-#   - Stage2 only trains bw; accel execution comes from the teacher checkpoint.
-#   - Reward is aligned with the stage1 total-backlog objective:
-#       0.6 * T_access + 0.1 * T_backhaul - 0.02 * Q_tot + 1.0 * Delta_Q_tot - 6.0 * D_tot
+# Stage 1 accel-only reward ablation.
+# Queue and queue-delta use arrival normalization.
+# Disabled terms for this experiment: drop event, accel penalty, close risk, fail penalty.
+# Variant: omega_q reduced to 0.10 and eta_q_delta increased to 2.5.
 seed: 42
 map_size: 1500.0
 tau0: 1.0
@@ -76,19 +72,19 @@ energy_enabled: false
 fading_enabled: false
 interference_enabled: false
 
-enable_bw_action: true
+enable_bw_action: false
 fixed_satellite_strategy: true
 sat_select_mode: sample
 N_RF: 2
 
-train_accel: false
-train_bw: true
+train_accel: true
+train_bw: false
 train_sat: false
 train_shared_backbone: true
-exec_accel_source: teacher
-exec_bw_source: policy
+exec_accel_source: policy
+exec_bw_source: zero
 exec_sat_source: zero
-exec_teacher_actor_path: runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/actor.pt
+exec_teacher_actor_path: null
 exec_teacher_deterministic: true
 
 avoidance_enabled: true
@@ -110,20 +106,20 @@ avoidance_eta_min: 1.0
 avoidance_eta_max: 5.0
 eta_crash: 0.0
 
-omega_q: 0.02
-omega_q_gu: 0.0
-omega_q_uav: 0.0
-omega_q_sat: 0.0
-eta_drop: 6.0
-eta_drop_gu: 6.0
-eta_drop_uav: 6.0
-eta_drop_sat: 6.0
+omega_q: 0.10
+omega_q_gu: 1.0
+omega_q_uav: 0.4
+omega_q_sat: 0.2
+eta_drop: 1.3
+eta_drop_gu: 1.3
+eta_drop_uav: 1.3
+eta_drop_sat: 1.8
 eta_drop_step: 0.0
 eta_service: 0.0
 eta_assoc: 0.0
-eta_q_delta: 1.0
+eta_q_delta: 2.5
 eta_throughput_access: 0.6
-eta_throughput_backhaul: 0.1
+eta_throughput_backhaul: 0.08
 eta_accel: 0.0
 close_risk_enabled: false
 eta_close_risk: 0.0
@@ -143,12 +139,11 @@ eta_dist_delta: 0.0
 queue_penalty_mode: linear
 queue_log_k: 0.0
 queue_norm_K: 1.0
-queue_norm_arrival_floor: 0.0
 queue_reward_use_arrival_norm: true
 q_norm_tail_q0: 0.0
 omega_q_tail: null
 queue_delta_use_active: false
-queue_delta_mode: total
+queue_delta_mode: weighted
 
 input_norm_enabled: true
 reward_norm_enabled: false
@@ -169,8 +164,8 @@ imitation_coef_decay_updates: 0
 imitation_accel: false
 imitation_bw: false
 imitation_sat: false
-danger_imitation_enabled: false
-danger_imitation_coef: 0.0
+danger_imitation_enabled: true
+danger_imitation_coef: 0.1
 danger_imitation_trigger_mode: intervention_threshold
 danger_imitation_close_risk_thresh: 0.05
 danger_imitation_intervention_thresh: 0.05

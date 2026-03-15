@@ -1,11 +1,10 @@
-# Stage 2 bw-only on top of the stage1 total-backlog accel checkpoint.
-# Warm-start:
-#   python scripts/train.py --config configs/phase1_actions_curriculum_stage2_bw.yaml --updates 30 --log_dir runs/phase1_actions --run_id stage2_bw_probe --init_actor runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/actor.pt --init_critic runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/critic.pt
-# Notes:
-#   - Keep the actor architecture aligned with the stage1 checkpoint so shared backbone + accel head warm-start works.
-#   - Stage2 only trains bw; accel execution comes from the teacher checkpoint.
-#   - Reward is aligned with the stage1 total-backlog objective:
-#       0.6 * T_access + 0.1 * T_backhaul - 0.02 * Q_tot + 1.0 * Delta_Q_tot - 6.0 * D_tot
+# Long-run config for total-backlog reward with checkpoint evaluation early stop.
+# Reward:
+#   0.6 * T_access
+# + 0.1 * T_backhaul
+# - 0.02 * Q_tot
+# + 1.0 * Delta_Q_tot
+# - 6.0 * D_tot
 seed: 42
 map_size: 1500.0
 tau0: 1.0
@@ -76,19 +75,19 @@ energy_enabled: false
 fading_enabled: false
 interference_enabled: false
 
-enable_bw_action: true
+enable_bw_action: false
 fixed_satellite_strategy: true
 sat_select_mode: sample
 N_RF: 2
 
-train_accel: false
-train_bw: true
+train_accel: true
+train_bw: false
 train_sat: false
 train_shared_backbone: true
-exec_accel_source: teacher
-exec_bw_source: policy
+exec_accel_source: policy
+exec_bw_source: zero
 exec_sat_source: zero
-exec_teacher_actor_path: runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/actor.pt
+exec_teacher_actor_path: null
 exec_teacher_deterministic: true
 
 avoidance_enabled: true
@@ -143,7 +142,6 @@ eta_dist_delta: 0.0
 queue_penalty_mode: linear
 queue_log_k: 0.0
 queue_norm_K: 1.0
-queue_norm_arrival_floor: 0.0
 queue_reward_use_arrival_norm: true
 q_norm_tail_q0: 0.0
 omega_q_tail: null
@@ -169,8 +167,8 @@ imitation_coef_decay_updates: 0
 imitation_accel: false
 imitation_bw: false
 imitation_sat: false
-danger_imitation_enabled: false
-danger_imitation_coef: 0.0
+danger_imitation_enabled: true
+danger_imitation_coef: 0.1
 danger_imitation_trigger_mode: intervention_threshold
 danger_imitation_close_risk_thresh: 0.05
 danger_imitation_intervention_thresh: 0.05
@@ -182,3 +180,11 @@ adv_clip: 5.0
 entropy_coef: 0.001
 
 early_stop_enabled: false
+checkpoint_eval_enabled: true
+checkpoint_eval_interval_updates: 30
+checkpoint_eval_start_update: 30
+checkpoint_eval_episodes: 20
+checkpoint_eval_episode_seed_base: 42000
+checkpoint_eval_sat_drop_worsen_delta: 5.0e-4
+checkpoint_eval_front_queue_rel_improve_tol: 0.05
+checkpoint_eval_worsen_patience: 2

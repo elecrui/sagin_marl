@@ -18,6 +18,7 @@ from sagin_marl.env.config import ablation_flag, load_config
 from sagin_marl.env.sagin_env import SaginParallelEnv
 from sagin_marl.rl.action_assembler import assemble_actions
 from sagin_marl.rl.policy import ActorNet, batch_flatten_obs
+from sagin_marl.utils.checkpoint import load_checkpoint_forgiving
 
 
 def _resolve_paths(
@@ -535,7 +536,9 @@ def main() -> None:
     obs_probe, _ = env.reset()
     obs_dim = batch_flatten_obs(list(obs_probe.values()), cfg).shape[1]
     actor = ActorNet(obs_dim, cfg).to(device)
-    actor.load_state_dict(torch.load(checkpoint, map_location=device))
+    info = load_checkpoint_forgiving(actor, checkpoint, map_location=device, strict=True)
+    if info.get("adapted_keys"):
+        print(f"Loaded actor with adapted tensors from {checkpoint}: {len(info['adapted_keys'])}")
     actor.eval()
 
     target_lookup = set(target_indices)

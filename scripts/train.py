@@ -86,6 +86,12 @@ def main():
     )
     parser.add_argument("--init_actor", type=str, default=None, help="Init actor checkpoint path.")
     parser.add_argument("--init_critic", type=str, default=None, help="Init critic checkpoint path.")
+    parser.add_argument(
+        "--resume_state",
+        type=str,
+        default=None,
+        help="Resume full training state (model + optimizer + scheduler) from train_state.pt.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -118,6 +124,7 @@ def main():
             save_interval_updates=args.save_interval,
             init_actor_path=args.init_actor,
             init_critic_path=args.init_critic,
+            resume_state_path=args.resume_state,
         )
     finally:
         close_fn = getattr(env, "close", None)

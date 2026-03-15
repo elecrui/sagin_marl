@@ -235,6 +235,62 @@ def test_reward_throughput_terms_are_applied():
     assert abs(float(reward) - 0.34) < 1e-9
 
 
+def test_reward_mode_throughput_only_ignores_dense_shaping_terms():
+    cfg = SaginConfig(
+        num_uav=1,
+        num_gu=1,
+        num_sat=1,
+        users_obs_max=1,
+        sats_obs_max=1,
+        nbrs_obs_max=1,
+        task_arrival_rate=200.0,
+        reward_mode="throughput_only",
+        omega_q=7.0,
+        eta_drop=9.0,
+        eta_drop_step=3.0,
+        eta_service=2.0,
+        eta_throughput_access=0.4,
+        eta_throughput_backhaul=0.6,
+        eta_q_delta=5.0,
+        eta_accel=4.0,
+        eta_centroid=1.5,
+        eta_crash=8.0,
+        close_risk_enabled=False,
+    )
+    env = SaginParallelEnv(cfg)
+    env.reset()
+    env.gu_queue[:] = 100.0
+    env.uav_queue[:] = 40.0
+    env.sat_queue[:] = 20.0
+    env.gu_drop[:] = 10.0
+    env.uav_drop[:] = 5.0
+    env.sat_drop[:] = 2.0
+    env.prev_queue_sum = 240.0
+    env.prev_queue_sum_gu = 120.0
+    env.prev_queue_sum_uav = 60.0
+    env.prev_queue_sum_sat = 60.0
+    env.last_exec_accel = np.array([[3.0, 4.0]], dtype=np.float32)
+    env.last_gu_arrival = np.array([200.0], dtype=np.float32)
+    env.last_gu_outflow = np.array([50.0], dtype=np.float32)
+    env.last_sat_incoming = np.array([80.0], dtype=np.float32)
+    env.last_sat_processed = np.array([30.0], dtype=np.float32)
+
+    reward = env._compute_reward()
+    parts = env.last_reward_parts
+
+    assert abs(float(parts["term_throughput_access"]) - 0.25) < 1e-9
+    assert abs(float(parts["term_throughput_backhaul"]) - 0.4) < 1e-9
+    assert abs(float(parts["term_drop"])) < 1e-9
+    assert abs(float(parts["term_queue"])) < 1e-9
+    assert abs(float(parts["term_q_delta"])) < 1e-9
+    assert abs(float(parts["term_accel"])) < 1e-9
+    assert abs(float(parts["queue_weight"])) < 1e-9
+    assert abs(float(parts["q_delta_weight"])) < 1e-9
+    assert abs(float(parts["crash_weight"])) < 1e-9
+    assert abs(float(parts["reward_raw"]) - 0.65) < 1e-9
+    assert abs(float(reward) - 0.65) < 1e-9
+
+
 def test_weighted_queue_delta_uses_layer_weights():
     cfg = SaginConfig(
         num_uav=1,
@@ -279,6 +335,64 @@ def test_weighted_queue_delta_uses_layer_weights():
     assert parts["queue_delta_mode"] == "weighted"
     assert abs(float(parts["queue_delta"]) - 0.1) < 1e-9
     assert abs(float(parts["term_q_delta"]) - 0.1) < 1e-9
+
+
+def test_queue_reward_can_use_arrival_normalization():
+    cfg = SaginConfig(
+        num_uav=1,
+        num_gu=1,
+        num_sat=1,
+        users_obs_max=1,
+        sats_obs_max=1,
+        nbrs_obs_max=1,
+        task_arrival_rate=10.0,
+        tau0=1.0,
+        queue_max_gu=100.0,
+        queue_max_uav=100.0,
+        queue_max_sat=100.0,
+        omega_q=1.0,
+        omega_q_gu=1.0,
+        omega_q_uav=0.5,
+        omega_q_sat=0.25,
+        eta_drop=0.0,
+        eta_drop_step=0.0,
+        eta_service=0.0,
+        eta_q_delta=1.0,
+        eta_accel=0.0,
+        eta_crash=0.0,
+        queue_penalty_mode="linear",
+        queue_delta_use_active=False,
+        queue_delta_mode="weighted",
+        queue_reward_use_arrival_norm=True,
+        close_risk_enabled=False,
+    )
+    env = SaginParallelEnv(cfg)
+    env.reset()
+    env.prev_queue_sum = 90.0
+    env.prev_queue_sum_gu = 30.0
+    env.prev_queue_sum_uav = 40.0
+    env.prev_queue_sum_sat = 20.0
+    env.gu_queue[:] = 20.0
+    env.uav_queue[:] = 50.0
+    env.sat_queue[:] = 10.0
+
+    env._compute_reward()
+    parts = env.last_reward_parts
+
+    assert abs(float(parts["gu_queue_arrival_steps"]) - 2.0) < 1e-9
+    assert abs(float(parts["uav_queue_arrival_steps"]) - 5.0) < 1e-9
+    assert abs(float(parts["sat_queue_arrival_steps"]) - 1.0) < 1e-9
+    assert abs(float(parts["queue_pen_gu"]) - 2.0) < 1e-9
+    assert abs(float(parts["queue_pen_uav"]) - 5.0) < 1e-9
+    assert abs(float(parts["queue_pen_sat"]) - 1.0) < 1e-9
+    assert abs(float(parts["queue_pen"]) - (4.75 / 1.75)) < 1e-9
+    assert abs(float(parts["queue_delta_gu"]) - 1.0) < 1e-9
+    assert abs(float(parts["queue_delta_uav"]) + 1.0) < 1e-9
+    assert abs(float(parts["queue_delta_sat"]) - 1.0) < 1e-9
+    assert parts["queue_delta_mode"] == "weighted"
+    assert abs(float(parts["queue_delta"]) - (0.75 / 1.75)) < 1e-9
+    assert abs(float(parts["term_queue"]) + (4.75 / 1.75)) < 1e-9
+    assert abs(float(parts["term_q_delta"]) - (0.75 / 1.75)) < 1e-9
 
 
 def test_avoidance_linear_repulsion_and_clip():

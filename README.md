@@ -135,6 +135,14 @@ python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage1_acc
 python scripts/render_episode.py --config configs/phase1_actions_curriculum_stage1_accel_setpool_prealert_top1gain_close_risk.yaml --run_dir <RUN_DIR>
 ```
 
+渲染一条 baseline 轨迹（与 `evaluate.py --baseline ...` 使用相同策略名）：
+```powershell
+python scripts/render_episode.py --config configs/phase1_actions_curriculum_stage1_accel_setpool_prealert_top1gain_close_risk.yaml --run_dir <RUN_DIR> --baseline queue_aware --episode_seed 42000 --out <RUN_DIR>/episode_queue_aware_seed42000.gif
+```
+
+- 如需复现 `evaluate.py --episode_seed_base B` 的第 `e` 个 episode，可在渲染时使用 `--episode_seed (B + e)`。
+- 如需查看修改初始化条件后的轨迹，复制并修改配置中的 `uav_spawn_*`、`queue_init_*` 等参数，再把 `--config` 指向新配置。
+
 TensorBoard：
 ```powershell
 tensorboard --logdir <RUN_DIR>

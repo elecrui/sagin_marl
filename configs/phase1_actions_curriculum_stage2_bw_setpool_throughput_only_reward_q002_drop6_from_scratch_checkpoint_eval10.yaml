@@ -1,11 +1,10 @@
-# Stage 2 bw-only on top of the stage1 total-backlog accel checkpoint.
-# Warm-start:
-#   python scripts/train.py --config configs/phase1_actions_curriculum_stage2_bw.yaml --updates 30 --log_dir runs/phase1_actions --run_id stage2_bw_probe --init_actor runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/actor.pt --init_critic runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/critic.pt
-# Notes:
-#   - Keep the actor architecture aligned with the stage1 checkpoint so shared backbone + accel head warm-start works.
-#   - Stage2 only trains bw; accel execution comes from the teacher checkpoint.
-#   - Reward is aligned with the stage1 total-backlog objective:
-#       0.6 * T_access + 0.1 * T_backhaul - 0.02 * Q_tot + 1.0 * Delta_Q_tot - 6.0 * D_tot
+# Stage-2 bw-only config corresponding to the stage1 throughput-only reward setup.
+# From-scratch bw training (no init_actor/init_critic, accel fixed as zero/no-op):
+#   python scripts/train.py --config configs/phase1_actions_curriculum_stage2_bw_setpool_throughput_only_reward_q002_drop6_from_scratch_checkpoint_eval10.yaml --log_dir runs/phase1_actions --run_id bw_throughput_only_from_scratch_eval10 --num_envs 12 --vec_backend subproc --torch_threads 2 --updates 300
+# Evaluate trained policy:
+#   python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage2_bw_setpool_throughput_only_reward_q002_drop6_from_scratch_checkpoint_eval10.yaml --run_dir runs/phase1_actions/bw_throughput_only_from_scratch_eval10 --episodes 20 --episode_seed_base 42000
+# Evaluate the recommended baseline once:
+#   python scripts/evaluate.py --config configs/phase1_actions_curriculum_stage2_bw_setpool_throughput_only_reward_q002_drop6_from_scratch_checkpoint_eval10.yaml --run_dir runs/phase1_actions/bw_throughput_only_from_scratch_eval10 --episodes 20 --episode_seed_base 42000 --baseline queue_aware
 seed: 42
 map_size: 1500.0
 tau0: 1.0
@@ -85,10 +84,10 @@ train_accel: false
 train_bw: true
 train_sat: false
 train_shared_backbone: true
-exec_accel_source: teacher
+exec_accel_source: zero
 exec_bw_source: policy
 exec_sat_source: zero
-exec_teacher_actor_path: runs/phase1_actions/total_backlog_reward_q002_drop6_checkpoint_eval_long/actor.pt
+exec_teacher_actor_path: null
 exec_teacher_deterministic: true
 
 avoidance_enabled: true
@@ -110,20 +109,21 @@ avoidance_eta_min: 1.0
 avoidance_eta_max: 5.0
 eta_crash: 0.0
 
-omega_q: 0.02
+reward_mode: throughput_only
+omega_q: 0.0
 omega_q_gu: 0.0
 omega_q_uav: 0.0
 omega_q_sat: 0.0
-eta_drop: 6.0
-eta_drop_gu: 6.0
-eta_drop_uav: 6.0
-eta_drop_sat: 6.0
+eta_drop: 0.0
+eta_drop_gu: 0.0
+eta_drop_uav: 0.0
+eta_drop_sat: 0.0
 eta_drop_step: 0.0
 eta_service: 0.0
 eta_assoc: 0.0
-eta_q_delta: 1.0
-eta_throughput_access: 0.6
-eta_throughput_backhaul: 0.1
+eta_q_delta: 0.0
+eta_throughput_access: 1.0
+eta_throughput_backhaul: 1.0
 eta_accel: 0.0
 close_risk_enabled: false
 eta_close_risk: 0.0
@@ -143,7 +143,6 @@ eta_dist_delta: 0.0
 queue_penalty_mode: linear
 queue_log_k: 0.0
 queue_norm_K: 1.0
-queue_norm_arrival_floor: 0.0
 queue_reward_use_arrival_norm: true
 q_norm_tail_q0: 0.0
 omega_q_tail: null
@@ -156,7 +155,8 @@ reward_norm_clip: 5.0
 reward_tanh_enabled: false
 lr_decay_enabled: false
 lr_final_factor: 0.1
-critic_lr: 1.0e-4
+actor_lr: 1.0e-4
+critic_lr: 2.0e-4
 actor_hidden: 256
 actor_encoder_type: set_pool
 actor_set_embed_dim: 64
@@ -182,3 +182,13 @@ adv_clip: 5.0
 entropy_coef: 0.001
 
 early_stop_enabled: false
+checkpoint_eval_enabled: true
+checkpoint_eval_interval_updates: 10
+checkpoint_eval_start_update: 10
+checkpoint_eval_episodes: 20
+checkpoint_eval_episode_seed_base: 42000
+checkpoint_eval_fixed_policy: queue_aware
+checkpoint_eval_sat_drop_worsen_delta: 5.0e-4
+checkpoint_eval_front_queue_rel_improve_tol: 0.05
+checkpoint_eval_worsen_patience: 2
+checkpoint_eval_early_stop_enabled: false
