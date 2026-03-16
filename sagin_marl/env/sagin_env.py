@@ -441,6 +441,11 @@ class SaginParallelEnv(ParallelEnv):
         self.last_sat_score = 0.0
         self.last_sat_selection: List[List[int]] = [[] for _ in range(cfg.num_uav)]
         self.last_sat_connection_counts = np.zeros((cfg.num_sat,), dtype=np.float32)
+        self.last_connected_sat_count = 0.0
+        self.last_connected_sat_dist_mean = 0.0
+        self.last_connected_sat_dist_p95 = 0.0
+        self.last_connected_sat_elevation_deg_mean = 0.0
+        self.last_connected_sat_elevation_deg_min = 0.0
         self.last_visible_raw_counts = np.zeros((cfg.num_uav,), dtype=np.int32)
         self.last_visible_kept_counts = np.zeros((cfg.num_uav,), dtype=np.int32)
         self.last_visible_raw_candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
@@ -505,6 +510,8 @@ class SaginParallelEnv(ParallelEnv):
             "sat_queue_arrival_steps": 0.0,
             "queue_topk": 0.0,
             "assoc_ratio": 0.0,
+            "assoc_unfair_max_gu_count": 0.0,
+            "assoc_unfair_step": 0.0,
             "queue_delta": 0.0,
             "queue_delta_mode": "total",
             "queue_delta_gu": 0.0,
@@ -655,6 +662,7 @@ class SaginParallelEnv(ParallelEnv):
         rate_matrix, sat_loads = self._compute_backhaul_rates(sat_pos, sat_vel, sat_selection)
         self.last_sat_selection = [list(sel) for sel in sat_selection]
         self.last_sat_connection_counts = sat_loads.astype(np.float32, copy=False)
+        self._update_connected_sat_link_stats(sat_pos, sat_selection)
 
         # Update UAV queues and satellite queues
         outflow_matrix = self._update_uav_queues(gu_outflow, rate_matrix)
@@ -1774,6 +1782,31 @@ class SaginParallelEnv(ParallelEnv):
         self.uav_energy = self.uav_energy - self.last_energy_cost * cfg.tau0
         self.uav_energy = np.maximum(self.uav_energy, 0.0)
 
+    def _update_connected_sat_link_stats(self, sat_pos: np.ndarray, sat_selection: List[List[int]]) -> None:
+        dist_values: List[float] = []
+        elevation_deg_values: List[float] = []
+        for u, selected in enumerate(sat_selection):
+            for l in selected:
+                sat_idx = int(l)
+                rel_pos = sat_pos[sat_idx] - self._uav_ecef(u)
+                dist_values.append(float(np.linalg.norm(rel_pos)))
+                elevation_deg_values.append(math.degrees(self._elevation_angle(u, sat_idx, sat_pos)))
+        if dist_values:
+            dist_arr = np.asarray(dist_values, dtype=np.float32)
+            elevation_arr = np.asarray(elevation_deg_values, dtype=np.float32)
+            self.last_connected_sat_count = float(dist_arr.size)
+            self.last_connected_sat_dist_mean = float(np.mean(dist_arr))
+            self.last_connected_sat_dist_p95 = float(np.percentile(dist_arr, 95.0))
+            self.last_connected_sat_elevation_deg_mean = float(np.mean(elevation_arr))
+            self.last_connected_sat_elevation_deg_min = float(np.min(elevation_arr))
+            return
+
+        self.last_connected_sat_count = 0.0
+        self.last_connected_sat_dist_mean = 0.0
+        self.last_connected_sat_dist_p95 = 0.0
+        self.last_connected_sat_elevation_deg_mean = 0.0
+        self.last_connected_sat_elevation_deg_min = 0.0
+
     def _compute_reward(self) -> float:
         cfg = self.cfg
         # Reward can use the legacy dense queue-aware shaping or a throughput-only objective.
@@ -1842,6 +1875,16 @@ class SaginParallelEnv(ParallelEnv):
             assoc_ratio = float(np.mean(self.last_association >= 0))
         else:
             assoc_ratio = 0.0
+        assoc_unfair_max_gu_count = 0.0
+        assoc_unfair_step = 0.0
+        assoc_unfair_gu_threshold = max(int(getattr(cfg, "assoc_unfair_gu_threshold", 15) or 0), 0)
+        if cfg.num_uav > 0 and cfg.num_gu > 0:
+            assoc_valid = self.last_association[self.last_association >= 0]
+            if assoc_valid.size > 0:
+                assoc_counts = np.bincount(assoc_valid, minlength=cfg.num_uav).astype(np.float32, copy=False)
+                assoc_unfair_max_gu_count = float(np.max(assoc_counts))
+                if assoc_unfair_gu_threshold > 0 and assoc_unfair_max_gu_count >= float(assoc_unfair_gu_threshold):
+                    assoc_unfair_step = 1.0
 
         arrival_ref = float(getattr(self, "effective_task_arrival_rate", cfg.task_arrival_rate))
         arrival_scale = max(arrival_ref * float(cfg.num_gu) * float(cfg.tau0), 1e-9)
@@ -2177,6 +2220,8 @@ class SaginParallelEnv(ParallelEnv):
             "queue_total": q_total,
             "queue_total_active": q_total_active,
             "assoc_ratio": assoc_ratio,
+            "assoc_unfair_max_gu_count": assoc_unfair_max_gu_count,
+            "assoc_unfair_step": assoc_unfair_step,
             "queue_delta": queue_delta,
             "queue_delta_mode": queue_delta_mode,
             "queue_delta_gu": queue_delta_gu,

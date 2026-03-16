@@ -292,6 +292,7 @@ class SaginConfig:
     candidate_mode: str = "assoc"  # "assoc", "nearest", "radius"
     candidate_radius: float | None = None
     candidate_k: int | None = None
+    assoc_unfair_gu_threshold: int = 15
     queue_th_gu: float | None = None
     queue_th_uav: float | None = None
     queue_th_gu_frac: float = 0.8

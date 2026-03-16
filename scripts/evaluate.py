@@ -139,6 +139,16 @@ def _init_eval_tb_layout(writer: SummaryWriter, tag_prefix: str) -> None:
         },
         "Eval/Satellite": {
             "SatFlow": ["Multiline", [t("sat_incoming_sum"), t("sat_processed_sum")]],
+            "LinkGeometry": [
+                "Multiline",
+                [
+                    t("connected_sat_count_mean"),
+                    t("connected_sat_dist_mean"),
+                    t("connected_sat_dist_p95_mean"),
+                    t("connected_sat_elevation_deg_mean"),
+                    t("connected_sat_elevation_deg_min"),
+                ],
+            ],
         },
         "Eval/Regime": {
             "NonEmpty": [
@@ -520,10 +530,26 @@ def main():
         "active_net_drift_per_step",
         "sat_net_drift_per_step",
         "total_net_drift_per_step",
+        "connected_sat_count_mean",
+        "connected_sat_dist_mean",
+        "connected_sat_dist_p95_mean",
+        "connected_sat_elevation_deg_mean",
+        "connected_sat_elevation_deg_min",
         "energy_mean",
         "assoc_ratio_mean",
         "assoc_dist_mean",
     ]
+    for u in range(cfg.num_uav):
+        fieldnames.extend(
+            [
+                f"uav{u}_assoc_gu_count_mean",
+                f"uav{u}_assoc_gu_count_p95",
+                f"uav{u}_assoc_gu_count_max",
+                f"uav{u}_access_outflow_mean",
+                f"uav{u}_access_outflow_p95",
+                f"uav{u}_access_outflow_sum",
+            ]
+        )
     q_zero_eps = 1e-9
     layer_total_capacity = {
         "gu": float(cfg.num_gu) * float(cfg.queue_max_gu),
@@ -562,9 +588,17 @@ def main():
             sat_drop_sum = 0.0
             sat_processed_sum = 0.0
             sat_incoming_sum = 0.0
+            connected_sat_count_sum = 0.0
+            connected_sat_dist_mean_sum = 0.0
+            connected_sat_dist_p95_sum = 0.0
+            connected_sat_elevation_deg_mean_sum = 0.0
+            connected_sat_elevation_deg_min_episode = float("inf")
             energy_mean_sum = 0.0
             assoc_ratio_sum = 0.0
             assoc_dist_sum = 0.0
+            uav_assoc_gu_count_steps = [[] for _ in range(cfg.num_uav)]
+            uav_access_outflow_steps = [[] for _ in range(cfg.num_uav)]
+            uav_access_outflow_sum = np.zeros((cfg.num_uav,), dtype=np.float64)
             reward_raw_sum = 0.0
             service_norm_sum = 0.0
             throughput_access_norm_sum = 0.0
@@ -697,6 +731,18 @@ def main():
                     sat_processed_sum += float(np.sum(env.last_sat_processed))
                 if hasattr(env, "last_sat_incoming"):
                     sat_incoming_sum += float(np.sum(env.last_sat_incoming))
+                connected_sat_count_step = float(getattr(env, "last_connected_sat_count", 0.0))
+                connected_sat_count_sum += connected_sat_count_step
+                connected_sat_dist_mean_sum += float(getattr(env, "last_connected_sat_dist_mean", 0.0))
+                connected_sat_dist_p95_sum += float(getattr(env, "last_connected_sat_dist_p95", 0.0))
+                connected_sat_elevation_deg_mean_sum += float(
+                    getattr(env, "last_connected_sat_elevation_deg_mean", 0.0)
+                )
+                if connected_sat_count_step > 0.0:
+                    connected_sat_elevation_deg_min_episode = min(
+                        connected_sat_elevation_deg_min_episode,
+                        float(getattr(env, "last_connected_sat_elevation_deg_min", 0.0)),
+                    )
                 if cfg.energy_enabled:
                     energy_mean_sum += float(np.mean(env.uav_energy))
                 parts = getattr(env, "last_reward_parts", None)
@@ -739,12 +785,22 @@ def main():
                         near_collision_steps += 1.0
                 assoc_ratio = 0.0
                 assoc_dist = 0.0
+                assoc_counts = np.zeros((cfg.num_uav,), dtype=np.float32)
+                access_outflow_per_uav = np.zeros((cfg.num_uav,), dtype=np.float32)
                 if cfg.num_gu > 0 and hasattr(env, "last_association"):
-                    assoc = env.last_association
+                    assoc = np.asarray(env.last_association, dtype=np.int32)
                     mask = assoc >= 0
                     if mask.size > 0:
                         assoc_ratio = float(np.mean(mask))
                         if np.any(mask):
+                            assoc_counts = np.bincount(assoc[mask], minlength=cfg.num_uav).astype(np.float32)
+                            if hasattr(env, "last_gu_outflow"):
+                                gu_outflow = np.asarray(env.last_gu_outflow, dtype=np.float32)
+                                access_outflow_per_uav = np.bincount(
+                                    assoc[mask],
+                                    weights=gu_outflow[mask],
+                                    minlength=cfg.num_uav,
+                                ).astype(np.float32)
                             gu_pos = env.gu_pos[mask]
                             u_idx = assoc[mask].astype(np.int32)
                             uav_pos = env.uav_pos[u_idx]
@@ -752,6 +808,10 @@ def main():
                             assoc_dist = float(np.mean(d2d)) if d2d.size else 0.0
                 assoc_ratio_sum += assoc_ratio
                 assoc_dist_sum += assoc_dist
+                for u in range(cfg.num_uav):
+                    uav_assoc_gu_count_steps[u].append(float(assoc_counts[u]))
+                    uav_access_outflow_steps[u].append(float(access_outflow_per_uav[u]))
+                    uav_access_outflow_sum[u] += float(access_outflow_per_uav[u])
             ep_time = time.perf_counter() - ep_start
             steps = max(1, steps)
             layer_queue_end_sum = {
@@ -884,10 +944,37 @@ def main():
                 "active_net_drift_per_step": active_net_drift_per_step,
                 "sat_net_drift_per_step": sat_net_drift_per_step,
                 "total_net_drift_per_step": total_net_drift_per_step,
+                "connected_sat_count_mean": connected_sat_count_sum / steps,
+                "connected_sat_dist_mean": connected_sat_dist_mean_sum / steps,
+                "connected_sat_dist_p95_mean": connected_sat_dist_p95_sum / steps,
+                "connected_sat_elevation_deg_mean": connected_sat_elevation_deg_mean_sum / steps,
+                "connected_sat_elevation_deg_min": (
+                    0.0 if not np.isfinite(connected_sat_elevation_deg_min_episode)
+                    else connected_sat_elevation_deg_min_episode
+                ),
                 "energy_mean": (energy_mean_sum / steps) if cfg.energy_enabled else 0.0,
                 "assoc_ratio_mean": assoc_ratio_sum / steps,
                 "assoc_dist_mean": assoc_dist_sum / steps,
             }
+            for u in range(cfg.num_uav):
+                assoc_series = uav_assoc_gu_count_steps[u]
+                access_series = uav_access_outflow_steps[u]
+                metrics[f"uav{u}_assoc_gu_count_mean"] = (
+                    float(np.mean(assoc_series)) if assoc_series else 0.0
+                )
+                metrics[f"uav{u}_assoc_gu_count_p95"] = (
+                    float(np.percentile(assoc_series, 95)) if assoc_series else 0.0
+                )
+                metrics[f"uav{u}_assoc_gu_count_max"] = (
+                    float(np.max(assoc_series)) if assoc_series else 0.0
+                )
+                metrics[f"uav{u}_access_outflow_mean"] = (
+                    float(np.mean(access_series)) if access_series else 0.0
+                )
+                metrics[f"uav{u}_access_outflow_p95"] = (
+                    float(np.percentile(access_series, 95)) if access_series else 0.0
+                )
+                metrics[f"uav{u}_access_outflow_sum"] = float(uav_access_outflow_sum[u])
             writer.writerow([metrics.get(name, "") for name in fieldnames])
             for key, val in metrics.items():
                 if isinstance(val, (int, float, np.floating, np.integer)):

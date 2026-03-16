@@ -63,6 +63,15 @@ def _collect_step_stats(env: SaginParallelEnv) -> Dict[str, object]:
         'uav_drop_sum': _safe_sum(getattr(env, 'uav_drop', 0.0)),
         'sat_processed_sum': _safe_sum(sat_processed) if sat_processed is not None else 0.0,
         'sat_incoming_sum': _safe_sum(sat_incoming) if sat_incoming is not None else 0.0,
+        'connected_sat_count': float(getattr(env, 'last_connected_sat_count', 0.0)),
+        'connected_sat_dist_mean': float(getattr(env, 'last_connected_sat_dist_mean', 0.0)),
+        'connected_sat_dist_p95': float(getattr(env, 'last_connected_sat_dist_p95', 0.0)),
+        'connected_sat_elevation_deg_mean': float(
+            getattr(env, 'last_connected_sat_elevation_deg_mean', 0.0)
+        ),
+        'connected_sat_elevation_deg_min': float(
+            getattr(env, 'last_connected_sat_elevation_deg_min', 0.0)
+        ),
         'energy_mean': _safe_mean(getattr(env, 'uav_energy', 0.0)),
         'dynamics_time_sec': float(profile.get('dynamics_time_sec', 0.0)),
         'orbit_visible_time_sec': float(profile.get('orbit_visible_time_sec', 0.0)),

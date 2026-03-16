@@ -226,6 +226,16 @@ class MetricLogger:
                         "centroid_transfer_ratio",
                     ],
                 ],
+                "AssociationFairness": [
+                    "Multiline",
+                    [
+                        "assoc_unfair_step_rate",
+                        "assoc_unfair_max_gu_count",
+                        "assoc_unfair_episode_frac_mean",
+                        "assoc_unfair_episode_frac_p95",
+                        "assoc_unfair_episode_frac_max",
+                    ],
+                ],
             },
             "Training/Satellite": {
                 "SatFlow": ["Multiline", ["sat_incoming_sum", "sat_processed_sum"]],
@@ -235,6 +245,16 @@ class MetricLogger:
                         "throughput_access_norm",
                         "throughput_backhaul_norm",
                         "sat_processed_norm",
+                    ],
+                ],
+                "LinkGeometry": [
+                    "Multiline",
+                    [
+                        "connected_sat_count",
+                        "connected_sat_dist_mean",
+                        "connected_sat_dist_p95",
+                        "connected_sat_elevation_deg_mean",
+                        "connected_sat_elevation_deg_min",
                     ],
                 ],
                 "LinkRatios": [

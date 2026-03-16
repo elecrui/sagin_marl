@@ -78,6 +78,15 @@ def _single_env_step_stats(env) -> Dict[str, object]:
         "sat_drop_sum": _safe_sum(getattr(env, "sat_drop", 0.0)),
         "sat_processed_sum": _safe_sum(sat_processed) if sat_processed is not None else 0.0,
         "sat_incoming_sum": _safe_sum(sat_incoming) if sat_incoming is not None else 0.0,
+        "connected_sat_count": float(getattr(env, "last_connected_sat_count", 0.0)),
+        "connected_sat_dist_mean": float(getattr(env, "last_connected_sat_dist_mean", 0.0)),
+        "connected_sat_dist_p95": float(getattr(env, "last_connected_sat_dist_p95", 0.0)),
+        "connected_sat_elevation_deg_mean": float(
+            getattr(env, "last_connected_sat_elevation_deg_mean", 0.0)
+        ),
+        "connected_sat_elevation_deg_min": float(
+            getattr(env, "last_connected_sat_elevation_deg_min", 0.0)
+        ),
         "energy_mean": _safe_mean(getattr(env, "uav_energy", 0.0)),
         "dynamics_time_sec": float(profile.get("dynamics_time_sec", 0.0)),
         "orbit_visible_time_sec": float(profile.get("orbit_visible_time_sec", 0.0)),
@@ -753,6 +762,12 @@ def train(
         "r_bw_align",
         "r_sat_score",
         "r_assoc_ratio",
+        "assoc_unfair_step_rate",
+        "assoc_unfair_max_gu_count",
+        "assoc_unfair_episode_frac_mean",
+        "assoc_unfair_episode_frac_p95",
+        "assoc_unfair_episode_frac_max",
+        "assoc_unfair_episode_count",
         "r_queue_delta",
         "r_dist",
         "r_dist_delta",
@@ -866,6 +881,11 @@ def train(
         "sat_drop_sum",
         "sat_processed_sum",
         "sat_incoming_sum",
+        "connected_sat_count",
+        "connected_sat_dist_mean",
+        "connected_sat_dist_p95",
+        "connected_sat_elevation_deg_mean",
+        "connected_sat_elevation_deg_min",
         "energy_mean",
         "env_dynamics_time_sec",
         "env_orbit_visible_time_sec",
@@ -1043,6 +1063,8 @@ def train(
         return np.concatenate(parts, axis=1).astype(np.float32, copy=False)
 
     completed_updates = resume_update
+    episode_step_counts_env = np.zeros((num_envs,), dtype=np.int64)
+    episode_assoc_unfair_step_counts_env = np.zeros((num_envs,), dtype=np.int64)
     for local_update in range(total_updates):
         update = resume_update + local_update
         imitation_coef_curr = _imitation_coef_at(update)
@@ -1062,6 +1084,11 @@ def train(
         sat_drop_sum = 0.0
         sat_processed_sum = 0.0
         sat_incoming_sum = 0.0
+        connected_sat_count_sum = 0.0
+        connected_sat_dist_mean_sum = 0.0
+        connected_sat_dist_p95_sum = 0.0
+        connected_sat_elevation_deg_mean_sum = 0.0
+        connected_sat_elevation_deg_min_sum = 0.0
         energy_mean_sum = 0.0
         dynamics_time_sum = 0.0
         orbit_visible_time_sum = 0.0
@@ -1159,6 +1186,8 @@ def train(
         intervention_norm_sum = 0.0
         intervention_rate_sum = 0.0
         intervention_norm_top1_sum = 0.0
+        assoc_unfair_step_sum = 0.0
+        assoc_unfair_max_gu_count_sum = 0.0
         collision_event_sum = 0.0
         avoidance_eta_eff_sum = 0.0
         avoidance_eta_exec_sum = 0.0
@@ -1174,6 +1203,7 @@ def train(
         pairwise_fallback_count_sum = 0.0
         pairwise_candidate_infeasible_count_sum = 0.0
         arrival_rate_eff_sum = 0.0
+        assoc_unfair_episode_fracs: List[float] = []
         q_norm_active_values: List[float] = []
         queue_total_active_values: List[float] = []
         q_norm_active_nonzero_count = 0
@@ -1360,6 +1390,7 @@ def train(
                 ep_reward += reward_scalar
                 steps_count += 1
                 total_env_steps += 1
+                episode_step_counts_env[env_idx] += 1
 
                 stats = step_stats[env_idx] if step_stats[env_idx] is not None else {}
                 gu_queue_sum += float(stats.get("gu_queue_mean", 0.0))
@@ -1373,6 +1404,15 @@ def train(
                 sat_drop_sum += float(stats.get("sat_drop_sum", 0.0))
                 sat_processed_sum += float(stats.get("sat_processed_sum", 0.0))
                 sat_incoming_sum += float(stats.get("sat_incoming_sum", 0.0))
+                connected_sat_count_sum += float(stats.get("connected_sat_count", 0.0))
+                connected_sat_dist_mean_sum += float(stats.get("connected_sat_dist_mean", 0.0))
+                connected_sat_dist_p95_sum += float(stats.get("connected_sat_dist_p95", 0.0))
+                connected_sat_elevation_deg_mean_sum += float(
+                    stats.get("connected_sat_elevation_deg_mean", 0.0)
+                )
+                connected_sat_elevation_deg_min_sum += float(
+                    stats.get("connected_sat_elevation_deg_min", 0.0)
+                )
                 if cfg.energy_enabled:
                     energy_mean_sum += float(stats.get("energy_mean", 0.0))
                 dynamics_time_sum += float(stats.get("dynamics_time_sec", 0.0))
@@ -1504,6 +1544,23 @@ def train(
                     intervention_norm_sum += float(parts.get("intervention_norm", 0.0))
                     intervention_rate_sum += float(parts.get("intervention_rate", 0.0))
                     intervention_norm_top1_sum += float(parts.get("intervention_norm_top1", 0.0))
+                    assoc_unfair_step_value = float(parts.get("assoc_unfair_step", 0.0))
+                    assoc_unfair_step_sum += assoc_unfair_step_value
+                    assoc_unfair_max_gu_count_sum += float(parts.get("assoc_unfair_max_gu_count", 0.0))
+                    if assoc_unfair_step_value > 0.5:
+                        episode_assoc_unfair_step_counts_env[env_idx] += 1
+
+                if done_scalar:
+                    episode_steps_curr = int(episode_step_counts_env[env_idx])
+                    unfair_steps_curr = int(episode_assoc_unfair_step_counts_env[env_idx])
+                    unfair_frac = (
+                        float(unfair_steps_curr) / float(max(episode_steps_curr, 1))
+                        if episode_steps_curr > 0
+                        else 0.0
+                    )
+                    assoc_unfair_episode_fracs.append(unfair_frac)
+                    episode_step_counts_env[env_idx] = 0
+                    episode_assoc_unfair_step_counts_env[env_idx] = 0
 
                 danger_target_env, danger_mask_env = _build_danger_imitation_step_data(stats, cfg, num_agents)
                 post_step_state = np.asarray(
@@ -1817,6 +1874,15 @@ def train(
             returns_var = float(np.var(returns_np))
             if returns_var > 1e-8:
                 explained_variance = 1.0 - float(np.var(returns_np - value_pred_eval)) / returns_var
+        assoc_unfair_episode_frac_mean = (
+            float(np.mean(assoc_unfair_episode_fracs)) if assoc_unfair_episode_fracs else 0.0
+        )
+        assoc_unfair_episode_frac_p95 = (
+            float(np.percentile(assoc_unfair_episode_fracs, 95.0)) if assoc_unfair_episode_fracs else 0.0
+        )
+        assoc_unfair_episode_frac_max = (
+            float(np.max(assoc_unfair_episode_fracs)) if assoc_unfair_episode_fracs else 0.0
+        )
         metrics = {
             "episode_reward": episode_reward,
             "policy_loss": float(np.mean(policy_losses)),
@@ -1851,6 +1917,12 @@ def train(
             "r_bw_align": r_bw_align_sum / steps_count,
             "r_sat_score": r_sat_score_sum / steps_count,
             "r_assoc_ratio": r_assoc_ratio_sum / steps_count,
+            "assoc_unfair_step_rate": assoc_unfair_step_sum / steps_count,
+            "assoc_unfair_max_gu_count": assoc_unfair_max_gu_count_sum / steps_count,
+            "assoc_unfair_episode_frac_mean": assoc_unfair_episode_frac_mean,
+            "assoc_unfair_episode_frac_p95": assoc_unfair_episode_frac_p95,
+            "assoc_unfair_episode_frac_max": assoc_unfair_episode_frac_max,
+            "assoc_unfair_episode_count": float(len(assoc_unfair_episode_fracs)),
             "r_queue_delta": r_queue_delta_sum / steps_count,
             "r_dist": r_dist_sum / steps_count,
             "r_dist_delta": r_dist_delta_sum / steps_count,
@@ -1970,6 +2042,11 @@ def train(
             "sat_drop_sum": sat_drop_sum,
             "sat_processed_sum": sat_processed_sum,
             "sat_incoming_sum": sat_incoming_sum,
+            "connected_sat_count": connected_sat_count_sum / steps_count,
+            "connected_sat_dist_mean": connected_sat_dist_mean_sum / steps_count,
+            "connected_sat_dist_p95": connected_sat_dist_p95_sum / steps_count,
+            "connected_sat_elevation_deg_mean": connected_sat_elevation_deg_mean_sum / steps_count,
+            "connected_sat_elevation_deg_min": connected_sat_elevation_deg_min_sum / steps_count,
             "energy_mean": (energy_mean_sum / steps_count) if cfg.energy_enabled else 0.0,
             "env_dynamics_time_sec": dynamics_time_sum / steps_count,
             "env_orbit_visible_time_sec": orbit_visible_time_sum / steps_count,
