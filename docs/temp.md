@@ -1,391 +1,246 @@
-我先直接给你结论：**bw 配置至少要先把 accel-only 里已经证明“更稳”的那批训练项同步过去**，否则你是在拿“改好后的 accel”去接“没改好的 bw 模板”，这样对比本身就不公平。你给的两份配置里，这种“不一致”很明显。 
+可以理解，但我得直接一点说：
 
-你这两份配置对照下来，我建议分成三类看。
+**在你当前这套问题定义下，想靠“再调一点 PPO 超参”超过 `queue_aware_bw`，概率已经很低了。**
+如果你还是希望训练出来的方法更好，**就不能再把它当成“纯 RL 从结果里自己悟出来”这个问题**，而要把问题改成：
 
-## 一、应该直接从 accel 配置迁到 bw 配置的项
+> **先把 `queue_aware_bw` 学会，再只学习“什么时候偏离它”。**
 
-这些我认为是**优先级最高**的，因为它们不是“accel 专属”，而是更像通用的 PPO 稳定化设置。
-
-### 1) PPO 时序相关参数要补齐
-
-在 accel 配置里有：
-
-* `gamma: 0.9975`
-* `gae_lambda: 0.95`
-* `kl_stop: true`
-* `target_kl: 0.02`
-
-而你这份 bw 配置里这些项没有出现。 
-
-这很可疑，因为如果代码默认值不是你现在 accel 这套，那 bw 实际训练口径就和 accel 不一致了。
-**我建议 bw 先显式加上这四个：**
-
-```yaml
-gamma: 0.9975
-gae_lambda: 0.95
-kl_stop: true
-target_kl: 0.02
-```
-
-尤其是 `kl_stop + target_kl=0.02`，你前面已经说 accel 改完后训练才比较好，这一项很可能就是关键稳定器之一。
+这和你前面做的 imitation 还不一样。你前面的 imitation 更像“teacher 拉着学”；我现在建议的是**残差策略 / 混合策略**。
 
 ---
 
-### 2) checkpoint eval / early stop 逻辑要同步
+## 我认为最有希望超过 `queue_aware_bw` 的方向
 
-accel 配置里有比较完整的 checkpoint-eval 和 reward plateau early-stop 逻辑，例如：
+### 方向 1：学“对 heuristic 的修正”，不是重学生成整个 bw
 
-* `checkpoint_eval_interval_updates: 50`
-* `checkpoint_eval_start_update: 200`
-* `checkpoint_eval_fixed_policy: zero`
-* `checkpoint_eval_early_stop_enabled: true`
-* `checkpoint_eval_reward_early_stop_enabled: true`
-* `checkpoint_eval_reward_patience: 5`
-* `checkpoint_eval_reward_min_delta_rel: 0.005`
-* `checkpoint_eval_reward_collision_threshold: 0.01`
+也就是不要让策略直接输出最终 `bw_logits`，而是输出：
 
-而 bw 配置里是旧式的：
+[
+\text{bw_logits} = \text{queue_aware_logits} + \Delta_\theta
+]
 
-* `checkpoint_eval_interval_updates: 10`
-* `checkpoint_eval_start_update: 10`
-* `checkpoint_eval_fixed_policy: queue_aware`
-* `checkpoint_eval_early_stop_enabled: false`
+其中 (\Delta_\theta) 是一个**小范围残差**。
 
-这说明 bw 这份配置还没吸收你后面对 accel 训练流程的修正。 
+这一步非常关键，因为它把学习任务从：
 
-这里我建议分开说：
+* “从零发现完整分配规则”
 
-* **checkpoint eval 的频率/开始点**：bw 不一定要照搬 50/200，但至少要有一套你认可的逻辑，不要还是“每 10 update 就 eval 一次”的旧口径。
-* **early stop**：如果 accel 上有用，bw 也建议接上。
-* **baseline 口径**：bw 用 `queue_aware` 当固定 baseline 是合理的，这一点不一定改成 `zero`。因为 bw 的固定对照本来就更适合是一个 hand-crafted bandwidth baseline。
+改成了：
 
-所以这里不是“全盘照搬”，而是：
+* “在一个已经很强的规则上，学少量修正”
 
-* **训练稳定逻辑照搬**
-* **baseline 口径按 bw 任务保留 `queue_aware`**
+这正适合你现在这种情况：
 
----
+* `queue_aware` 已经强
+* `zero_bw` 也不差
+* bw 边际作用小
+* 纯 RL 很难学到完整规则
 
-### 3) 初始化/生成场景的稳定化设置要同步
+### 为什么这比 imitation 更有机会赢
 
-accel 配置里有这些，而 bw 没有：
+因为 imitation 只是“尽量靠近 teacher”；
+残差策略是“**以 teacher 为默认值，但允许超过 teacher**”。
 
-* `assoc_unfair_gu_threshold: 15`
-* `uav_spawn_curriculum_enabled: false`
-* `uav_safe_random_init_enabled: true`
-* `uav_init_boundary_margin_steps: 3.0`
-* `uav_init_speed_frac: 0.2`
-* `uav_init_min_spacing: 20.0`
+如果某些状态下 heuristic 不够好，残差可以修正；
+如果 teacher 已经很好，残差就学成接近 0。
 
-bw 配置里却还是：
-
-* `uav_spawn_curriculum_enabled: true`
-* 没有 safe init 这一组
-* 没有 `assoc_unfair_gu_threshold`
-
-这说明 **环境分布本身也没同步**。 
-
-这一点我非常建议你重视，因为你现在是想做：
-
-> 在现有 accel-only 基础上训练 bw
-
-那就意味着 **bw 阶段的环境分布最好尽量和“accel 已经学好的那套运行分布”一致**，否则 accel 学到的位置控制规律，和 bw 训练时看到的轨迹/碰撞/初始化分布不一致，会把后续 credit assignment 搅乱。
-
-所以我建议 bw 先改成更接近 accel：
-
-```yaml
-assoc_unfair_gu_threshold: 15
-
-uav_spawn_curriculum_enabled: false
-uav_safe_random_init_enabled: true
-uav_init_boundary_margin_steps: 3.0
-uav_init_speed_frac: 0.2
-uav_init_min_spacing: 20.0
-```
+这比“完全自由输出 logits”稳定得多，也比“只蒸馏”更有机会超过。
 
 ---
 
-### 4) 学习率拆分保留
+## 如果你只剩有限训练机会，这条线怎么做
 
-这项你 bw 已经和 accel 一致了：
+### 最推荐的实现形式
 
-* `actor_lr: 1e-4`
-* `critic_lr: 2e-4`
+直接在执行端做：
 
-这个保留就行。 
+[
+\text{logits}*{exec} = \text{logits}*{heuristic} + \alpha \cdot \Delta_\theta
+]
 
----
+其中：
 
-### 5) reward norm 关闭保留
+* `logits_heuristic`：就是现在 `queue_aware_bw` 生成的 logits
+* `Δθ`：policy 输出的残差 logits
+* `α`：一个较小的残差系数，比如 `0.3` 或 `0.5`
 
-这项也已经一致：
+再加一层 clip：
 
-* `reward_norm_enabled: false`
+* 把残差 clip 到较小范围，比如 `[-1, 1]` 或 `[-2, 2]`
 
-继续保持。 
+### 这有什么好处
 
----
+它会天然保证：
 
-## 二、不要机械照搬 accel，而是要按“bw 任务”单独判断的项
-
-### 1) danger imitation 不建议直接照搬
-
-accel 配置里：
-
-* `danger_imitation_enabled: true`
-* `danger_imitation_coef: 0.1`
-
-bw 配置里：
-
-* `danger_imitation_enabled: false`
-
-这里我**不建议你直接照搬成 true**。 
-
-原因很简单：
-danger imitation 本质上更像是**碰撞/近距离风险下的 accel 安全先验**。如果你现在训练的是 bw，而 accel 是固定执行的，那么这个 imitation loss 很可能：
-
-* 要么根本不作用在 bw head 上
-* 要么通过共享 backbone 间接扰动表示学习
-* 要么只会制造额外梯度噪声
-
-所以这项必须看代码后才能定，不能光看 yaml 决定。
+* 初始就不比 heuristic 差太远
+* policy 不容易把强基线扰坏
+* 学习目标更聚焦：只改 teacher 的不足之处
 
 ---
 
-### 2) `exec_accel_source` 不能再用 `zero`
+## 方向 2：让 reward 只奖“比 heuristic 好了多少”
 
-你现在这份 bw 配置里写的是：
+如果你真想超过 `queue_aware_bw`，一个更直接的想法是不要再优化绝对 reward，而是优化**相对 heuristic 的改进**。
 
-```yaml
-train_accel: false
-train_bw: true
-exec_accel_source: zero
-exec_bw_source: policy
-```
+概念上像这样：
 
-如果你真的是“在现有 accel-only 基础上训练 bw”，那这里大概率不应该是 `zero`，而应该让 accel 来自**已训练好的 accel policy**。
+[
+r' = r(\text{policy}) - r(\text{queue_aware})
+]
 
-这是我目前看到的**最关键问题之一**。
+或者更实际一点，在同一状态下用 heuristic rollout 作为 baseline。
+但这通常实现更麻烦，因为你需要：
 
-因为 `exec_accel_source: zero` 的意思很可能是：
+* 同状态对照
+* 或额外 rollout
+* 或 teacher value / teacher action baseline
 
-* UAV 不再执行你训练好的机动策略
-* 而是用“零加速度 / no-op accel”跑环境
-
-那这样训练出来的 bw，学到的是“静态/近静态 accel 行为下的最优带宽分配”，**不是你想要的“建立在已学好 accel 基础上的 bw”**。
-
-这里我怀疑你真正需要的是类似下面这种口径：
-
-```yaml
-train_accel: false
-train_bw: true
-train_sat: false
-
-exec_accel_source: teacher   # 或 policy / frozen_policy，具体看代码定义
-exec_teacher_actor_path: <stage1_accel_actor.pt>
-exec_teacher_deterministic: true
-
-exec_bw_source: policy
-exec_sat_source: zero
-```
-
-但具体 `exec_accel_source` 可选值是什么，必须看代码。
+如果你代码时间有限，这个不如“残差策略”现实。
 
 ---
 
-### 3) `train_shared_backbone: true` 要不要保留，要看实现
+## 方向 3：直接把 heuristic 的结构写进网络
 
-你现在 bw 配置是：
+你现在 heuristic 本质上是：
 
-```yaml
-train_shared_backbone: true
-```
+[
+\beta_i \propto q_i(0.5+\eta_i)(1+\text{bonus}\cdot prev_i)
+]
 
-如果 actor 的 accel head 和 bw head 共享一个 backbone，那么当你只训练 bw 时，有两种可能：
+如果你非常想让 learned 方法超过它，一个更“模型化”的办法是：
 
-* **可能是好的**：bw 能利用 accel 阶段学到的空间结构特征
-* **也可能有坑**：bw 更新把原来 accel 已经学好的表示冲坏，之后再做 joint 或 sat stage 会出问题
+* 不让网络直接输出每个用户的最终 logits
+* 而是让网络输出这几个因素的**可学习权重或修正项**
 
-所以这一项不能只靠经验判断，必须看代码里：
+例如让网络学：
 
-* “只训练 bw”时，shared backbone 是否仍然参与反传
-* accel head 是否被冻结
-* shared encoder 是否被冻结
-* optimizer 参数组是怎么构造的
+[
+\logit_i = a \log(q_i+\epsilon) + b \log(0.5+\eta_i) + c,prev_i + d_i
+]
 
-这一点我会把它列进“必须看代码”的第一优先级。
+或者学这些系数随状态变化。
 
----
-
-## 三、我认为你现在最可能需要的 bw 配置方向
-
-如果你的目标真的是：
-
-> 先训好 accel，再在这个基础上训 bw
-
-那我建议你的 bw 配置方向不是“from scratch bw-only”，而是“**frozen accel execution + train bw**”。
-
-也就是概念上改成：
-
-```yaml
-enable_bw_action: true
-train_accel: false
-train_bw: true
-train_sat: false
-
-# accel 用已训练好的 stage1 actor 执行
-exec_accel_source: <teacher/frozen_policy/loaded_actor>
-exec_teacher_actor_path: runs/.../actor.pt
-exec_teacher_deterministic: true
-
-# bw 仍由当前策略学习
-exec_bw_source: policy
-exec_sat_source: zero
-
-# 同步 accel 中验证过的训练稳定项
-gamma: 0.9975
-gae_lambda: 0.95
-reward_norm_enabled: false
-actor_lr: 1e-4
-critic_lr: 2e-4
-kl_stop: true
-target_kl: 0.02
-
-# 同步环境分布
-uav_spawn_curriculum_enabled: false
-uav_safe_random_init_enabled: true
-uav_init_boundary_margin_steps: 3.0
-uav_init_speed_frac: 0.2
-uav_init_min_spacing: 20.0
-assoc_unfair_gu_threshold: 15
-```
-
-也就是说，**最重要的不是把所有字段抄过去，而是把“执行的 accel 来源”从 zero 改成已训练 accel**。
+这会比纯黑盒 head 更容易逼近 heuristic，甚至超过它。
+但这已经属于结构改模型了。
 
 ---
 
-## 四、我还需要看的代码
+# 为什么你现在这条线难超过 heuristic
 
-为了把这个事判断准，我下一步最需要你给我这几部分代码。按优先级排：
+因为你现在 learned bw 在做的是：
 
-### 1) action 执行源的分发逻辑
+* 从共享编码中隐式提取 `q, eta, prev`
+* 再自己学会它们怎么组合
+* 再通过弱 reward 发现这个组合是否比 heuristic 更好
 
-我最想先看这部分，确认这些配置到底怎么生效：
+而 heuristic 是：
 
-* `exec_accel_source`
-* `exec_bw_source`
-* `exec_sat_source`
-* `exec_teacher_actor_path`
-* `exec_teacher_deterministic`
-* `train_accel / train_bw / train_sat`
+* 直接用 `q, eta, prev`
+* 显式按一个合理公式组合
+* 即时输出动作
 
-对应通常会在这些位置之一：
+后者对这个子任务天然占优。
 
-* `train.py`
-* `mappo.py`
-* `policy.py`
-* `action_assembler.py`
-* 和环境 `step()` 前组装 action 的那段代码
+所以如果你还坚持“训练出来的方法更好”，最合理的路径不是继续和 heuristic 正面硬拼，而是：
 
-我想确认的是：
-
-* `zero` 到底是不是“全零动作”
-* 是否支持“accel 用 teacher、bw 用 policy”
-* teacher actor 是整网输出还是只输出 accel head
-* 单独训 bw 时，采样的 logprob 是不是只算 bw 那部分
+> **把 heuristic 作为底座，让 learned 方法只学补丁。**
 
 ---
 
-### 2) policy / actor 的多头结构
+# 我给你的最现实建议
 
-我需要看：
+## 如果你还能改训练逻辑和执行逻辑
 
-* shared backbone
-* accel head
-* bw head
-* sat head
-* forward 时哪些 head 被调用
-* logprob / entropy 怎么分解
-* `train_shared_backbone` 怎么控制
+我最推荐你做成：
 
-这里主要判断：
+### 残差 bw 策略
 
-* bw 训练会不会把 accel 表征带坏
-* 只训 bw 时 entropy 和 PPO ratio 是不是只对 bw 分量算
-* 是否存在“未训练 head 仍参与 loss/entropy”的问题
+* `exec_bw_source` 不再是纯 `policy`
+* 而是 `heuristic + residual_policy`
 
----
+即：
 
-### 3) PPO loss 组装代码
+1. 先算 `queue_aware_bw` 的 logits
+2. policy 输出 `delta_bw_logits`
+3. 执行时相加后再 clip / softmax
 
-我需要看 `mappo.py` 里：
+### 同时加一个残差正则
 
-* actor loss
-* entropy loss
-* imitation / danger imitation loss
-* mask 哪些 action 维度参与训练
-* checkpoint eval / early stop 逻辑
+在 loss 里加一项，鼓励残差不要太大：
 
-重点确认：
+[
+L_{res} = |\Delta_\theta|^2
+]
 
-* 只训 bw 时，danger imitation 是否还会影响 shared encoder
-* KL stop 是按总 action 还是只按可训练 action 统计
-* entropy 是全动作熵还是只算 bw 熵
+或者直接对残差幅度做 L2 惩罚。
 
----
+这样训练会更稳，也更符合“只修正 heuristic”的目标。
 
-### 4) 环境里 bw 动作的实际语义
+### reward
 
-你前面说过 bw 头不是直接 softmax，而是环境里再转成分配权重。这个地方我也需要再看一次完整链路：
+reward 不需要再折腾太多，我建议就用你目前最有用的那类：
 
-* policy 输出什么
-* action_assembler 怎么打包
-* env 里怎么从 `bw_logits` 变成带宽比例
-* 是否有裁剪、归一化、mask、无效候选处理
+* `T_access - 0.05 Q_gu`
+* 或 `T_access + T_backhaul - 0.05 Q_gu`
 
-因为 bw 训练是否稳定，常常就死在这里，比如：
+如果是 residual，我更倾向第一种更干净的：
+[
+r = T_{access} - 0.05Q_{gu}
+]
 
-* 某些维度经常无效
-* softmax 温度过硬
-* 候选数变化导致梯度尺度乱跳
-* 分配后大部分带宽落到无意义链路上
+因为你本来就只想让 bw 优化前端。
 
 ---
 
-## 五、你现在可以直接先改的地方
+## 如果你不能改执行结构太多
 
-不等代码，我建议你先把 bw yaml 至少改这几项：
+次优方案是：
 
-```yaml
-# 先补齐 PPO 稳定项
-gamma: 0.9975
-gae_lambda: 0.95
-kl_stop: true
-target_kl: 0.02
+* imitation target 用 `queue_aware_logits`
+* **policy 输出不是最终 logits，而是 residual**
+* 初始 residual 为 0
+* imitation target 也是 0（因为目标是先复制 heuristic）
+* RL 再从 0 残差附近微调
 
-# 先对齐环境分布
-assoc_unfair_gu_threshold: 15
-uav_spawn_curriculum_enabled: false
-uav_safe_random_init_enabled: true
-uav_init_boundary_margin_steps: 3.0
-uav_init_speed_frac: 0.2
-uav_init_min_spacing: 20.0
-```
-
-然后最关键的是，把这项别再留成：
-
-```yaml
-exec_accel_source: zero
-```
-
-这项我目前判断**大概率必须改**，否则它不是“基于已学好 accel 训 bw”。
+这实际上还是残差思想，只是放进 loss 里。
 
 ---
 
-把下面几段代码贴给我就够了，我可以直接帮你给出“bw 阶段最终该怎么配”的精确版本：
+# 你要接受的一点现实
 
-1. `policy.py` 里 actor 多头 forward、logprob、entropy 那几段
-2. `mappo.py` 里 action sampling / PPO loss / danger imitation 那几段
-3. `action_assembler.py` 全文件
-4. 环境里把 `bw_logits` 变成实际带宽分配的那段
-5. 配置解析里 `exec_accel_source / train_bw / train_shared_backbone` 这些字段是怎么用的那段
+如果你坚持“训练出来的方法一定要比 heuristic 好”，那你就得允许：
+
+* 用 heuristic 当 teacher
+* 用 heuristic 当执行底座
+* 用 heuristic 作为结构先验
+
+否则你是在要求 PPO 从一个比它更适合这个子问题的规则手里，凭弱 reward 反超，这本来就不公平。
+
+所以**超过 heuristic 的最合理方式，不是摆脱 heuristic，而是站在 heuristic 肩膀上。**
+
+---
+
+# 最后一枪我会怎么选
+
+如果现在让我替你选一条最有可能超过 `queue_aware_bw` 的路线，我会选：
+
+### 最优先
+
+**Residual Queue-Aware BW**
+
+* 执行：`bw = heuristic_bw + residual_bw`
+* 初始 residual = 0
+* 残差幅度限制较小
+* reward：`T_access - 0.05 Q_gu`
+* 低噪声配置保持不变
+* backbone 继续冻结
+
+这是我觉得你现在最有机会赢 heuristic 的方法。
+
+---
+
+如果你愿意，我下一条可以直接给你写成**具体到代码接口级别**的改法：
+包括 `action_assembler / mappo rollout / loss` 应该怎么最小改动支持 `heuristic + residual bw`。
+
+注意：1. 不要并行读取
+2. 执行代码前先激活虚拟环境

@@ -563,6 +563,7 @@ class SaginParallelEnv(ParallelEnv):
             "term_q_delta": 0.0,
             "term_throughput_access": 0.0,
             "term_throughput_backhaul": 0.0,
+            "term_queue_gu_arrival": 0.0,
             "term_centroid": 0.0,
             "term_bw_align": 0.0,
             "term_sat_score": 0.0,
@@ -2086,9 +2087,16 @@ class SaginParallelEnv(ParallelEnv):
             tail_eta_accel = tail_eta_accel * tail_eta_accel_gain
 
         if reward_mode == "throughput_only":
+            throughput_only_access_coef = float(getattr(cfg, "throughput_only_access_coef", 1.0) or 0.0)
+            throughput_only_backhaul_coef = float(getattr(cfg, "throughput_only_backhaul_coef", 1.0) or 0.0)
             term_service = 0.0
-            term_throughput_access = throughput_access_norm
-            term_throughput_backhaul = throughput_backhaul_norm
+            term_throughput_access = throughput_only_access_coef * throughput_access_norm
+            term_throughput_backhaul = throughput_only_backhaul_coef * throughput_backhaul_norm
+            throughput_only_gu_queue_coef = max(
+                float(getattr(cfg, "throughput_only_gu_queue_coef", 0.0) or 0.0),
+                0.0,
+            )
+            term_queue_gu_arrival = -throughput_only_gu_queue_coef * gu_queue_arrival_steps
             eta_drop_default = 0.0
             eta_drop_gu = 0.0
             eta_drop_uav = 0.0
@@ -2107,13 +2115,14 @@ class SaginParallelEnv(ParallelEnv):
             term_accel = 0.0
             term_close_risk = 0.0
             term_energy = 0.0
-            raw_reward = term_throughput_access + term_throughput_backhaul
+            raw_reward = term_throughput_access + term_throughput_backhaul + term_queue_gu_arrival
         else:
             term_service = cfg.eta_service * service_norm
             term_throughput_access = float(getattr(cfg, "eta_throughput_access", 0.0) or 0.0) * throughput_access_norm
             term_throughput_backhaul = (
                 float(getattr(cfg, "eta_throughput_backhaul", 0.0) or 0.0) * throughput_backhaul_norm
             )
+            term_queue_gu_arrival = 0.0
             eta_drop_default = float(getattr(cfg, "eta_drop", 0.0) or 0.0)
             eta_drop_gu = float(
                 eta_drop_default
@@ -2276,6 +2285,7 @@ class SaginParallelEnv(ParallelEnv):
             "term_q_delta": term_q_delta,
             "term_throughput_access": term_throughput_access,
             "term_throughput_backhaul": term_throughput_backhaul,
+            "term_queue_gu_arrival": term_queue_gu_arrival,
             "term_dist": term_dist,
             "term_dist_delta": term_dist_delta,
             "term_centroid": term_centroid,

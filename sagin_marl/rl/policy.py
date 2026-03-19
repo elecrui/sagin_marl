@@ -109,7 +109,11 @@ class ActorNet(nn.Module):
         self.cfg = cfg
         self.enable_bw = cfg.enable_bw_action
         self.enable_sat = not cfg.fixed_satellite_strategy
-        self.bw_scale = float(cfg.bw_logit_scale)
+        bw_exec_source = str(getattr(cfg, "exec_bw_source", "policy") or "policy").strip().lower()
+        if bw_exec_source == "heuristic_residual":
+            self.bw_scale = float(getattr(cfg, "bw_residual_clip", 1.0) or 1.0)
+        else:
+            self.bw_scale = float(cfg.bw_logit_scale)
         self.sat_scale = float(cfg.sat_logit_scale)
         self.danger_nbr_enabled = bool(getattr(cfg, "danger_nbr_enabled", False))
         self.obs_dim = int(obs_dim)
@@ -184,7 +188,11 @@ class ActorNet(nn.Module):
 
         if self.enable_bw:
             self.bw_head = nn.Linear(cfg.actor_hidden, cfg.users_obs_max)
-            self.bw_log_std = nn.Parameter(torch.zeros(cfg.users_obs_max))
+            if bool(getattr(cfg, "bw_head_zero_init", False)):
+                nn.init.zeros_(self.bw_head.weight)
+                nn.init.zeros_(self.bw_head.bias)
+            bw_log_std_init = float(getattr(cfg, "bw_log_std_init", 0.0) or 0.0)
+            self.bw_log_std = nn.Parameter(torch.full((cfg.users_obs_max,), bw_log_std_init, dtype=torch.float32))
         else:
             self.bw_head = None
             self.bw_log_std = None

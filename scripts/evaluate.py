@@ -113,7 +113,7 @@ def _baseline_actions(
 
 def _normalize_exec_source(raw: str | None) -> str:
     src = str("policy" if raw is None else raw).strip().lower()
-    allowed = {"policy", "teacher", "heuristic", "zero"}
+    allowed = {"policy", "teacher", "heuristic", "zero", "heuristic_residual"}
     if src not in allowed:
         raise ValueError(f"Invalid exec source '{raw}'. Allowed: {sorted(allowed)}")
     return src
@@ -133,6 +133,37 @@ def _select_exec_values(
     if source == "heuristic" and heuristic_values is not None:
         return np.asarray(heuristic_values, dtype=np.float32)
     return np.zeros(shape, dtype=np.float32)
+
+
+def _source_needs_heuristic(source: str) -> bool:
+    return source in {"heuristic", "heuristic_residual"}
+
+
+def _compose_bw_exec_values(
+    source: str,
+    policy_values: np.ndarray | None,
+    teacher_values: np.ndarray | None,
+    heuristic_values: np.ndarray | None,
+    shape: tuple[int, int],
+    cfg,
+) -> np.ndarray:
+    if source != "heuristic_residual":
+        return _select_exec_values(source, policy_values, teacher_values, heuristic_values, shape)
+    if heuristic_values is None:
+        raise ValueError("exec_bw_source='heuristic_residual' requires heuristic bw logits.")
+    heur = np.asarray(heuristic_values, dtype=np.float32)
+    delta = (
+        np.asarray(policy_values, dtype=np.float32)
+        if policy_values is not None
+        else np.zeros(shape, dtype=np.float32)
+    )
+    residual_clip = max(float(getattr(cfg, "bw_residual_clip", 1.0) or 0.0), 0.0)
+    if residual_clip > 0.0:
+        delta = np.clip(delta, -residual_clip, residual_clip)
+    alpha = float(getattr(cfg, "bw_residual_alpha", 0.5) or 0.0)
+    out = heur + alpha * delta
+    bw_limit = float(getattr(cfg, "bw_logit_scale", 1.0) or 1.0)
+    return np.clip(out, -bw_limit, bw_limit).astype(np.float32, copy=False)
 
 
 def _hybrid_bw_sat_actions(
@@ -276,7 +307,9 @@ def main():
     exec_sat_source = _normalize_exec_source(getattr(cfg, "exec_sat_source", "policy"))
     teacher_deterministic = bool(getattr(cfg, "exec_teacher_deterministic", True))
     need_teacher_exec = "teacher" in {exec_accel_source, exec_bw_source, exec_sat_source}
-    need_heuristic_exec = "heuristic" in {exec_accel_source, exec_bw_source, exec_sat_source}
+    need_heuristic_exec = any(
+        _source_needs_heuristic(src) for src in (exec_accel_source, exec_bw_source, exec_sat_source)
+    )
     if not use_baseline:
         obs, _ = env.reset()
         obs_dim = batch_flatten_obs(list(obs.values()), cfg).shape[1]
@@ -457,12 +490,13 @@ def main():
                     bw_logits = None
                     sat_logits = None
                     if cfg.enable_bw_action:
-                        bw_logits = _select_exec_values(
+                        bw_logits = _compose_bw_exec_values(
                             exec_bw_source,
                             policy_bw,
                             teacher_bw,
                             heur_bw,
                             (len(env.agents), cfg.users_obs_max),
+                            cfg,
                         )
                     if not cfg.fixed_satellite_strategy:
                         sat_logits = _select_exec_values(

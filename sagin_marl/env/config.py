@@ -222,6 +222,12 @@ class SaginConfig:
     # Action logit scales
     bw_logit_scale: float = 5.0
     sat_logit_scale: float = 5.0
+    bw_residual_alpha: float = 0.5
+    bw_residual_clip: float = 1.0
+    bw_residual_l2_coef: float = 0.0
+    bw_head_zero_init: bool = False
+    bw_log_std_init: float = 0.0
+    bw_log_std_trainable: bool = True
 
     # Baseline heuristics (queue_aware)
     baseline_accel_gain: float = 2.0
@@ -239,6 +245,9 @@ class SaginConfig:
 
     # Reward shaping
     reward_mode: str = "dense"  # "dense" or "throughput_only"
+    throughput_only_access_coef: float = 1.0
+    throughput_only_backhaul_coef: float = 1.0
+    throughput_only_gu_queue_coef: float = 0.0
     omega_q: float = 0.6
     omega_q_gu: float = 1.0
     omega_q_uav: float = 0.0
@@ -324,6 +333,7 @@ class SaginConfig:
     imitation_enabled: bool = False
     imitation_coef: float = 0.0
     imitation_coef_final: float | None = None
+    imitation_coef_decay_start_update: int = 0
     imitation_coef_decay_updates: int = 0
     imitation_accel: bool = True
     imitation_bw: bool = True
@@ -338,7 +348,7 @@ class SaginConfig:
     train_sat: bool | None = None
     train_shared_backbone: bool = True
     exec_accel_source: str = "policy"  # policy|teacher|heuristic|zero
-    exec_bw_source: str = "policy"  # policy|teacher|heuristic|zero
+    exec_bw_source: str = "policy"  # policy|teacher|heuristic|zero|heuristic_residual
     exec_sat_source: str = "policy"  # policy|teacher|heuristic|zero
     exec_teacher_actor_path: str | None = None
     exec_teacher_deterministic: bool = True

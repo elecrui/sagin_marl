@@ -1,10 +1,9 @@
-# Stage 3: sat-only training on top of the trained stage2 accel+bw policy.
-# Train:
-#   python scripts/train.py --config configs/phase1_actions_curriculum_stage3_sat.yaml --updates 500 --log_dir runs/phase1_actions --run_id stage3_sat_from_stage2_bw_u1500_sat144 --init_actor runs/phase1_actions/stage2_bw_from_stage1_accel_teacher_resbw_a05_clip1_l2e2_no_backhaul_gupen005_u1500/actor.pt --init_critic runs/phase1_actions/stage2_bw_from_stage1_accel_teacher_resbw_a05_clip1_l2e2_no_backhaul_gupen005_u1500/critic.pt
-# Notes:
-#   - Keep env and PPO settings aligned with stage2 bw training.
-#   - Only open sat action, increase the real constellation size, and switch reward focus to backhaul.
-#   - Keep visible_sats_max == sats_obs_max so sat candidates and sat-head logits stay one-to-one.
+# Stage-2 bw-only residual training with:
+#   - accel executes from the fixed stage1 teacher
+#   - bw executes as queue-aware logits plus a small learned residual
+#   - throughput-only reward uses access only plus GU queue penalty
+#   - shared backbone remains frozen
+#   - bw head starts at zero residual logits, bw_log_std is frozen at -1.5
 seed: 42
 map_size: 1500.0
 tau0: 1.0
@@ -12,7 +11,7 @@ T_steps: 400
 
 num_uav: 3
 num_gu: 20
-num_sat: 144
+num_sat: 72
 walker_num_planes: 6
 sat_state_max: 9
 
@@ -81,18 +80,17 @@ fading_enabled: false
 interference_enabled: false
 
 enable_bw_action: true
-fixed_satellite_strategy: false
+fixed_satellite_strategy: true
 sat_select_mode: sample
 N_RF: 2
-sat_candidate_mode: elevation
 
 train_accel: false
-train_bw: false
-train_sat: true
+train_bw: true
+train_sat: false
 train_shared_backbone: false
 exec_accel_source: teacher
 exec_bw_source: heuristic_residual
-exec_sat_source: policy
+exec_sat_source: zero
 exec_teacher_actor_path: runs/phase1_actions/stage1_accel_throughput_only_q002_drop6_rec_norewardnorm_klstop002_ckpteval50_start200_es_u1500/actor.pt
 exec_teacher_deterministic: true
 
@@ -124,9 +122,9 @@ avoidance_eta_max: 5.0
 eta_crash: 0.0
 
 reward_mode: throughput_only
-throughput_only_access_coef: 0.0
-throughput_only_backhaul_coef: 1.0
-throughput_only_gu_queue_coef: 0.0
+throughput_only_access_coef: 1.0
+throughput_only_backhaul_coef: 0.0
+throughput_only_gu_queue_coef: 0.05
 omega_q: 0.0
 omega_q_gu: 0.0
 omega_q_uav: 0.0
@@ -139,7 +137,7 @@ eta_drop_step: 0.0
 eta_service: 0.0
 eta_assoc: 0.0
 eta_q_delta: 0.0
-eta_throughput_access: 0.0
+eta_throughput_access: 1.0
 eta_throughput_backhaul: 1.0
 eta_accel: 0.0
 close_risk_enabled: false

@@ -136,7 +136,7 @@ def _sum_selected_parts(parts: Dict[str, torch.Tensor], train_heads: Dict[str, b
 
 def _normalize_exec_source(raw: str | None) -> str:
     src = str("policy" if raw is None else raw).strip().lower()
-    allowed = {"policy", "teacher", "heuristic", "zero"}
+    allowed = {"policy", "teacher", "heuristic", "zero", "heuristic_residual"}
     if src not in allowed:
         raise ValueError(f"Invalid exec source '{raw}'. Allowed: {sorted(allowed)}")
     return src
@@ -164,6 +164,53 @@ def _select_exec_values(
     if source == "heuristic" and heuristic_values is not None:
         return np.asarray(heuristic_values, dtype=np.float32)
     return np.zeros(shape, dtype=np.float32)
+
+
+def _source_needs_heuristic(source: str) -> bool:
+    return source in {"heuristic", "heuristic_residual"}
+
+
+def _compose_bw_exec_values(
+    source: str,
+    policy_values: np.ndarray | None,
+    teacher_values: np.ndarray | None,
+    heuristic_values: np.ndarray | None,
+    shape: Tuple[int, int],
+    cfg,
+) -> np.ndarray:
+    if source != "heuristic_residual":
+        return _select_exec_values(source, policy_values, teacher_values, heuristic_values, shape)
+    if heuristic_values is None:
+        raise ValueError("exec_bw_source='heuristic_residual' requires heuristic bw logits.")
+    heur = np.asarray(heuristic_values, dtype=np.float32)
+    delta = (
+        np.asarray(policy_values, dtype=np.float32)
+        if policy_values is not None
+        else np.zeros(shape, dtype=np.float32)
+    )
+    residual_clip = max(float(getattr(cfg, "bw_residual_clip", 1.0) or 0.0), 0.0)
+    if residual_clip > 0.0:
+        delta = np.clip(delta, -residual_clip, residual_clip)
+    alpha = float(getattr(cfg, "bw_residual_alpha", 0.5) or 0.0)
+    out = heur + alpha * delta
+    bw_limit = float(getattr(cfg, "bw_logit_scale", 1.0) or 1.0)
+    return np.clip(out, -bw_limit, bw_limit).astype(np.float32, copy=False)
+
+
+def _compose_bw_train_action(
+    source: str,
+    policy_values: np.ndarray | None,
+    shape: Tuple[int, int],
+    cfg,
+) -> np.ndarray:
+    if policy_values is None:
+        return np.zeros(shape, dtype=np.float32)
+    out = np.asarray(policy_values, dtype=np.float32)
+    if source == "heuristic_residual":
+        residual_clip = max(float(getattr(cfg, "bw_residual_clip", 1.0) or 0.0), 0.0)
+        if residual_clip > 0.0:
+            out = np.clip(out, -residual_clip, residual_clip)
+    return out.astype(np.float32, copy=False)
 
 
 def _build_danger_imitation_step_data(stats: Dict[str, object], cfg, num_agents: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -443,12 +490,13 @@ def _checkpoint_eval_summary(
                         policy_bw = (
                             policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
                         )
-                        bw_logits = _select_exec_values(
+                        bw_logits = _compose_bw_exec_values(
                             exec_bw_source,
                             policy_bw,
                             teacher_bw,
                             heur_bw,
                             (len(eval_env.agents), cfg.users_obs_max),
+                            cfg,
                         )
                     if not cfg.fixed_satellite_strategy:
                         policy_sat = (
@@ -716,7 +764,9 @@ def train(
     actor.log_std.requires_grad = train_heads["accel"]
     _set_module_requires_grad(actor.bw_head, train_heads["bw"])
     if actor.bw_log_std is not None:
-        actor.bw_log_std.requires_grad = train_heads["bw"]
+        actor.bw_log_std.requires_grad = train_heads["bw"] and bool(
+            getattr(cfg, "bw_log_std_trainable", True)
+        )
     _set_module_requires_grad(actor.sat_head, train_heads["sat"])
     if actor.sat_log_std is not None:
         actor.sat_log_std.requires_grad = train_heads["sat"]
@@ -795,8 +845,10 @@ def train(
         "rollout_reward_per_step",
         "episode_term_throughput_access",
         "episode_term_throughput_backhaul",
+        "episode_term_queue_gu_arrival",
         "throughput_access_norm",
         "throughput_backhaul_norm",
+        "gu_queue_arrival_steps",
         "gu_queue_mean",
         "uav_queue_mean",
         "queue_total_active",
@@ -817,6 +869,7 @@ def train(
         "reward_rms_mean",
         "reward_rms_var",
         "danger_imitation_loss",
+        "residual_reg_loss",
         "danger_imitation_coef",
         "danger_imitation_active_rate",
         "log_std_mean",
@@ -835,8 +888,10 @@ def train(
         "rollout_reward_per_step",
         "episode_term_throughput_access",
         "episode_term_throughput_backhaul",
+        "episode_term_queue_gu_arrival",
         "throughput_access_norm",
         "throughput_backhaul_norm",
+        "gu_queue_arrival_steps",
         "gu_queue_mean",
         "uav_queue_mean",
         "queue_total_active",
@@ -848,6 +903,7 @@ def train(
         "approx_kl",
         "clip_frac",
         "danger_imitation_loss",
+        "residual_reg_loss",
         "danger_imitation_coef",
         "danger_imitation_active_rate",
     ]
@@ -856,8 +912,10 @@ def train(
         "rollout_reward_per_step",
         "episode_term_throughput_access",
         "episode_term_throughput_backhaul",
+        "episode_term_queue_gu_arrival",
         "throughput_access_norm",
         "throughput_backhaul_norm",
+        "gu_queue_arrival_steps",
         "gu_queue_mean",
         "uav_queue_mean",
         "queue_total_active",
@@ -878,14 +936,18 @@ def train(
         if imitation_coef_final_cfg is None
         else float(imitation_coef_final_cfg)
     )
+    imitation_coef_decay_start_update = int(getattr(cfg, "imitation_coef_decay_start_update", 0) or 0)
     imitation_coef_decay_updates = int(getattr(cfg, "imitation_coef_decay_updates", 0) or 0)
 
     def _imitation_coef_at(update_idx: int) -> float:
         if imitation_coef_decay_updates <= 0:
             return imitation_coef_start
+        if update_idx < imitation_coef_decay_start_update:
+            return imitation_coef_start
         progress = min(
             1.0,
-            float(max(update_idx, 0)) / float(max(imitation_coef_decay_updates - 1, 1)),
+            float(max(update_idx - imitation_coef_decay_start_update, 0))
+            / float(max(imitation_coef_decay_updates - 1, 1)),
         )
         return imitation_coef_start + (imitation_coef_final - imitation_coef_start) * progress
 
@@ -900,20 +962,24 @@ def train(
     imitation_accel = bool(getattr(cfg, "imitation_accel", True)) and train_heads["accel"]
     imitation_bw = bool(getattr(cfg, "imitation_bw", True)) and train_heads["bw"]
     imitation_sat = bool(getattr(cfg, "imitation_sat", False)) and train_heads["sat"]
+    bw_residual_enabled = str(getattr(cfg, "exec_bw_source", "policy") or "policy").strip().lower() == "heuristic_residual"
+    bw_residual_l2_coef = max(float(getattr(cfg, "bw_residual_l2_coef", 0.0) or 0.0), 0.0)
     imitation_coef_curr = _imitation_coef_at(resume_update)
     imitation_enabled_curr = imitation_enabled and imitation_coef_curr > 0.0
     danger_imitation_coef = max(float(getattr(cfg, "danger_imitation_coef", 0.0) or 0.0), 0.0)
     danger_imitation_enabled = bool(getattr(cfg, "danger_imitation_enabled", False)) and danger_imitation_coef > 0.0
     if danger_imitation_enabled and not train_heads["accel"]:
         raise ValueError("danger_imitation_enabled=true requires train_accel=true")
-    bw_scale = float(getattr(cfg, "bw_logit_scale", 1.0) or 1.0)
+    bw_scale = float(getattr(actor, "bw_scale", getattr(cfg, "bw_logit_scale", 1.0)) or 1.0)
     sat_scale = float(getattr(cfg, "sat_logit_scale", 1.0) or 1.0)
     exec_accel_source = _normalize_exec_source(getattr(cfg, "exec_accel_source", "policy"))
     exec_bw_source = _normalize_exec_source(getattr(cfg, "exec_bw_source", "policy"))
     exec_sat_source = _normalize_exec_source(getattr(cfg, "exec_sat_source", "policy"))
     teacher_deterministic = bool(getattr(cfg, "exec_teacher_deterministic", True))
     need_teacher_exec = "teacher" in {exec_accel_source, exec_bw_source, exec_sat_source}
-    need_heuristic_exec = "heuristic" in {exec_accel_source, exec_bw_source, exec_sat_source}
+    need_heuristic_exec = any(
+        _source_needs_heuristic(src) for src in (exec_accel_source, exec_bw_source, exec_sat_source)
+    )
 
     teacher_actor = None
     if need_teacher_exec:
@@ -1012,7 +1078,10 @@ def train(
             parts.append(np.zeros_like(base_accel))
         if cfg.enable_bw_action:
             if imitation_bw:
-                parts.append(base_bw)
+                if bw_residual_enabled:
+                    parts.append(np.zeros_like(base_bw))
+                else:
+                    parts.append(base_bw)
             else:
                 parts.append(np.zeros_like(base_bw))
         if not cfg.fixed_satellite_strategy:
@@ -1028,12 +1097,14 @@ def train(
     episode_return_env = np.zeros((num_envs,), dtype=np.float64)
     episode_term_throughput_access_env = np.zeros((num_envs,), dtype=np.float64)
     episode_term_throughput_backhaul_env = np.zeros((num_envs,), dtype=np.float64)
+    episode_term_queue_gu_arrival_env = np.zeros((num_envs,), dtype=np.float64)
     episode_collision_env = np.zeros((num_envs,), dtype=np.float32)
     episode_stat_window = max(1, int(getattr(cfg, "train_episode_stat_window", 100) or 100))
     recent_episode_returns: deque[float] = deque(maxlen=episode_stat_window)
     recent_episode_lengths: deque[float] = deque(maxlen=episode_stat_window)
     recent_episode_term_throughput_access: deque[float] = deque(maxlen=episode_stat_window)
     recent_episode_term_throughput_backhaul: deque[float] = deque(maxlen=episode_stat_window)
+    recent_episode_term_queue_gu_arrival: deque[float] = deque(maxlen=episode_stat_window)
     recent_episode_collisions: deque[float] = deque(maxlen=episode_stat_window)
     for local_update in range(total_updates):
         update = resume_update + local_update
@@ -1089,6 +1160,7 @@ def train(
         r_term_service_sum = 0.0
         r_term_throughput_access_sum = 0.0
         r_term_throughput_backhaul_sum = 0.0
+        r_term_queue_gu_arrival_sum = 0.0
         r_term_drop_sum = 0.0
         r_term_drop_gu_sum = 0.0
         r_term_drop_uav_sum = 0.0
@@ -1108,6 +1180,7 @@ def train(
         r_term_close_risk_sum = 0.0
         imitation_loss_sum = 0.0
         danger_imitation_loss_sum = 0.0
+        residual_reg_loss_sum = 0.0
         reward_raw_sum = 0.0
         arrival_sum_sum = 0.0
         outflow_sum_sum = 0.0
@@ -1232,6 +1305,7 @@ def train(
             action_dicts = []
             accel_cmd_list: List[np.ndarray] = []
             bw_exec_list: List[np.ndarray | None] = []
+            bw_policy_action_list: List[np.ndarray | None] = []
             sat_exec_list: List[np.ndarray | None] = []
             for env_idx in range(num_envs):
                 sl = slice(env_idx * num_agents, (env_idx + 1) * num_agents)
@@ -1265,15 +1339,24 @@ def train(
                     sats_mask = sats_mask * doppler_ok
 
                 bw_exec = None
+                bw_policy_action = None
                 if cfg.enable_bw_action:
-                    bw_raw = _select_exec_values(
+                    bw_policy_action = _compose_bw_train_action(
+                        exec_bw_source,
+                        bw_policy_env,
+                        (len(obs_list), cfg.users_obs_max),
+                        cfg,
+                    )
+                    bw_raw = _compose_bw_exec_values(
                         exec_bw_source,
                         bw_policy_env,
                         bw_teacher_env,
                         heur_bw,
                         (len(obs_list), cfg.users_obs_max),
+                        cfg,
                     )
                     bw_exec = bw_raw * users_mask
+                    bw_policy_action = bw_policy_action * users_mask
 
                 sat_exec = None
                 if not cfg.fixed_satellite_strategy:
@@ -1296,6 +1379,7 @@ def train(
                 action_dicts.append(action_dict)
                 accel_cmd_list.append(accel_cmd)
                 bw_exec_list.append(bw_exec)
+                bw_policy_action_list.append(bw_policy_action)
                 sat_exec_list.append(sat_exec)
             action_pack_time += time.perf_counter() - action_pack_start
 
@@ -1337,7 +1421,10 @@ def train(
                 accel_exec_norm = np.clip(accel_exec_norm, -1.0, 1.0).astype(np.float32, copy=False)
                 exec_parts = [accel_exec_norm]
                 if cfg.enable_bw_action and bw_exec_list[env_idx] is not None:
-                    exec_parts.append(bw_exec_list[env_idx])
+                    if exec_bw_source == "heuristic_residual" and bw_policy_action_list[env_idx] is not None:
+                        exec_parts.append(bw_policy_action_list[env_idx])
+                    else:
+                        exec_parts.append(bw_exec_list[env_idx])
                 if not cfg.fixed_satellite_strategy and sat_exec_list[env_idx] is not None:
                     exec_parts.append(sat_exec_list[env_idx])
                 action_vec_exec_env.append(np.concatenate(exec_parts, axis=1).astype(np.float32, copy=False))
@@ -1494,10 +1581,13 @@ def train(
                     r_term_service_sum += float(parts.get("term_service", 0.0))
                     term_throughput_access = float(parts.get("term_throughput_access", 0.0))
                     term_throughput_backhaul = float(parts.get("term_throughput_backhaul", 0.0))
+                    term_queue_gu_arrival = float(parts.get("term_queue_gu_arrival", 0.0))
                     r_term_throughput_access_sum += term_throughput_access
                     r_term_throughput_backhaul_sum += term_throughput_backhaul
+                    r_term_queue_gu_arrival_sum += term_queue_gu_arrival
                     episode_term_throughput_access_env[env_idx] += term_throughput_access
                     episode_term_throughput_backhaul_env[env_idx] += term_throughput_backhaul
+                    episode_term_queue_gu_arrival_env[env_idx] += term_queue_gu_arrival
                     r_term_drop_sum += float(parts.get("term_drop", 0.0))
                     r_term_drop_gu_sum += float(parts.get("term_drop_gu", 0.0))
                     r_term_drop_uav_sum += float(parts.get("term_drop_uav", 0.0))
@@ -1546,12 +1636,16 @@ def train(
                     recent_episode_term_throughput_backhaul.append(
                         float(episode_term_throughput_backhaul_env[env_idx])
                     )
+                    recent_episode_term_queue_gu_arrival.append(
+                        float(episode_term_queue_gu_arrival_env[env_idx])
+                    )
                     recent_episode_collisions.append(float(episode_collision_env[env_idx]))
                     completed_episode_count += 1
                     assoc_unfair_episode_fracs.append(unfair_frac)
                     episode_return_env[env_idx] = 0.0
                     episode_term_throughput_access_env[env_idx] = 0.0
                     episode_term_throughput_backhaul_env[env_idx] = 0.0
+                    episode_term_queue_gu_arrival_env[env_idx] = 0.0
                     episode_collision_env[env_idx] = 0.0
                     episode_step_counts_env[env_idx] = 0
                     episode_assoc_unfair_step_counts_env[env_idx] = 0
@@ -1786,6 +1880,11 @@ def train(
                     diff = (pred_action - target_action) * imitation_mask
                     imitation_loss = (diff.pow(2).sum(-1) / (imitation_mask_sum + 1e-9)).mean()
 
+                residual_reg_loss = torch.tensor(0.0, device=device)
+                if bw_residual_enabled and train_heads["bw"] and bw_residual_l2_coef > 0.0:
+                    pred_bw_residual = torch.tanh(out["bw_mu"]) * bw_scale
+                    residual_reg_loss = pred_bw_residual.pow(2).mean()
+
                 danger_imitation_loss = torch.tensor(0.0, device=device)
                 if danger_imitation_enabled:
                     pred_accel = torch.tanh(out["mu"])
@@ -1802,6 +1901,7 @@ def train(
                 (
                     policy_loss
                     + imitation_coef_curr * imitation_loss
+                    + bw_residual_l2_coef * residual_reg_loss
                     + danger_imitation_coef * danger_imitation_loss
                     - cfg.entropy_coef * entropy.mean()
                 ).backward()
@@ -1824,6 +1924,7 @@ def train(
                 log_ratio_abs_samples.append(log_ratio.abs().detach().cpu().numpy().reshape(-1))
                 imitation_loss_sum += float(imitation_loss.item())
                 danger_imitation_loss_sum += float(danger_imitation_loss.item())
+                residual_reg_loss_sum += float(residual_reg_loss.item())
                 if stop_early:
                     break
             if stop_early:
@@ -1852,6 +1953,11 @@ def train(
         episode_term_throughput_backhaul = (
             float(np.mean(recent_episode_term_throughput_backhaul))
             if recent_episode_term_throughput_backhaul
+            else 0.0
+        )
+        episode_term_queue_gu_arrival = (
+            float(np.mean(recent_episode_term_queue_gu_arrival))
+            if recent_episode_term_queue_gu_arrival
             else 0.0
         )
         collision_rate = float(np.mean(recent_episode_collisions)) if recent_episode_collisions else 0.0
@@ -1910,8 +2016,10 @@ def train(
             "rollout_reward_per_step": rollout_reward_per_step,
             "episode_term_throughput_access": episode_term_throughput_access,
             "episode_term_throughput_backhaul": episode_term_throughput_backhaul,
+            "episode_term_queue_gu_arrival": episode_term_queue_gu_arrival,
             "throughput_access_norm": throughput_access_norm_sum / steps_count,
             "throughput_backhaul_norm": throughput_backhaul_norm_sum / steps_count,
+            "gu_queue_arrival_steps": gu_queue_arrival_steps_sum / steps_count,
             "gu_queue_mean": gu_queue_sum / steps_count,
             "uav_queue_mean": uav_queue_sum / steps_count,
             "queue_total_active": queue_total_active_sum / steps_count,
@@ -1932,6 +2040,7 @@ def train(
             "reward_rms_mean": reward_rms_mean,
             "reward_rms_var": reward_rms_var,
             "danger_imitation_loss": danger_imitation_loss_sum / max(1, len(policy_losses)),
+            "residual_reg_loss": residual_reg_loss_sum / max(1, len(policy_losses)),
             "danger_imitation_coef": danger_imitation_coef,
             "danger_imitation_active_rate": danger_imitation_active_rate_sum / steps_count,
             "log_std_mean": float(np.mean(log_std_vec)),
