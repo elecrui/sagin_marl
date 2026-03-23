@@ -18,6 +18,7 @@ from sagin_marl.env.config import load_config
 from sagin_marl.env.sagin_env import SaginParallelEnv
 from sagin_marl.rl.action_assembler import assemble_actions
 from sagin_marl.rl.baselines import (
+    cluster_center_accel_policy,
     centroid_accel_policy,
     queue_aware_policy,
     random_accel_policy,
@@ -84,12 +85,17 @@ def _baseline_actions(
     obs_list,
     cfg,
     num_agents: int,
+    env=None,
     rng: np.random.Generator | None = None,
 ):
     if baseline in ("zero_accel", "fixed"):
         return zero_accel_policy(num_agents), None, None
     if baseline == "random_accel":
         return random_accel_policy(num_agents, rng=rng), None, None
+    if baseline == "cluster_center":
+        centers = None if env is None else getattr(env, "gu_cluster_centers", None)
+        counts = None if env is None else getattr(env, "gu_cluster_counts", None)
+        return cluster_center_accel_policy(obs_list, cfg, centers, counts), None, None
     if baseline == "centroid":
         gain = float(getattr(cfg, "baseline_centroid_gain", 2.0))
         queue_weighted = bool(getattr(cfg, "baseline_centroid_queue_weighted", True))
@@ -246,6 +252,7 @@ def main():
             "fixed", 
             "zero_accel", 
             "random_accel", 
+            "cluster_center",
             "centroid", 
             "queue_aware", 
             "uniform_bw", 
@@ -286,6 +293,9 @@ def main():
     )
 
     cfg = load_config(args.config)
+    if args.baseline == "cluster_center":
+        cfg.avoidance_enabled = True
+        cfg.pairwise_hard_filter_enabled = True
     env = SaginParallelEnv(cfg)
 
     use_baseline = args.baseline != "none"
@@ -441,7 +451,7 @@ def main():
                 if use_baseline:
                     obs_list = list(obs.values())
                     accel_actions, bw_logits, sat_logits = _baseline_actions(
-                        args.baseline, obs_list, cfg, len(env.agents), rng=env.rng
+                        args.baseline, obs_list, cfg, len(env.agents), env=env, rng=env.rng
                     )
                     actions = assemble_actions(
                         cfg, env.agents, accel_actions, bw_logits=bw_logits, sat_logits=sat_logits

@@ -242,6 +242,11 @@ class SaginConfig:
     baseline_repulse_radius_factor: float = 1.5
     baseline_energy_low: float = 0.3
     baseline_energy_weight: float = 1.0
+    baseline_cluster_cruise_speed: float | None = None
+    baseline_cluster_slow_radius: float = 120.0
+    baseline_cluster_stop_radius: float = 20.0
+    baseline_cluster_speed_tol: float = 2.0
+    baseline_cluster_vel_gain: float = 1.0
 
     # Reward shaping
     reward_mode: str = "dense"  # "dense" or "throughput_only"

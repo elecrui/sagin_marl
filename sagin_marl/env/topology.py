@@ -9,13 +9,14 @@ def thomas_cluster_process(
     num_clusters: int = 3,
     cluster_std: float = 80.0,
     rng: np.random.Generator | None = None,
-) -> np.ndarray:
+    return_metadata: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]:
     rng = rng or np.random.default_rng()
     num_clusters = max(1, int(num_clusters))
     # Sample cluster centers uniformly
-    centers = rng.uniform(0.1 * map_size, 0.9 * map_size, size=(num_clusters, 2))
+    centers = rng.uniform(0.1 * map_size, 0.9 * map_size, size=(num_clusters, 2)).astype(np.float32)
     # Allocate points per cluster
-    counts = rng.multinomial(num_points, [1 / num_clusters] * num_clusters)
+    counts = rng.multinomial(num_points, [1 / num_clusters] * num_clusters).astype(np.int32)
     points = []
     for c, n in zip(centers, counts):
         if n == 0:
@@ -24,5 +25,11 @@ def thomas_cluster_process(
         pts = np.clip(pts, 0.0, map_size)
         points.append(pts)
     if not points:
-        return rng.uniform(0.0, map_size, size=(num_points, 2))
-    return np.vstack(points)
+        pts = rng.uniform(0.0, map_size, size=(num_points, 2)).astype(np.float32)
+        if return_metadata:
+            return pts, centers, counts
+        return pts
+    pts = np.vstack(points).astype(np.float32, copy=False)
+    if return_metadata:
+        return pts, centers, counts
+    return pts

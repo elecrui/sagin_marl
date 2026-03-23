@@ -393,12 +393,13 @@ class SaginParallelEnv(ParallelEnv):
         self.t = 0
         self._episode_collision_count = 0
         self._episode_step_count = 0
-        self.gu_pos = thomas_cluster_process(
+        self.gu_pos, self.gu_cluster_centers, self.gu_cluster_counts = thomas_cluster_process(
             cfg.num_gu,
             cfg.map_size,
             num_clusters=max(1, cfg.num_gu // 5),
             cluster_std=80.0,
             rng=self.rng,
+            return_metadata=True,
         )
         self.uav_pos = self._sample_uav_positions()
         self.uav_vel = self._sample_uav_initial_velocities()

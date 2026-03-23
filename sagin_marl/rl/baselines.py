@@ -39,6 +39,127 @@ def centroid_accel_policy(
         accel[i] = np.clip(vec * gain, -1.0, 1.0).astype(np.float32)
     return accel
 
+
+def _baseline_energy_term(obs: Dict[str, np.ndarray], cfg) -> np.ndarray:
+    accel_vec = np.zeros((2,), dtype=np.float32)
+    energy_weight = float(getattr(cfg, "baseline_energy_weight", 1.0))
+    if not cfg.energy_enabled or energy_weight <= 0.0:
+        return accel_vec
+
+    energy_low = float(getattr(cfg, "baseline_energy_low", 0.3))
+    energy_norm = float(obs["own"][4])
+    if energy_norm >= energy_low:
+        return accel_vec
+
+    vel = obs["own"][2:4].astype(np.float32)
+    speed = float(np.linalg.norm(vel))
+    if speed <= 1e-6:
+        return accel_vec
+
+    target_speed = min(cfg.uav_opt_speed / max(cfg.v_max, 1e-6), 1.0)
+    delta = target_speed - speed
+    if delta >= 0.0:
+        return accel_vec
+
+    scale = (energy_low - energy_norm) / max(energy_low, 1e-6)
+    accel_vec = accel_vec + energy_weight * scale * (vel / speed) * delta
+    return accel_vec.astype(np.float32, copy=False)
+
+
+def _select_cluster_targets(
+    obs_list: List[Dict[str, np.ndarray]],
+    cfg,
+    cluster_centers: np.ndarray,
+    cluster_counts: np.ndarray,
+) -> np.ndarray:
+    num_agents = len(obs_list)
+    targets = np.full((num_agents,), -1, dtype=np.int32)
+    if num_agents <= 0:
+        return targets
+
+    centers = np.asarray(cluster_centers, dtype=np.float32)
+    counts = np.asarray(cluster_counts, dtype=np.float32).reshape(-1)
+    if centers.ndim != 2 or centers.shape[1] != 2 or counts.size != centers.shape[0]:
+        return targets
+
+    valid = np.flatnonzero(counts > 0.0)
+    if valid.size == 0:
+        return targets
+
+    priority = valid[np.argsort(-counts[valid], kind="stable")]
+    selected = priority[: min(num_agents, priority.size)]
+    uav_pos = np.asarray([obs["own"][0:2] * cfg.map_size for obs in obs_list], dtype=np.float32)
+
+    remaining_uavs = list(range(num_agents))
+    for cluster_idx in selected:
+        rem = np.asarray(remaining_uavs, dtype=np.int32)
+        dists = np.linalg.norm(uav_pos[rem] - centers[cluster_idx], axis=1)
+        best_uav = int(rem[int(np.argmin(dists))])
+        targets[best_uav] = int(cluster_idx)
+        remaining_uavs.remove(best_uav)
+
+    if selected.size > 0:
+        selected_centers = centers[selected]
+        for u in remaining_uavs:
+            dists = np.linalg.norm(selected_centers - uav_pos[u], axis=1)
+            targets[u] = int(selected[int(np.argmin(dists))])
+
+    return targets
+
+
+def _cluster_tracking_term(obs: Dict[str, np.ndarray], cfg, target_abs: np.ndarray) -> np.ndarray:
+    own = obs["own"]
+    pos = own[0:2].astype(np.float32) * cfg.map_size
+    vel = own[2:4].astype(np.float32) * cfg.v_max
+    error = np.asarray(target_abs, dtype=np.float32) - pos
+    dist = float(np.linalg.norm(error))
+    speed = float(np.linalg.norm(vel))
+
+    stop_radius = max(float(getattr(cfg, "baseline_cluster_stop_radius", 20.0) or 0.0), 0.0)
+    speed_tol = max(float(getattr(cfg, "baseline_cluster_speed_tol", 2.0) or 0.0), 0.0)
+    slow_radius_cfg = float(getattr(cfg, "baseline_cluster_slow_radius", 120.0) or 0.0)
+    slow_radius = max(slow_radius_cfg, stop_radius + 1e-6)
+    cruise_speed_cfg = getattr(cfg, "baseline_cluster_cruise_speed", None)
+    cruise_speed = cfg.uav_opt_speed if cruise_speed_cfg is None else float(cruise_speed_cfg)
+    cruise_speed = float(np.clip(cruise_speed, 0.0, cfg.v_max))
+    vel_gain = max(float(getattr(cfg, "baseline_cluster_vel_gain", 1.0) or 0.0), 0.0)
+
+    if dist <= stop_radius:
+        if speed <= speed_tol:
+            return np.zeros((2,), dtype=np.float32)
+        desired_vel = np.zeros((2,), dtype=np.float32)
+    else:
+        direction = error / max(dist, 1e-6)
+        desired_speed = cruise_speed * min(dist / slow_radius, 1.0)
+        desired_vel = direction * desired_speed
+
+    desired_accel = vel_gain * (desired_vel - vel) / max(cfg.tau0, 1e-6)
+    action = desired_accel / max(cfg.a_max, 1e-6)
+    return np.clip(action, -1.0, 1.0).astype(np.float32, copy=False)
+
+
+def cluster_center_accel_policy(
+    obs_list: List[Dict[str, np.ndarray]],
+    cfg,
+    cluster_centers: np.ndarray | None,
+    cluster_counts: np.ndarray | None,
+) -> np.ndarray:
+    num_agents = len(obs_list)
+    accel = np.zeros((num_agents, 2), dtype=np.float32)
+    if num_agents <= 0 or cluster_centers is None or cluster_counts is None:
+        return accel
+
+    centers = np.asarray(cluster_centers, dtype=np.float32)
+    targets = _select_cluster_targets(obs_list, cfg, centers, np.asarray(cluster_counts, dtype=np.float32))
+    for i, obs in enumerate(obs_list):
+        accel_vec = np.zeros((2,), dtype=np.float32)
+        target_idx = int(targets[i])
+        if 0 <= target_idx < len(centers):
+            accel_vec = accel_vec + _cluster_tracking_term(obs, cfg, centers[target_idx])
+        accel_vec = accel_vec + _baseline_energy_term(obs, cfg)
+        accel[i] = np.clip(accel_vec, -1.0, 1.0)
+    return accel
+
 def uniform_bw_policy(num_agents: int, users_obs_max: int) -> np.ndarray:
     return np.zeros((num_agents, users_obs_max), dtype=np.float32)
 

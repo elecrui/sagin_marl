@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 import csv
 import os
 import time
@@ -144,7 +145,7 @@ def _normalize_exec_source(raw: str | None) -> str:
 
 def _normalize_checkpoint_eval_fixed_policy(raw: str | None) -> str:
     policy = str("zero" if raw is None else raw).strip().lower()
-    allowed = {"zero", "queue_aware", "teacher_accel_queue_aware"}
+    allowed = {"zero", "queue_aware", "teacher_accel_queue_aware", "stage2_exec_fixed_sat"}
     if policy not in allowed:
         raise ValueError(f"Invalid checkpoint-eval fixed policy '{raw}'. Allowed: {sorted(allowed)}")
     return policy
@@ -396,7 +397,11 @@ def _checkpoint_eval_summary(
 ) -> Dict[str, float]:
     from ..env.sagin_env import SaginParallelEnv
 
-    eval_env = SaginParallelEnv(cfg)
+    eval_cfg = cfg
+    if fixed_baseline and fixed_baseline_policy == "stage2_exec_fixed_sat":
+        eval_cfg = replace(cfg, fixed_satellite_strategy=True, train_sat=False)
+
+    eval_env = SaginParallelEnv(eval_cfg)
     try:
         reward_sum_total = 0.0
         throughput_access_norm_total = 0.0
@@ -426,9 +431,9 @@ def _checkpoint_eval_summary(
                 obs_list = list(obs.values())
                 if fixed_baseline:
                     if fixed_baseline_policy == "queue_aware":
-                        heur_accel, heur_bw, heur_sat = queue_aware_policy(obs_list, cfg)
+                        heur_accel, heur_bw, heur_sat = queue_aware_policy(obs_list, eval_cfg)
                         actions = assemble_actions(
-                            cfg,
+                            eval_cfg,
                             eval_env.agents,
                             heur_accel,
                             bw_logits=heur_bw,
@@ -443,17 +448,68 @@ def _checkpoint_eval_summary(
                         obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
                         with torch.inference_mode():
                             teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
-                        _, heur_bw, heur_sat = queue_aware_policy(obs_list, cfg)
+                        _, heur_bw, heur_sat = queue_aware_policy(obs_list, eval_cfg)
                         actions = assemble_actions(
-                            cfg,
+                            eval_cfg,
                             eval_env.agents,
                             teacher_out.accel.cpu().numpy(),
                             bw_logits=heur_bw,
                             sat_logits=heur_sat,
                         )
+                    elif fixed_baseline_policy == "stage2_exec_fixed_sat":
+                        if actor is None:
+                            raise ValueError(
+                                "checkpoint_eval_fixed_policy='stage2_exec_fixed_sat' requires the current actor."
+                            )
+                        obs_batch = batch_flatten_obs(obs_list, eval_cfg)
+                        obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
+                        with torch.inference_mode():
+                            policy_out = actor.act(obs_tensor, deterministic=True)
+                        teacher_accel = None
+                        teacher_bw = None
+                        if teacher_actor is not None:
+                            with torch.inference_mode():
+                                teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
+                            teacher_accel = teacher_out.accel.cpu().numpy()
+                            teacher_bw = (
+                                teacher_out.bw_logits.cpu().numpy()
+                                if teacher_out.bw_logits is not None
+                                else None
+                            )
+                        heur_accel = None
+                        heur_bw = None
+                        if need_heuristic_exec:
+                            heur_accel, heur_bw, _ = queue_aware_policy(obs_list, eval_cfg)
+                        accel_actions = _select_exec_values(
+                            exec_accel_source,
+                            policy_out.accel.cpu().numpy(),
+                            teacher_accel,
+                            heur_accel,
+                            (len(eval_env.agents), 2),
+                        )
+                        bw_logits = None
+                        if eval_cfg.enable_bw_action:
+                            policy_bw = (
+                                policy_out.bw_logits.cpu().numpy() if policy_out.bw_logits is not None else None
+                            )
+                            bw_logits = _compose_bw_exec_values(
+                                exec_bw_source,
+                                policy_bw,
+                                teacher_bw,
+                                heur_bw,
+                                (len(eval_env.agents), eval_cfg.users_obs_max),
+                                eval_cfg,
+                            )
+                        actions = assemble_actions(
+                            eval_cfg,
+                            eval_env.agents,
+                            accel_actions,
+                            bw_logits=bw_logits,
+                            sat_logits=None,
+                        )
                     else:
                         accel_actions = np.zeros((len(eval_env.agents), 2), dtype=np.float32)
-                        actions = assemble_actions(cfg, eval_env.agents, accel_actions)
+                        actions = assemble_actions(eval_cfg, eval_env.agents, accel_actions)
                 else:
                     obs_batch = batch_flatten_obs(obs_list, cfg)
                     obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
@@ -1034,7 +1090,7 @@ def train(
         if checkpoint_eval_fixed_summary is None:
             checkpoint_eval_fixed_summary = _checkpoint_eval_summary(
                 cfg,
-                actor=None,
+                actor=actor,
                 device=device,
                 episodes=checkpoint_eval_episodes,
                 episode_seed_base=checkpoint_eval_episode_seed_base,

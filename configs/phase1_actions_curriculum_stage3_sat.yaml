@@ -1,10 +1,11 @@
 # Stage 3: sat-only training on top of the trained stage2 accel+bw policy.
 # Train:
-#   python scripts/train.py --config configs/phase1_actions_curriculum_stage3_sat.yaml --updates 500 --log_dir runs/phase1_actions --run_id stage3_sat_from_stage2_bw_u1500_sat144 --init_actor runs/phase1_actions/stage2_bw_from_stage1_accel_teacher_resbw_a05_clip1_l2e2_no_backhaul_gupen005_u1500/actor.pt --init_critic runs/phase1_actions/stage2_bw_from_stage1_accel_teacher_resbw_a05_clip1_l2e2_no_backhaul_gupen005_u1500/critic.pt
+#   python scripts/train.py --config configs/phase1_actions_curriculum_stage3_sat.yaml --updates 500 --log_dir runs/phase1_actions --run_id stage3_sat_from_stage2_bw_u1500_sat144 --init_actor runs/phase1_actions/stage2_bw_from_stage1_accel_teacher_resbw_a05_clip1_l2e2_no_backhaul_gupen005_u1500/actor.pt
 # Notes:
 #   - Keep env and PPO settings aligned with stage2 bw training.
 #   - Only open sat action, increase the real constellation size, and switch reward focus to backhaul.
 #   - Keep visible_sats_max == sats_obs_max so sat candidates and sat-head logits stay one-to-one.
+#   - Do not init critic from stage2 here; the value target changes from access-focused to backhaul-only.
 seed: 42
 map_size: 1500.0
 tau0: 1.0
@@ -201,7 +202,7 @@ buffer_size: 400
 num_mini_batch: 4
 ppo_epochs: 5
 adv_clip: 5.0
-entropy_coef: 0.0
+entropy_coef: 0.001
 
 early_stop_enabled: false
 checkpoint_eval_enabled: true
@@ -209,7 +210,7 @@ checkpoint_eval_interval_updates: 50
 checkpoint_eval_start_update: 200
 checkpoint_eval_episodes: 20
 checkpoint_eval_episode_seed_base: 42000
-checkpoint_eval_fixed_policy: teacher_accel_queue_aware
+checkpoint_eval_fixed_policy: stage2_exec_fixed_sat
 checkpoint_eval_sat_drop_early_stop_enabled: false
 checkpoint_eval_sat_drop_worsen_delta: 5.0e-4
 checkpoint_eval_front_queue_rel_improve_tol: 0.05

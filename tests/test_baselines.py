@@ -4,6 +4,7 @@ import numpy as np
 
 from sagin_marl.env.config import SaginConfig
 from sagin_marl.rl.baselines import (
+    cluster_center_accel_policy,
     centroid_accel_policy,
     queue_aware_policy,
     random_accel_policy,
@@ -47,6 +48,72 @@ def test_centroid_accel_policy_points_to_users():
     assert accel[0, 0] > 0.0
     assert accel[0, 1] < 0.0
     assert np.max(np.abs(accel)) <= 1.0 + 1e-6
+
+
+def test_cluster_center_accel_policy_assigns_by_cluster_priority_and_uav_position():
+    cfg = SaginConfig(num_uav=2, map_size=1000.0)
+    cfg.baseline_cluster_cruise_speed = 10.0
+    cfg.baseline_cluster_slow_radius = 120.0
+    cfg.baseline_cluster_stop_radius = 10.0
+    cfg.baseline_cluster_speed_tol = 0.5
+
+    base_obs = {
+        "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
+        "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
+        "sats": np.zeros((cfg.sats_obs_max, SAT_OBS_DIM), dtype=np.float32),
+        "sats_mask": np.zeros((cfg.sats_obs_max,), dtype=np.float32),
+        "nbrs": np.zeros((cfg.nbrs_obs_max, 4), dtype=np.float32),
+        "nbrs_mask": np.zeros((cfg.nbrs_obs_max,), dtype=np.float32),
+    }
+    obs_left = {
+        **base_obs,
+        "own": np.array([0.05, 0.10, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+    }
+    obs_right = {
+        **base_obs,
+        "own": np.array([0.95, 0.10, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+    }
+
+    centers = np.array(
+        [
+            [900.0, 100.0],
+            [100.0, 100.0],
+            [500.0, 900.0],
+        ],
+        dtype=np.float32,
+    )
+    counts = np.array([9, 8, 1], dtype=np.int32)
+
+    accel = cluster_center_accel_policy([obs_left, obs_right], cfg, centers, counts)
+    assert accel.shape == (2, 2)
+    assert accel.dtype == np.float32
+    assert accel[0, 0] > 0.0
+    assert accel[1, 0] < 0.0
+    assert np.max(np.abs(accel)) <= 1.0 + 1e-6
+
+
+def test_cluster_center_accel_policy_brakes_at_cluster_center():
+    cfg = SaginConfig(num_uav=1, map_size=1000.0)
+    cfg.baseline_cluster_stop_radius = 20.0
+    cfg.baseline_cluster_speed_tol = 0.5
+
+    obs = {
+        "own": np.array([0.50, 0.50, 0.40, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
+        "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
+        "sats": np.zeros((cfg.sats_obs_max, SAT_OBS_DIM), dtype=np.float32),
+        "sats_mask": np.zeros((cfg.sats_obs_max,), dtype=np.float32),
+        "nbrs": np.zeros((cfg.nbrs_obs_max, 4), dtype=np.float32),
+        "nbrs_mask": np.zeros((cfg.nbrs_obs_max,), dtype=np.float32),
+    }
+
+    centers = np.array([[500.0, 500.0]], dtype=np.float32)
+    counts = np.array([5], dtype=np.int32)
+
+    accel = cluster_center_accel_policy([obs], cfg, centers, counts)
+    assert accel.shape == (1, 2)
+    assert accel[0, 0] < 0.0
+    assert abs(float(accel[0, 1])) <= 1e-6
 
 
 def test_queue_aware_policy_shapes():
