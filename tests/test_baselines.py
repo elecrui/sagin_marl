@@ -10,7 +10,7 @@ from sagin_marl.rl.baselines import (
     random_accel_policy,
     zero_accel_policy,
 )
-from sagin_marl.rl.policy import SAT_OBS_DIM
+from sagin_marl.rl.policy import OWN_OBS_DIM, SAT_OBS_DIM
 
 
 def test_zero_accel_policy_shape_dtype():
@@ -30,7 +30,7 @@ def test_random_accel_policy_shape_dtype_and_range():
 
 def test_centroid_accel_policy_points_to_users():
     obs = {
-        "own": np.zeros((7,), dtype=np.float32),
+        "own": np.zeros((OWN_OBS_DIM,), dtype=np.float32),
         "users": np.zeros((3, 5), dtype=np.float32),
         "users_mask": np.zeros((3,), dtype=np.float32),
         "sats": np.zeros((1, SAT_OBS_DIM), dtype=np.float32),
@@ -67,11 +67,11 @@ def test_cluster_center_accel_policy_assigns_by_cluster_priority_and_uav_positio
     }
     obs_left = {
         **base_obs,
-        "own": np.array([0.05, 0.10, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        "own": np.array([0.05, 0.10, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
     }
     obs_right = {
         **base_obs,
-        "own": np.array([0.95, 0.10, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        "own": np.array([0.95, 0.10, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
     }
 
     centers = np.array(
@@ -98,7 +98,7 @@ def test_cluster_center_accel_policy_brakes_at_cluster_center():
     cfg.baseline_cluster_speed_tol = 0.5
 
     obs = {
-        "own": np.array([0.50, 0.50, 0.40, 0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        "own": np.array([0.50, 0.50, 0.40, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
         "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
         "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
         "sats": np.zeros((cfg.sats_obs_max, SAT_OBS_DIM), dtype=np.float32),
@@ -121,7 +121,7 @@ def test_queue_aware_policy_shapes():
     cfg.enable_bw_action = True
     cfg.fixed_satellite_strategy = False
     obs = {
-        "own": np.zeros((7,), dtype=np.float32),
+        "own": np.zeros((OWN_OBS_DIM,), dtype=np.float32),
         "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
         "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
         "bw_valid_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
@@ -163,7 +163,7 @@ def test_queue_aware_sat_uses_load_bw_and_stay_features():
     cfg = SaginConfig(num_uav=3, sats_obs_max=2)
     cfg.fixed_satellite_strategy = False
     obs = {
-        "own": np.zeros((7,), dtype=np.float32),
+        "own": np.zeros((OWN_OBS_DIM,), dtype=np.float32),
         "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
         "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
         "bw_valid_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
@@ -197,7 +197,7 @@ def test_queue_aware_sat_prefers_current_sat_within_switch_margin():
     cfg.fixed_satellite_strategy = False
     cfg.baseline_sat_switch_margin = 0.2
     obs = {
-        "own": np.zeros((7,), dtype=np.float32),
+        "own": np.zeros((OWN_OBS_DIM,), dtype=np.float32),
         "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
         "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
         "bw_valid_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),

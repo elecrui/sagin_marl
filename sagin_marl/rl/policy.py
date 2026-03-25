@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import torch
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .distributions import HybridActionDist
 
-OWN_OBS_DIM = 7
+OWN_OBS_DIM = 10
 USER_OBS_DIM = 5
 SAT_OBS_DIM = 12
 NBR_OBS_DIM = 4
@@ -21,7 +21,7 @@ DANGER_NBR_OBS_DIM = 5
 class PolicyOutput:
     action: torch.Tensor
     logprob: torch.Tensor
-    accel: torch.Tensor
+    accel: torch.Tensor | None
     bw_action: torch.Tensor | None = None
     sat_select_mask: torch.Tensor | None = None
     sat_indices: torch.Tensor | None = None
@@ -108,6 +108,7 @@ class ActorNet(nn.Module):
     def __init__(self, obs_dim: int, cfg):
         super().__init__()
         self.cfg = cfg
+        self.ctx_dim = int(cfg.actor_hidden)
         self.enable_bw = bool(cfg.enable_bw_action)
         self.enable_sat = not bool(cfg.fixed_satellite_strategy)
         self.danger_nbr_enabled = bool(getattr(cfg, "danger_nbr_enabled", False))
@@ -211,6 +212,21 @@ class ActorNet(nn.Module):
             self.sat_action_encoder = None
             self.sat_scorer = None
 
+    def _available_action_heads(self) -> Tuple[str, ...]:
+        heads = ["accel"]
+        if self.enable_bw:
+            heads.append("bw")
+        if self.enable_sat:
+            heads.append("sat")
+        return tuple(heads)
+
+    def _resolve_required_heads(self, required_heads: Iterable[str] | None = None) -> Tuple[str, ...]:
+        available = self._available_action_heads()
+        if required_heads is None:
+            return available
+        requested = {str(head).strip().lower() for head in required_heads}
+        return tuple(head for head in available if head in requested)
+
     def backbone_modules(self) -> Tuple[nn.Module, ...]:
         if self.encoder_type == "flat_mlp":
             return (self.obs_norm, self.fc1, self.fc2)
@@ -227,6 +243,15 @@ class ActorNet(nn.Module):
             ]
         )
         return tuple(modules)
+
+    def backbone_is_frozen(self) -> bool:
+        for module in self.backbone_modules():
+            if module is None:
+                continue
+            for param in module.parameters():
+                if param.requires_grad:
+                    return False
+        return True
 
     def _split_flat_obs(
         self, obs: torch.Tensor
@@ -291,36 +316,63 @@ class ActorNet(nn.Module):
         fused = F.relu(self.fusion_fc1(fused))
         return F.relu(self.fusion_fc2(fused))
 
-    def forward(self, obs: torch.Tensor) -> Dict[str, torch.Tensor]:
-        x = self._encode_obs(obs)
-        own, danger_nbr, users, users_mask, bw_valid_mask, sats, sats_mask, sat_valid_mask, nbrs, nbrs_mask = self._split_flat_obs(obs)
-        del own, danger_nbr, users_mask, sats_mask, nbrs, nbrs_mask
+    def encode_ctx(self, obs: torch.Tensor) -> torch.Tensor:
+        return self._encode_obs(obs)
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        required_heads: Iterable[str] | None = None,
+        ctx: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        active_heads = self._resolve_required_heads(required_heads)
+        if ctx is None:
+            x = self._encode_obs(obs)
+        else:
+            if ctx.ndim != 2 or ctx.shape[0] != obs.shape[0] or ctx.shape[1] != self.ctx_dim:
+                raise ValueError(
+                    f"Expected ctx with shape ({obs.shape[0]}, {self.ctx_dim}), got {tuple(ctx.shape)}"
+                )
+            x = ctx
         out: Dict[str, torch.Tensor] = {
             "ctx": x,
-            "mu": self.mu_head(x),
-            "users": users,
-            "bw_valid_mask": bw_valid_mask,
-            "sats": sats,
-            "sat_valid_mask": sat_valid_mask,
         }
-        if self.enable_bw and self.bw_user_encoder is not None and self.bw_scorer is not None:
+        if "accel" in active_heads:
+            out["mu"] = self.mu_head(x)
+        if "bw" in active_heads or "sat" in active_heads:
+            own, danger_nbr, users, users_mask, bw_valid_mask, sats, sats_mask, sat_valid_mask, nbrs, nbrs_mask = (
+                self._split_flat_obs(obs)
+            )
+            del own, danger_nbr, users_mask, sats_mask, nbrs, nbrs_mask
+        else:
+            users = None
+            bw_valid_mask = None
+            sats = None
+            sat_valid_mask = None
+        if "bw" in active_heads and self.enable_bw and self.bw_user_encoder is not None and self.bw_scorer is not None:
+            if users is None or bw_valid_mask is None:
+                raise ValueError("bw head requested without user features.")
             user_emb = self.bw_user_encoder(users)
             ctx_u = x.unsqueeze(1).expand(-1, self.users_obs_max, -1)
             bw_in = torch.cat([ctx_u, user_emb, users], dim=-1)
             bw_score = self.bw_scorer(bw_in).squeeze(-1)
             alpha_floor = max(float(getattr(self.cfg, "bw_alpha_floor", 0.2) or 0.0), 1e-4)
             out["bw_alpha"] = F.softplus(bw_score) + alpha_floor
-        if self.enable_sat and self.sat_action_encoder is not None and self.sat_scorer is not None:
+            out["bw_valid_mask"] = bw_valid_mask
+        if "sat" in active_heads and self.enable_sat and self.sat_action_encoder is not None and self.sat_scorer is not None:
+            if sats is None or sat_valid_mask is None:
+                raise ValueError("sat head requested without satellite features.")
             sat_emb = self.sat_action_encoder(sats)
             ctx_s = x.unsqueeze(1).expand(-1, self.sats_obs_max, -1)
             sat_in = torch.cat([ctx_s, sat_emb, sats], dim=-1)
             out["sat_logits"] = self.sat_scorer(sat_in).squeeze(-1)
+            out["sat_valid_mask"] = sat_valid_mask
         return out
 
     def _build_hybrid_dist(self, out: Dict[str, torch.Tensor]) -> HybridActionDist:
         return HybridActionDist(
-            accel_mu=out["mu"],
-            accel_log_std=self.log_std,
+            accel_mu=out.get("mu"),
+            accel_log_std=self.log_std if "mu" in out else None,
             bw_alpha=out.get("bw_alpha"),
             bw_mask=out.get("bw_valid_mask"),
             sat_logits=out.get("sat_logits"),
@@ -343,11 +395,28 @@ class ActorNet(nn.Module):
             sat = action[:, idx : idx + self.cfg.sats_obs_max]
         return accel, bw, sat
 
-    def act(self, obs: torch.Tensor, deterministic: bool = False) -> PolicyOutput:
-        out = self.forward(obs)
+    def act(
+        self,
+        obs: torch.Tensor,
+        deterministic: bool = False,
+        required_heads: Iterable[str] | None = None,
+        compute_logprob: bool = True,
+        compute_entropy: bool = False,
+        ctx: torch.Tensor | None = None,
+    ) -> PolicyOutput:
+        active_heads = self._resolve_required_heads(required_heads)
+        out = self.forward(obs, required_heads=active_heads, ctx=ctx)
         hybrid_dist = self._build_hybrid_dist(out)
-        sample = hybrid_dist.sample(deterministic=deterministic)
-        logprob = sum(sample.logprob_parts.values())
+        sample = hybrid_dist.sample(
+            deterministic=deterministic,
+            compute_logprob=compute_logprob,
+            compute_entropy=compute_entropy,
+            stat_heads=active_heads,
+        )
+        if sample.logprob_parts:
+            logprob = sum(sample.logprob_parts.values())
+        else:
+            logprob = torch.zeros(obs.shape[0], dtype=obs.dtype, device=obs.device)
         return PolicyOutput(
             action=sample.env_action,
             logprob=logprob,
@@ -364,15 +433,23 @@ class ActorNet(nn.Module):
         action: torch.Tensor,
         sat_indices: torch.Tensor | None = None,
         out: Dict[str, torch.Tensor] | None = None,
+        heads: Iterable[str] | None = None,
+        need_entropy: bool = True,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         if not torch.isfinite(obs).all():
             raise ValueError("obs contains NaN/Inf")
+        active_heads = self._resolve_required_heads(heads)
         if out is None:
-            out = self.forward(obs)
+            out = self.forward(obs, required_heads=active_heads)
         accel_action, bw_action, _ = self._split_env_action(action)
         hybrid_dist = self._build_hybrid_dist(out)
-        logprob_parts = hybrid_dist.log_prob(accel_action, bw_action=bw_action, sat_indices=sat_indices)
-        entropy_parts = hybrid_dist.entropy()
+        logprob_parts = hybrid_dist.log_prob(
+            accel_action,
+            bw_action=bw_action,
+            sat_indices=sat_indices,
+            heads=active_heads,
+        )
+        entropy_parts = hybrid_dist.entropy(heads=active_heads) if need_entropy else {}
         return logprob_parts, entropy_parts
 
     def evaluate_actions(
@@ -381,8 +458,17 @@ class ActorNet(nn.Module):
         action: torch.Tensor,
         sat_indices: torch.Tensor | None = None,
         out: Dict[str, torch.Tensor] | None = None,
+        heads: Iterable[str] | None = None,
+        need_entropy: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        logprob_parts, entropy_parts = self.evaluate_actions_parts(obs, action, sat_indices=sat_indices, out=out)
-        logprob = sum(logprob_parts.values())
-        entropy = sum(entropy_parts.values())
+        logprob_parts, entropy_parts = self.evaluate_actions_parts(
+            obs,
+            action,
+            sat_indices=sat_indices,
+            out=out,
+            heads=heads,
+            need_entropy=need_entropy,
+        )
+        logprob = sum(logprob_parts.values()) if logprob_parts else torch.zeros(obs.shape[0], dtype=obs.dtype, device=obs.device)
+        entropy = sum(entropy_parts.values()) if entropy_parts else torch.zeros(obs.shape[0], dtype=obs.dtype, device=obs.device)
         return logprob, entropy

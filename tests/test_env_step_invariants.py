@@ -291,6 +291,94 @@ def test_reward_mode_throughput_only_ignores_dense_shaping_terms():
     assert abs(float(reward) - 0.65) < 1e-9
 
 
+def test_controllable_flow_uses_log_pre_backlog_penalty_and_alias_terms():
+    cfg = SaginConfig(
+        num_uav=1,
+        num_gu=1,
+        num_sat=1,
+        users_obs_max=1,
+        sats_obs_max=1,
+        nbrs_obs_max=1,
+        task_arrival_rate=100.0,
+        reward_mode="controllable_flow",
+        reward_w_access=0.5,
+        reward_w_relay=0.5,
+        reward_w_pre_backlog=0.08,
+        reward_w_pre_drop=1.0,
+        reward_w_pre_growth=0.0,
+    )
+    env = SaginParallelEnv(cfg)
+    env.reset()
+    env.gu_queue[:] = 60.0
+    env.uav_queue[:] = 40.0
+    env.gu_drop[:] = 10.0
+    env.uav_drop[:] = 5.0
+    env.sat_drop[:] = 0.0
+    env.last_gu_arrival = np.array([100.0], dtype=np.float32)
+    env.last_gu_outflow = np.array([50.0], dtype=np.float32)
+    env.last_sat_incoming = np.array([40.0], dtype=np.float32)
+    env.last_sat_processed = np.array([20.0], dtype=np.float32)
+
+    reward = env._compute_reward()
+    parts = env.last_reward_parts
+    expected = 0.25 + 0.20 - 0.15 - 0.08 * np.log1p(1.0)
+
+    assert abs(float(parts["b_pre_steps"]) - 1.0) < 1e-9
+    assert abs(float(parts["term_access"]) - 0.25) < 1e-9
+    assert abs(float(parts["term_relay"]) - 0.20) < 1e-9
+    assert abs(float(parts["term_pre_drop"]) + 0.15) < 1e-9
+    assert abs(float(parts["term_pre_backlog"]) + 0.08 * np.log1p(1.0)) < 1e-9
+    assert abs(float(parts["term_queue"]) - float(parts["term_pre_backlog"])) < 1e-9
+    assert abs(float(parts["term_drop"]) - float(parts["term_pre_drop"])) < 1e-9
+    assert abs(float(parts["reward_raw"]) - expected) < 1e-9
+    assert abs(float(reward) - expected) < 1e-9
+
+
+def test_own_obs_includes_assoc_centroid_summary_features():
+    cfg = SaginConfig(
+        num_uav=2,
+        num_gu=3,
+        num_sat=1,
+        users_obs_max=3,
+        sats_obs_max=1,
+        nbrs_obs_max=1,
+        map_size=100.0,
+    )
+    env = SaginParallelEnv(cfg)
+    env.reset(seed=0)
+    env.uav_pos[:] = np.array([[10.0, 10.0], [90.0, 10.0]], dtype=np.float32)
+    env.gu_pos[:] = np.array([[20.0, 10.0], [40.0, 10.0], [80.0, 20.0]], dtype=np.float32)
+    env._cached_assoc = np.array([0, 0, 1], dtype=np.int32)
+
+    obs0 = env._get_obs(0)
+    obs1 = env._get_obs(1)
+
+    assert obs0["own"].shape == (10,)
+    assert abs(float(obs0["own"][7]) - (2.0 / 3.0)) < 1e-6
+    assert abs(float(obs0["own"][8]) - 0.20) < 1e-6
+    assert abs(float(obs0["own"][9]) - 0.0) < 1e-6
+    assert abs(float(obs1["own"][7]) - (1.0 / 3.0)) < 1e-6
+    assert abs(float(obs1["own"][8]) + 0.10) < 1e-6
+    assert abs(float(obs1["own"][9]) - 0.10) < 1e-6
+
+
+def test_sat_overlap_eval_matches_selected_satellite_pattern():
+    cfg = SaginConfig(
+        num_uav=3,
+        num_gu=0,
+        num_sat=3,
+        users_obs_max=1,
+        sats_obs_max=2,
+        nbrs_obs_max=1,
+        fixed_satellite_strategy=False,
+    )
+    env = SaginParallelEnv(cfg)
+    env.reset(seed=0)
+    env.last_sat_selection = [[0, 1], [0], [2]]
+
+    assert abs(env._compute_sat_overlap_eval() - 0.25) < 1e-9
+
+
 def test_weighted_queue_delta_uses_layer_weights():
     cfg = SaginConfig(
         num_uav=1,

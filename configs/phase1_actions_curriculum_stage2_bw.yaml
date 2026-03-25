@@ -93,6 +93,7 @@ train_accel: false
 train_bw: true
 train_sat: false
 train_shared_backbone: false
+train_fusion_last_layer: true
 exec_accel_source: policy
 exec_bw_source: policy
 exec_sat_source: zero
@@ -121,8 +122,9 @@ eta_crash: 0.0
 reward_mode: controllable_flow
 reward_w_access: 0.5
 reward_w_relay: 0.5
+reward_w_pre_backlog: 0.08
 reward_w_pre_drop: 1.0
-reward_w_pre_growth: 0.2
+reward_w_pre_growth: 0.0
 
 input_norm_enabled: true
 gamma: 0.9975
@@ -176,3 +178,6 @@ checkpoint_eval_reward_early_stop_enabled: true
 checkpoint_eval_reward_patience: 5
 checkpoint_eval_reward_min_delta_rel: 0.005
 checkpoint_eval_reward_collision_threshold: 0.01
+checkpoint_eval_model_collision_threshold: 0.0
+checkpoint_eval_reward_tie_rel_tol: 0.05
+checkpoint_eval_use_sat_overlap: false

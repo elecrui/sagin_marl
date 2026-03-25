@@ -259,8 +259,9 @@ class SaginConfig:
     use_queue_max_norm: bool = False
     reward_w_access: float = 0.5
     reward_w_relay: float = 0.5
+    reward_w_pre_backlog: float = 0.08
     reward_w_pre_drop: float = 1.0
-    reward_w_pre_growth: float = 0.2
+    reward_w_pre_growth: float = 0.0
     throughput_only_access_coef: float = 1.0
     throughput_only_backhaul_coef: float = 1.0
     throughput_only_gu_queue_coef: float = 0.0
@@ -363,11 +364,25 @@ class SaginConfig:
     train_bw: bool | None = None
     train_sat: bool | None = None
     train_shared_backbone: bool = True
+    train_fusion: bool = False
+    train_fusion_last_layer: bool = False
     exec_accel_source: str = "policy"  # policy|teacher|heuristic|zero
     exec_bw_source: str = "policy"  # policy|teacher|heuristic|zero|heuristic_residual
     exec_sat_source: str = "policy"  # policy|teacher|heuristic|zero
     exec_teacher_actor_path: str | None = None
     exec_teacher_deterministic: bool = True
+    reward_stage1_assoc_centroid_enabled: bool = False
+    reward_stage1_assoc_centroid_weight_init: float = 0.15
+    reward_stage1_assoc_centroid_weight_mid: float = 0.05
+    reward_stage1_assoc_centroid_weight_floor: float = 0.0
+    reward_stage1_assoc_centroid_hold_ratio: float = 0.30
+    reward_stage1_assoc_centroid_mid_ratio: float = 0.70
+    reward_stage3_sat_overlap_enabled: bool = False
+    reward_stage3_sat_overlap_weight_init: float = 0.10
+    reward_stage3_sat_overlap_weight_mid: float = 0.03
+    reward_stage3_sat_overlap_weight_floor: float = 0.0
+    reward_stage3_sat_overlap_hold_ratio: float = 0.40
+    reward_stage3_sat_overlap_mid_ratio: float = 0.80
 
     actor_hidden: int = 256
     actor_encoder_type: str = "flat_mlp"  # "flat_mlp" or "set_pool"
@@ -395,6 +410,9 @@ class SaginConfig:
     checkpoint_eval_reward_patience: int = 5
     checkpoint_eval_reward_min_delta_rel: float = 0.0
     checkpoint_eval_reward_collision_threshold: float = 1.0
+    checkpoint_eval_model_collision_threshold: float = 0.0
+    checkpoint_eval_reward_tie_rel_tol: float = 0.05
+    checkpoint_eval_use_sat_overlap: bool = False
 
     @property
     def theta_min_rad(self) -> float:

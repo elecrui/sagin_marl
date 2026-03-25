@@ -33,6 +33,10 @@ def _collect_step_stats(env: SaginParallelEnv) -> Dict[str, object]:
 
     num_agents = len(getattr(env, 'agents', []))
     default_accel = np.zeros((num_agents, 2), dtype=np.float32)
+    default_bw = np.zeros((num_agents, getattr(env.cfg, 'users_obs_max', 0)), dtype=np.float32)
+    sat_k = max(int(getattr(env.cfg, 'sat_num_select', env.cfg.N_RF) or env.cfg.N_RF), 0)
+    default_sat_mask = np.zeros((num_agents, getattr(env.cfg, 'sats_obs_max', 0)), dtype=np.float32)
+    default_sat_indices = np.full((num_agents, sat_k), -1, dtype=np.int64)
     parts = getattr(env, 'last_reward_parts', None) or {}
     profile = getattr(env, 'last_step_profile', None) or {}
     sat_processed = getattr(env, 'last_sat_processed', None)
@@ -40,6 +44,15 @@ def _collect_step_stats(env: SaginParallelEnv) -> Dict[str, object]:
 
     return {
         'last_exec_accel': np.asarray(getattr(env, 'last_exec_accel', default_accel), dtype=np.float32),
+        'last_exec_bw_alloc': np.asarray(getattr(env, 'last_exec_bw_alloc', default_bw), dtype=np.float32),
+        'last_exec_sat_select_mask': np.asarray(
+            getattr(env, 'last_exec_sat_select_mask', default_sat_mask),
+            dtype=np.float32,
+        ),
+        'last_exec_sat_indices': np.asarray(
+            getattr(env, 'last_exec_sat_indices', default_sat_indices),
+            dtype=np.int64,
+        ),
         'danger_imitation_mask': np.asarray(
             getattr(env, 'last_danger_imitation_mask', np.zeros((num_agents,), dtype=np.float32)),
             dtype=np.float32,
@@ -61,6 +74,7 @@ def _collect_step_stats(env: SaginParallelEnv) -> Dict[str, object]:
         'sat_queue_max': _safe_max(getattr(env, 'sat_queue', 0.0)),
         'gu_drop_sum': _safe_sum(getattr(env, 'gu_drop', 0.0)),
         'uav_drop_sum': _safe_sum(getattr(env, 'uav_drop', 0.0)),
+        'sat_drop_sum': _safe_sum(getattr(env, 'sat_drop', 0.0)),
         'sat_processed_sum': _safe_sum(sat_processed) if sat_processed is not None else 0.0,
         'sat_incoming_sum': _safe_sum(sat_incoming) if sat_incoming is not None else 0.0,
         'connected_sat_count': float(getattr(env, 'last_connected_sat_count', 0.0)),
@@ -71,6 +85,14 @@ def _collect_step_stats(env: SaginParallelEnv) -> Dict[str, object]:
         ),
         'connected_sat_elevation_deg_min': float(
             getattr(env, 'last_connected_sat_elevation_deg_min', 0.0)
+        ),
+        'assoc_centroid_dist_norms': np.asarray(
+            getattr(env, 'last_assoc_centroid_dist_norms', np.zeros((num_agents,), dtype=np.float32)),
+            dtype=np.float32,
+        ),
+        'sat_overlap_uav': np.asarray(
+            getattr(env, 'last_sat_overlap_uav', np.zeros((num_agents,), dtype=np.float32)),
+            dtype=np.float32,
         ),
         'energy_mean': _safe_mean(getattr(env, 'uav_energy', 0.0)),
         'dynamics_time_sec': float(profile.get('dynamics_time_sec', 0.0)),

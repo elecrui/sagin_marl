@@ -47,3 +47,26 @@ def test_smoke_train(tmp_path, actor_encoder_type):
     assert "env_steps_per_sec" in header
     assert "update_steps_per_sec" in header
     assert "total_env_steps" in header
+    assert "stage1_aux_agent0" in header
+    assert "stage1_aux_agent1" in header
+    assert "stage3_overlap_agent0" in header
+    assert "stage3_overlap_agent1" in header
+
+
+def test_smoke_train_writes_best_checkpoint_when_checkpoint_eval_is_enabled(tmp_path):
+    cfg = SaginConfig(num_uav=1, num_gu=1, num_sat=1, users_obs_max=1, sats_obs_max=1, nbrs_obs_max=1)
+    cfg.buffer_size = 2
+    cfg.num_mini_batch = 1
+    cfg.ppo_epochs = 1
+    cfg.T_steps = 2
+    cfg.checkpoint_eval_enabled = True
+    cfg.checkpoint_eval_interval_updates = 1
+    cfg.checkpoint_eval_start_update = 1
+    cfg.checkpoint_eval_episodes = 1
+    cfg.checkpoint_eval_fixed_policy = "zero"
+    env = SaginParallelEnv(cfg)
+
+    train(env, cfg, str(tmp_path), total_updates=1)
+
+    assert (tmp_path / "actor_best.pt").exists()
+    assert (tmp_path / "critic_best.pt").exists()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Iterable
 
 import torch
 import torch.nn.functional as F
@@ -101,9 +101,30 @@ class MaskedSequentialCategorical:
         self.mask = mask > 0.5
         self.k = max(int(k), 0)
         self.num_choices = int(logits.shape[-1])
+        self._bit_weights = (1 << torch.arange(self.num_choices, device=logits.device, dtype=torch.int64))
 
     def _safe_logits(self, mask: torch.Tensor) -> torch.Tensor:
         return self.logits.masked_fill(~mask, -1e9)
+
+    def _indices_to_select_mask(self, indices: torch.Tensor) -> torch.Tensor:
+        select_mask = torch.zeros((*indices.shape[:-1], self.num_choices), dtype=self.logits.dtype, device=self.logits.device)
+        valid_choice_mask = indices >= 0
+        if torch.any(valid_choice_mask):
+            one_hot = F.one_hot(indices.clamp_min(0), num_classes=self.num_choices).to(select_mask.dtype)
+            one_hot = one_hot * valid_choice_mask.unsqueeze(-1).to(select_mask.dtype)
+            select_mask = one_hot.sum(dim=-2)
+        return select_mask
+
+    def _pad_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices.shape[-1] >= self.k:
+            return indices
+        pad = torch.full(
+            (*indices.shape[:-1], self.k - indices.shape[-1]),
+            -1,
+            dtype=indices.dtype,
+            device=indices.device,
+        )
+        return torch.cat([indices, pad], dim=-1)
 
     def _empty_result(self) -> MaskedSequentialCategoricalSample:
         batch_shape = self.logits.shape[:-1]
@@ -115,25 +136,20 @@ class MaskedSequentialCategorical:
     def sample(self) -> MaskedSequentialCategoricalSample:
         if self.k <= 0:
             return self._empty_result()
-        batch_shape = self.logits.shape[:-1]
-        indices = torch.full((*batch_shape, self.k), -1, dtype=torch.int64, device=self.logits.device)
-        select_mask = torch.zeros((*batch_shape, self.num_choices), dtype=self.logits.dtype, device=self.logits.device)
-        current_mask = self.mask.clone()
-        for step in range(self.k):
-            remaining = current_mask.sum(dim=-1)
-            active = remaining > 0
-            if not torch.any(active):
-                break
-            safe_logits = self._safe_logits(current_mask)
-            safe_logits = torch.where(active.unsqueeze(-1), safe_logits, torch.zeros_like(safe_logits))
-            dist = Categorical(logits=safe_logits)
-            sampled = dist.sample()
-            sampled = torch.where(active, sampled, torch.full_like(sampled, -1))
-            indices[..., step] = sampled
-            chosen_mask = F.one_hot(sampled.clamp_min(0), num_classes=self.num_choices).to(torch.bool)
-            chosen_mask = chosen_mask & active.unsqueeze(-1) & current_mask
-            select_mask = select_mask + chosen_mask.to(select_mask.dtype)
-            current_mask = current_mask & ~chosen_mask
+        max_k = min(self.k, self.num_choices)
+        if max_k <= 0:
+            return self._empty_result()
+        valid_count = self.mask.sum(dim=-1)
+        safe_logits = self.logits.masked_fill(~self.mask, float("-inf"))
+        gumbel_u = torch.rand_like(self.logits).clamp_(1e-6, 1.0 - 1e-6)
+        gumbel = -torch.log(-torch.log(gumbel_u))
+        sampled_scores = safe_logits + gumbel
+        topk = sampled_scores.topk(k=max_k, dim=-1).indices
+        rank_idx = torch.arange(max_k, device=topk.device).view(*([1] * (topk.ndim - 1)), -1)
+        valid_rank = rank_idx < valid_count.unsqueeze(-1)
+        indices = torch.where(valid_rank, topk, torch.full_like(topk, -1))
+        indices = self._pad_indices(indices)
+        select_mask = self._indices_to_select_mask(indices)
         return MaskedSequentialCategoricalSample(indices=indices, select_mask=select_mask)
 
     def mode(self) -> MaskedSequentialCategoricalSample:
@@ -145,15 +161,8 @@ class MaskedSequentialCategorical:
         rank_idx = torch.arange(topk.shape[-1], device=topk.device).view(*([1] * (topk.ndim - 1)), -1)
         valid_rank = rank_idx < valid_count.unsqueeze(-1)
         indices = torch.where(valid_rank, topk, torch.full_like(topk, -1))
-        if topk.shape[-1] < self.k:
-            pad = torch.full((*indices.shape[:-1], self.k - topk.shape[-1]), -1, dtype=indices.dtype, device=indices.device)
-            indices = torch.cat([indices, pad], dim=-1)
-        select_mask = torch.zeros_like(self.logits)
-        valid_choice_mask = indices >= 0
-        if torch.any(valid_choice_mask):
-            one_hot = F.one_hot(indices.clamp_min(0), num_classes=self.num_choices).to(select_mask.dtype)
-            one_hot = one_hot * valid_choice_mask.unsqueeze(-1).to(select_mask.dtype)
-            select_mask = one_hot.sum(dim=-2)
+        indices = self._pad_indices(indices)
+        select_mask = self._indices_to_select_mask(indices)
         return MaskedSequentialCategoricalSample(indices=indices, select_mask=select_mask)
 
     def log_prob(self, indices: torch.Tensor) -> torch.Tensor:
@@ -170,13 +179,57 @@ class MaskedSequentialCategorical:
             if torch.any(active):
                 safe_logits = flat_logits.masked_fill(~current_mask, -1e9)
                 safe_logits = torch.where(active.unsqueeze(-1), safe_logits, torch.zeros_like(safe_logits))
-                dist = Categorical(logits=safe_logits)
                 step_indices = flat_indices[:, step].clamp_min(0)
-                logprob = logprob + torch.where(active, dist.log_prob(step_indices), torch.zeros_like(logprob))
-            chosen_mask = F.one_hot(flat_indices[:, step].clamp_min(0), num_classes=self.num_choices).to(torch.bool)
-            chosen_mask = chosen_mask & current_mask & (flat_indices[:, step] >= 0).unsqueeze(-1)
-            current_mask = current_mask & ~chosen_mask
+                step_log_probs = F.log_softmax(safe_logits, dim=-1)
+                gathered = step_log_probs.gather(1, step_indices.unsqueeze(-1)).squeeze(-1)
+                step_valid = active & (flat_indices[:, step] >= 0) & current_mask.gather(
+                    1, step_indices.unsqueeze(-1)
+                ).squeeze(-1)
+                logprob = logprob + torch.where(step_valid, gathered, torch.zeros_like(logprob))
+            step_valid_idx = flat_indices[:, step] >= 0
+            if torch.any(step_valid_idx):
+                chosen_mask = torch.zeros_like(current_mask)
+                chosen_mask[step_valid_idx, flat_indices[step_valid_idx, step].long()] = True
+                current_mask = current_mask & ~chosen_mask
         return logprob.reshape(self.logits.shape[:-1])
+
+    def _mask_key(self, mask: torch.Tensor) -> int:
+        return int(torch.sum(mask.to(torch.int64) * self._bit_weights).item())
+
+    def _entropy_exact_row(
+        self,
+        row_logits: torch.Tensor,
+        row_mask: torch.Tensor,
+        steps_left: int,
+        memo: dict[tuple[int, int], torch.Tensor],
+    ) -> torch.Tensor:
+        valid_count = int(row_mask.sum().item())
+        if steps_left <= 0 or valid_count <= 1:
+            return row_logits.new_zeros(())
+        key = (steps_left, self._mask_key(row_mask))
+        if key in memo:
+            return memo[key]
+        safe_logits = row_logits.masked_fill(~row_mask, float("-inf"))
+        log_probs = F.log_softmax(safe_logits, dim=-1)
+        probs = log_probs.exp()
+        row_entropy = -(probs[row_mask] * log_probs[row_mask]).sum()
+        if steps_left == 1:
+            memo[key] = row_entropy
+            return row_entropy
+        future_entropy = row_logits.new_zeros(())
+        valid_indices = torch.nonzero(row_mask, as_tuple=False).flatten()
+        for idx in valid_indices:
+            next_mask = row_mask.clone()
+            next_mask[idx] = False
+            future_entropy = future_entropy + probs[idx] * self._entropy_exact_row(
+                row_logits,
+                next_mask,
+                steps_left - 1,
+                memo,
+            )
+        total_entropy = row_entropy + future_entropy
+        memo[key] = total_entropy
+        return total_entropy
 
     def entropy(self) -> torch.Tensor:
         batch_shape = self.logits.shape[:-1]
@@ -190,7 +243,20 @@ class MaskedSequentialCategorical:
         if self.k == 1:
             return entropy
         if self.k != 2:
-            return entropy
+            flat_logits = self.logits.reshape(-1, self.num_choices)
+            flat_mask = self.mask.reshape(-1, self.num_choices)
+            flat_entropy = []
+            for row_logits, row_mask in zip(flat_logits, flat_mask):
+                memo: dict[tuple[int, int], torch.Tensor] = {}
+                flat_entropy.append(
+                    self._entropy_exact_row(
+                        row_logits,
+                        row_mask,
+                        min(self.k, int(row_mask.sum().item())),
+                        memo,
+                    )
+                )
+            return torch.stack(flat_entropy, dim=0).reshape(batch_shape)
         probs1 = dist1.probs
         expected_h2 = torch.zeros_like(entropy)
         for choice in range(self.num_choices):
@@ -211,7 +277,7 @@ class MaskedSequentialCategorical:
 @dataclass
 class HybridActionSample:
     env_action: torch.Tensor
-    accel: torch.Tensor
+    accel: torch.Tensor | None
     bw_action: torch.Tensor | None
     sat_indices: torch.Tensor | None
     sat_select_mask: torch.Tensor | None
@@ -219,21 +285,39 @@ class HybridActionSample:
     entropy_parts: Dict[str, torch.Tensor]
 
 
+def _normalize_requested_heads(heads: Iterable[str] | None) -> set[str] | None:
+    if heads is None:
+        return None
+    allowed = {"accel", "bw", "sat"}
+    out = {str(head).strip().lower() for head in heads}
+    return out & allowed
+
+
 class HybridActionDist:
     def __init__(
         self,
-        accel_mu: torch.Tensor,
-        accel_log_std: torch.Tensor,
+        accel_mu: torch.Tensor | None,
+        accel_log_std: torch.Tensor | None,
         bw_alpha: torch.Tensor | None = None,
         bw_mask: torch.Tensor | None = None,
         sat_logits: torch.Tensor | None = None,
         sat_mask: torch.Tensor | None = None,
         sat_num_select: int = 2,
     ):
+        batch_source = accel_mu if accel_mu is not None else bw_alpha
+        if batch_source is None:
+            batch_source = sat_logits
+        if batch_source is None:
+            raise ValueError("HybridActionDist requires at least one action head.")
+        self.batch_shape = tuple(batch_source.shape[:-1])
+        self.dtype = batch_source.dtype
+        self.device = batch_source.device
         self.accel_mu = accel_mu
-        self.accel_log_std = torch.clamp(accel_log_std, -5.0, 2.0)
-        self.accel_std = torch.exp(self.accel_log_std)
-        self.accel_dist = Normal(self.accel_mu, self.accel_std)
+        self.accel_log_std = None if accel_log_std is None else torch.clamp(accel_log_std, -5.0, 2.0)
+        self.accel_std = None if self.accel_log_std is None else torch.exp(self.accel_log_std)
+        self.accel_dist = (
+            None if self.accel_mu is None or self.accel_std is None else Normal(self.accel_mu, self.accel_std)
+        )
         self.bw_dist = None if bw_alpha is None or bw_mask is None else MaskedDirichlet(bw_alpha, bw_mask)
         self.sat_dist = (
             None
@@ -241,22 +325,40 @@ class HybridActionDist:
             else MaskedSequentialCategorical(sat_logits, sat_mask, k=sat_num_select)
         )
 
-    def sample(self, deterministic: bool = False) -> HybridActionSample:
-        accel_z = self.accel_mu if deterministic else self.accel_dist.rsample()
-        accel = squash_action(accel_z, scale=1.0)
-        logprob_parts: Dict[str, torch.Tensor] = {
-            "accel": squashed_logprob(self.accel_dist, accel, scale=1.0)
-        }
-        entropy_parts: Dict[str, torch.Tensor] = {
-            "accel": self.accel_dist.entropy().sum(dim=-1)
-        }
-        env_parts = [accel]
+    def _zero_batch(self) -> torch.Tensor:
+        return torch.zeros(self.batch_shape, dtype=self.dtype, device=self.device)
+
+    def _head_enabled(self, head_set: set[str] | None, head: str) -> bool:
+        return head_set is None or head in head_set
+
+    def sample(
+        self,
+        deterministic: bool = False,
+        compute_logprob: bool = False,
+        compute_entropy: bool = False,
+        stat_heads: Iterable[str] | None = None,
+    ) -> HybridActionSample:
+        stat_head_set = _normalize_requested_heads(stat_heads)
+        logprob_parts: Dict[str, torch.Tensor] = {}
+        entropy_parts: Dict[str, torch.Tensor] = {}
+        env_parts: list[torch.Tensor] = []
+        accel = None
+        if self.accel_dist is not None and self.accel_mu is not None:
+            accel_z = self.accel_mu if deterministic else self.accel_dist.rsample()
+            accel = squash_action(accel_z, scale=1.0)
+            env_parts.append(accel)
+            if compute_logprob and self._head_enabled(stat_head_set, "accel"):
+                logprob_parts["accel"] = squashed_logprob(self.accel_dist, accel, scale=1.0)
+            if compute_entropy and self._head_enabled(stat_head_set, "accel"):
+                entropy_parts["accel"] = self.accel_dist.entropy().sum(dim=-1)
         bw_action = None
         if self.bw_dist is not None:
             bw_action = self.bw_dist.mode() if deterministic else self.bw_dist.sample()
             env_parts.append(bw_action)
-            logprob_parts["bw"] = self.bw_dist.log_prob(bw_action)
-            entropy_parts["bw"] = self.bw_dist.entropy()
+            if compute_logprob and self._head_enabled(stat_head_set, "bw"):
+                logprob_parts["bw"] = self.bw_dist.log_prob(bw_action)
+            if compute_entropy and self._head_enabled(stat_head_set, "bw"):
+                entropy_parts["bw"] = self.bw_dist.entropy()
         sat_indices = None
         sat_select_mask = None
         if self.sat_dist is not None:
@@ -264,10 +366,15 @@ class HybridActionDist:
             sat_indices = sat_sample.indices
             sat_select_mask = sat_sample.select_mask
             env_parts.append(sat_select_mask)
-            logprob_parts["sat"] = self.sat_dist.log_prob(sat_indices)
-            entropy_parts["sat"] = self.sat_dist.entropy()
+            if compute_logprob and self._head_enabled(stat_head_set, "sat"):
+                logprob_parts["sat"] = self.sat_dist.log_prob(sat_indices)
+            if compute_entropy and self._head_enabled(stat_head_set, "sat"):
+                entropy_parts["sat"] = self.sat_dist.entropy()
+        env_action = torch.cat(env_parts, dim=-1) if env_parts else torch.zeros(
+            (*self.batch_shape, 0), dtype=self.dtype, device=self.device
+        )
         return HybridActionSample(
-            env_action=torch.cat(env_parts, dim=-1),
+            env_action=env_action,
             accel=accel,
             bw_action=bw_action,
             sat_indices=sat_indices,
@@ -281,22 +388,25 @@ class HybridActionDist:
         accel: torch.Tensor,
         bw_action: torch.Tensor | None = None,
         sat_indices: torch.Tensor | None = None,
+        heads: Iterable[str] | None = None,
     ) -> Dict[str, torch.Tensor]:
-        out: Dict[str, torch.Tensor] = {
-            "accel": squashed_logprob(self.accel_dist, accel, scale=1.0)
-        }
-        if self.bw_dist is not None and bw_action is not None:
+        head_set = _normalize_requested_heads(heads)
+        out: Dict[str, torch.Tensor] = {}
+        if self.accel_dist is not None and self._head_enabled(head_set, "accel"):
+            out["accel"] = squashed_logprob(self.accel_dist, accel, scale=1.0)
+        if self.bw_dist is not None and bw_action is not None and self._head_enabled(head_set, "bw"):
             out["bw"] = self.bw_dist.log_prob(bw_action)
-        if self.sat_dist is not None and sat_indices is not None:
+        if self.sat_dist is not None and sat_indices is not None and self._head_enabled(head_set, "sat"):
             out["sat"] = self.sat_dist.log_prob(sat_indices)
         return out
 
-    def entropy(self) -> Dict[str, torch.Tensor]:
-        out: Dict[str, torch.Tensor] = {
-            "accel": self.accel_dist.entropy().sum(dim=-1)
-        }
-        if self.bw_dist is not None:
+    def entropy(self, heads: Iterable[str] | None = None) -> Dict[str, torch.Tensor]:
+        head_set = _normalize_requested_heads(heads)
+        out: Dict[str, torch.Tensor] = {}
+        if self.accel_dist is not None and self._head_enabled(head_set, "accel"):
+            out["accel"] = self.accel_dist.entropy().sum(dim=-1)
+        if self.bw_dist is not None and self._head_enabled(head_set, "bw"):
             out["bw"] = self.bw_dist.entropy()
-        if self.sat_dist is not None:
+        if self.sat_dist is not None and self._head_enabled(head_set, "sat"):
             out["sat"] = self.sat_dist.entropy()
         return out

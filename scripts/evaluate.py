@@ -213,6 +213,18 @@ def main():
     parser.add_argument("--episodes", type=int, default=20)
     parser.add_argument("--out", type=str, default=None)
     parser.add_argument(
+        "--checkpoint_strict",
+        action="store_true",
+        help="Require exact key match when loading the actor checkpoint.",
+    )
+    parser.add_argument(
+        "--policy_mode",
+        type=str,
+        default="deterministic",
+        choices=["deterministic", "stochastic"],
+        help="How to sample the trained policy when baseline=none.",
+    )
+    parser.add_argument(
         "--run_dir",
         type=str,
         default=None,
@@ -297,6 +309,7 @@ def main():
     _init_eval_tb_layout(tb_writer, tb_tag)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    policy_deterministic = args.policy_mode != "stochastic"
     actor = None
     teacher_actor = None
     exec_accel_source = _normalize_exec_source(getattr(cfg, "exec_accel_source", "policy"))
@@ -311,7 +324,7 @@ def main():
         obs, _ = env.reset()
         obs_dim = batch_flatten_obs(list(obs.values()), cfg).shape[1]
         actor = ActorNet(obs_dim, cfg).to(device)
-        info = load_checkpoint_forgiving(actor, args.checkpoint, map_location=device, strict=not use_hybrid)
+        info = load_checkpoint_forgiving(actor, args.checkpoint, map_location=device, strict=args.checkpoint_strict)
         if info.get("adapted_keys"):
             print(f"Loaded actor with adapted tensors from {args.checkpoint}: {len(info['adapted_keys'])}")
         actor.eval()
@@ -468,7 +481,7 @@ def main():
                     obs_batch = batch_flatten_obs(list(obs.values()), cfg)
                     obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
                     with torch.no_grad():
-                        policy_out = actor.act(obs_tensor, deterministic=True)
+                        policy_out = actor.act(obs_tensor, deterministic=policy_deterministic)
                         teacher_accel = None
                         teacher_bw = None
                         teacher_sat = None

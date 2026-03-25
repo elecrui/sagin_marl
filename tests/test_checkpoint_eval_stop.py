@@ -123,6 +123,7 @@ def test_checkpoint_eval_summary_reports_reward_and_eval_fields():
     assert 'processed_ratio_eval' in fieldnames
     assert 'drop_ratio_eval' in fieldnames
     assert 'pre_backlog_steps_eval' in fieldnames
+    assert 'sat_overlap_eval' in fieldnames
 
     summary = _checkpoint_eval_summary(
         cfg,
@@ -143,3 +144,89 @@ def test_checkpoint_eval_summary_reports_reward_and_eval_fields():
     assert 'processed_ratio_eval' in summary
     assert 'drop_ratio_eval' in summary
     assert 'pre_backlog_steps_eval' in summary
+    assert 'sat_overlap_eval' in summary
+
+
+def test_checkpoint_eval_model_selection_uses_reward_then_processed_inside_pre_backlog_tie_band():
+    cfg = SaginConfig(
+        checkpoint_eval_reward_tie_rel_tol=0.05,
+        checkpoint_eval_model_collision_threshold=0.0,
+        checkpoint_eval_use_sat_overlap=False,
+    )
+    state = {}
+
+    _update_checkpoint_eval_state(
+        state,
+        {
+            'reward_sum': 1.0,
+            'processed_ratio_eval': 0.80,
+            'drop_ratio_eval': 0.020,
+            'pre_backlog_steps_eval': 10.0,
+            'sat_overlap_eval': 0.40,
+            'collision_episode_fraction': 0.0,
+        },
+        cfg,
+    )
+    reward_tiebreak = _update_checkpoint_eval_state(
+        state,
+        {
+            'reward_sum': 1.2,
+            'processed_ratio_eval': 0.70,
+            'drop_ratio_eval': 0.030,
+            'pre_backlog_steps_eval': 10.4,
+            'sat_overlap_eval': 0.60,
+            'collision_episode_fraction': 0.0,
+        },
+        cfg,
+    )
+    processed_tiebreak = _update_checkpoint_eval_state(
+        state,
+        {
+            'reward_sum': 1.2,
+            'processed_ratio_eval': 0.85,
+            'drop_ratio_eval': 0.035,
+            'pre_backlog_steps_eval': 10.3,
+            'sat_overlap_eval': 0.70,
+            'collision_episode_fraction': 0.0,
+        },
+        cfg,
+    )
+
+    assert reward_tiebreak['model_improved'] == 1.0
+    assert processed_tiebreak['model_improved'] == 1.0
+
+
+def test_checkpoint_eval_model_selection_uses_sat_overlap_after_processed_in_stage3_mode():
+    cfg = SaginConfig(
+        checkpoint_eval_reward_tie_rel_tol=0.05,
+        checkpoint_eval_model_collision_threshold=0.0,
+        checkpoint_eval_use_sat_overlap=True,
+    )
+    state = {}
+
+    _update_checkpoint_eval_state(
+        state,
+        {
+            'reward_sum': 1.0,
+            'processed_ratio_eval': 0.80,
+            'drop_ratio_eval': 0.020,
+            'pre_backlog_steps_eval': 10.0,
+            'sat_overlap_eval': 0.40,
+            'collision_episode_fraction': 0.0,
+        },
+        cfg,
+    )
+    overlap_tiebreak = _update_checkpoint_eval_state(
+        state,
+        {
+            'reward_sum': 0.9,
+            'processed_ratio_eval': 0.80,
+            'drop_ratio_eval': 0.025,
+            'pre_backlog_steps_eval': 10.2,
+            'sat_overlap_eval': 0.20,
+            'collision_episode_fraction': 0.0,
+        },
+        cfg,
+    )
+
+    assert overlap_tiebreak['model_improved'] == 1.0

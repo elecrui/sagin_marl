@@ -102,6 +102,14 @@ def _single_env_step_stats(env) -> Dict[str, object]:
         "connected_sat_elevation_deg_min": float(
             getattr(env, "last_connected_sat_elevation_deg_min", 0.0)
         ),
+        "assoc_centroid_dist_norms": np.asarray(
+            getattr(env, "last_assoc_centroid_dist_norms", np.zeros((num_agents,), dtype=np.float32)),
+            dtype=np.float32,
+        ),
+        "sat_overlap_uav": np.asarray(
+            getattr(env, "last_sat_overlap_uav", np.zeros((num_agents,), dtype=np.float32)),
+            dtype=np.float32,
+        ),
         "energy_mean": _safe_mean(getattr(env, "uav_energy", 0.0)),
         "dynamics_time_sec": float(profile.get("dynamics_time_sec", 0.0)),
         "orbit_visible_time_sec": float(profile.get("orbit_visible_time_sec", 0.0)),
@@ -132,6 +140,424 @@ def _set_module_requires_grad(module, enabled: bool) -> None:
         param.requires_grad = bool(enabled)
 
 
+def _configure_actor_trainability(actor, cfg, train_heads: Dict[str, bool]) -> None:
+    _set_module_requires_grad(actor.mu_head, train_heads["accel"])
+    actor.log_std.requires_grad = train_heads["accel"]
+    _set_module_requires_grad(getattr(actor, "bw_user_encoder", None), train_heads["bw"])
+    _set_module_requires_grad(getattr(actor, "bw_scorer", None), train_heads["bw"])
+    _set_module_requires_grad(getattr(actor, "sat_action_encoder", None), train_heads["sat"])
+    _set_module_requires_grad(getattr(actor, "sat_scorer", None), train_heads["sat"])
+
+    train_shared_backbone = bool(getattr(cfg, "train_shared_backbone", True))
+    train_fusion = bool(getattr(cfg, "train_fusion", False))
+    train_fusion_last_layer = bool(getattr(cfg, "train_fusion_last_layer", False))
+    if train_shared_backbone:
+        return
+
+    for module in actor.backbone_modules():
+        _set_module_requires_grad(module, False)
+
+    if train_fusion:
+        if getattr(actor, "encoder_type", "flat_mlp") == "set_pool":
+            _set_module_requires_grad(getattr(actor, "fusion_fc1", None), True)
+            _set_module_requires_grad(getattr(actor, "fusion_fc2", None), True)
+        else:
+            _set_module_requires_grad(getattr(actor, "fc1", None), True)
+            _set_module_requires_grad(getattr(actor, "fc2", None), True)
+        return
+
+    if train_fusion_last_layer:
+        if getattr(actor, "encoder_type", "flat_mlp") == "set_pool":
+            _set_module_requires_grad(getattr(actor, "fusion_fc2", None), True)
+        else:
+            _set_module_requires_grad(getattr(actor, "fc2", None), True)
+
+
+def _module_states_match(target_module, source_module) -> bool:
+    if target_module is None or source_module is None:
+        return target_module is None and source_module is None
+    target_state = target_module.state_dict()
+    source_state = source_module.state_dict()
+    if target_state.keys() != source_state.keys():
+        return False
+    for key, target_value in target_state.items():
+        source_value = source_state[key]
+        if tuple(target_value.shape) != tuple(source_value.shape):
+            return False
+        if not torch.equal(
+            target_value.detach().cpu(),
+            source_value.detach().to(device="cpu", dtype=target_value.dtype),
+        ):
+            return False
+    return True
+
+
+def _actor_backbone_matches(actor, source_actor) -> bool:
+    target_modules = actor.backbone_modules()
+    source_modules = source_actor.backbone_modules()
+    if len(target_modules) != len(source_modules):
+        return False
+    for target_module, source_module in zip(target_modules, source_modules):
+        if not _module_states_match(target_module, source_module):
+            return False
+    return True
+
+
+def _actor_head_is_frozen(actor, head: str) -> bool:
+    modules: List[torch.nn.Module] = []
+    if head == "accel":
+        modules.append(actor.mu_head)
+        if bool(actor.log_std.requires_grad):
+            return False
+    elif head == "bw":
+        if getattr(actor, "bw_user_encoder", None) is not None:
+            modules.append(actor.bw_user_encoder)
+        if getattr(actor, "bw_scorer", None) is not None:
+            modules.append(actor.bw_scorer)
+    elif head == "sat":
+        if getattr(actor, "sat_action_encoder", None) is not None:
+            modules.append(actor.sat_action_encoder)
+        if getattr(actor, "sat_scorer", None) is not None:
+            modules.append(actor.sat_scorer)
+    else:
+        raise ValueError(f"Unsupported actor head '{head}'")
+    for module in modules:
+        for param in module.parameters():
+            if param.requires_grad:
+                return False
+    return True
+
+
+def _copy_module_state_(target_module, source_module) -> None:
+    if target_module is None or source_module is None:
+        return
+    target_module.load_state_dict(source_module.state_dict(), strict=True)
+
+
+def _copy_actor_head_state_(actor, source_actor, head: str) -> None:
+    if head == "accel":
+        _copy_module_state_(actor.mu_head, source_actor.mu_head)
+        actor.log_std.data.copy_(source_actor.log_std.detach())
+        return
+    if head == "bw":
+        _copy_module_state_(getattr(actor, "bw_user_encoder", None), getattr(source_actor, "bw_user_encoder", None))
+        _copy_module_state_(getattr(actor, "bw_scorer", None), getattr(source_actor, "bw_scorer", None))
+        return
+    if head == "sat":
+        _copy_module_state_(
+            getattr(actor, "sat_action_encoder", None),
+            getattr(source_actor, "sat_action_encoder", None),
+        )
+        _copy_module_state_(getattr(actor, "sat_scorer", None), getattr(source_actor, "sat_scorer", None))
+        return
+    raise ValueError(f"Unsupported actor head '{head}'")
+
+
+def _resolve_frozen_teacher_exec_sources(
+    actor,
+    teacher_actor,
+    train_heads: Dict[str, bool],
+    exec_accel_source: str,
+    exec_bw_source: str,
+    exec_sat_source: str,
+) -> Tuple[str, str, str, List[str], List[str]]:
+    if teacher_actor is None:
+        return exec_accel_source, exec_bw_source, exec_sat_source, [], []
+
+    sources = {
+        "accel": exec_accel_source,
+        "bw": exec_bw_source,
+        "sat": exec_sat_source,
+    }
+    resolved: List[str] = []
+    kept: List[str] = []
+    backbone_frozen = actor.backbone_is_frozen()
+    backbone_matches = _actor_backbone_matches(actor, teacher_actor) if backbone_frozen else False
+
+    for head in ("accel", "bw", "sat"):
+        if sources[head] != "teacher":
+            continue
+        if bool(train_heads.get(head, False)):
+            kept.append(f"{head}(trainable)")
+            continue
+        if not _actor_head_is_frozen(actor, head):
+            kept.append(f"{head}(head_not_frozen)")
+            continue
+        if not backbone_frozen:
+            kept.append(f"{head}(backbone_not_frozen)")
+            continue
+        if not backbone_matches:
+            kept.append(f"{head}(backbone_mismatch)")
+            continue
+        _copy_actor_head_state_(actor, teacher_actor, head)
+        sources[head] = "policy"
+        resolved.append(head)
+
+    return sources["accel"], sources["bw"], sources["sat"], resolved, kept
+
+
+def _module_param_counts(module) -> Tuple[int, int]:
+    if module is None:
+        return 0, 0
+    total = 0
+    trainable = 0
+    for param in module.parameters():
+        total += int(param.numel())
+        if param.requires_grad:
+            trainable += int(param.numel())
+    return total, trainable
+
+
+def _format_actor_trainability_report(actor) -> str:
+    module_names: List[Tuple[str, object]] = []
+    if getattr(actor, "encoder_type", "flat_mlp") == "flat_mlp":
+        module_names.extend(
+            [
+                ("obs_norm", getattr(actor, "obs_norm", None)),
+                ("fc1", getattr(actor, "fc1", None)),
+                ("fc2", getattr(actor, "fc2", None)),
+            ]
+        )
+    else:
+        module_names.extend(
+            [
+                ("own_encoder", getattr(actor, "own_encoder", None)),
+                ("danger_nbr_encoder", getattr(actor, "danger_nbr_encoder", None)),
+                ("users_encoder", getattr(actor, "users_encoder", None)),
+                ("sats_encoder", getattr(actor, "sats_encoder", None)),
+                ("nbrs_encoder", getattr(actor, "nbrs_encoder", None)),
+                ("fusion_fc1", getattr(actor, "fusion_fc1", None)),
+                ("fusion_fc2", getattr(actor, "fusion_fc2", None)),
+            ]
+        )
+    module_names.extend(
+        [
+            ("mu_head", getattr(actor, "mu_head", None)),
+            ("log_std", None),
+            ("bw_user_encoder", getattr(actor, "bw_user_encoder", None)),
+            ("bw_scorer", getattr(actor, "bw_scorer", None)),
+            ("sat_action_encoder", getattr(actor, "sat_action_encoder", None)),
+            ("sat_scorer", getattr(actor, "sat_scorer", None)),
+        ]
+    )
+
+    lines: List[str] = []
+    for name, module in module_names:
+        if name == "log_std":
+            total = int(actor.log_std.numel())
+            trainable = total if bool(actor.log_std.requires_grad) else 0
+        else:
+            total, trainable = _module_param_counts(module)
+        if total <= 0:
+            continue
+        if trainable <= 0:
+            state = "frozen"
+        elif trainable >= total:
+            state = "trainable"
+        else:
+            state = "partial"
+        lines.append(f"{name}={state}({trainable}/{total})")
+
+    trainable_names = [name for name, param in actor.named_parameters() if param.requires_grad]
+    return (
+        "Actor module freeze map: "
+        + ", ".join(lines)
+        + "\nActor trainable parameters:\n  - "
+        + "\n  - ".join(trainable_names)
+    )
+
+
+def _scheduled_three_phase_weight(
+    update_idx: int,
+    total_updates: int,
+    weight_init: float,
+    weight_mid: float,
+    weight_floor: float,
+    hold_ratio: float,
+    mid_ratio: float,
+) -> float:
+    if weight_init <= 0.0 and weight_mid <= 0.0 and weight_floor <= 0.0:
+        return 0.0
+    hold = float(np.clip(hold_ratio, 0.0, 1.0))
+    mid = float(np.clip(mid_ratio, hold, 1.0))
+    floor = min(max(float(weight_floor), 0.0), max(float(weight_mid), 0.0))
+    progress = 1.0
+    if total_updates > 0:
+        progress = float(np.clip((update_idx + 1) / max(total_updates, 1), 0.0, 1.0))
+    if progress <= hold:
+        return float(weight_init)
+    if progress <= mid:
+        alpha = (progress - hold) / max(mid - hold, 1e-9)
+        return float(weight_init + (weight_mid - weight_init) * alpha)
+    alpha = (progress - mid) / max(1.0 - mid, 1e-9)
+    return float(weight_mid + (floor - weight_mid) * alpha)
+
+
+def _estimate_aux_schedule_total_updates(cfg, planned_total_updates: int) -> int:
+    estimates: List[int] = []
+    checkpoint_eval_enabled = bool(getattr(cfg, "checkpoint_eval_enabled", False))
+    checkpoint_eval_interval = max(int(getattr(cfg, "checkpoint_eval_interval_updates", 0) or 0), 0)
+    checkpoint_eval_start = max(int(getattr(cfg, "checkpoint_eval_start_update", 0) or 0), 0)
+    if checkpoint_eval_enabled and checkpoint_eval_interval > 0 and bool(
+        getattr(cfg, "checkpoint_eval_early_stop_enabled", True)
+    ):
+        if checkpoint_eval_start <= 0:
+            checkpoint_eval_start = checkpoint_eval_interval
+        if bool(getattr(cfg, "checkpoint_eval_reward_early_stop_enabled", False)):
+            reward_patience = max(int(getattr(cfg, "checkpoint_eval_reward_patience", 5) or 0), 1)
+            estimates.append(checkpoint_eval_start + checkpoint_eval_interval * reward_patience)
+        if bool(getattr(cfg, "checkpoint_eval_sat_drop_early_stop_enabled", True)):
+            quality_patience = max(int(getattr(cfg, "checkpoint_eval_worsen_patience", 2) or 0), 1)
+            estimates.append(checkpoint_eval_start + checkpoint_eval_interval * quality_patience)
+
+    if bool(getattr(cfg, "early_stop_enabled", False)):
+        early_stop_min_updates = max(int(getattr(cfg, "early_stop_min_updates", 0) or 0), 0)
+        early_stop_window = max(int(getattr(cfg, "early_stop_window", 1) or 1), 1)
+        early_stop_patience = max(int(getattr(cfg, "early_stop_patience", 1) or 1), 1)
+        estimates.append(max(early_stop_min_updates, early_stop_window) + early_stop_patience - 1)
+
+    if not estimates:
+        return max(int(planned_total_updates or 0), 1)
+    effective_total = min(max(int(planned_total_updates or 0), 1), min(estimates))
+    return max(effective_total, 1)
+
+
+def _compute_train_reward_adjustment(
+    stats: Dict[str, object],
+    cfg,
+    update_idx: int,
+    total_updates: int,
+) -> Tuple[float, Dict[str, object]]:
+    parts = dict(stats.get("reward_parts", {}) or {})
+    num_uav = max(int(getattr(cfg, "num_uav", 0) or 0), 0)
+    stage1_metric_uav = np.asarray(
+        stats.get("assoc_centroid_dist_norms", np.zeros((num_uav,), dtype=np.float32)),
+        dtype=np.float32,
+    ).reshape(-1)
+    stage3_metric_uav = np.asarray(
+        stats.get("sat_overlap_uav", np.zeros((num_uav,), dtype=np.float32)),
+        dtype=np.float32,
+    ).reshape(-1)
+    stage1_weight = 0.0
+    stage1_metric = float(parts.get("assoc_centroid_dist_norm_mean", 0.0))
+    stage1_term = 0.0
+    if bool(getattr(cfg, "reward_stage1_assoc_centroid_enabled", False)):
+        stage1_weight = _scheduled_three_phase_weight(
+            update_idx,
+            total_updates,
+            max(float(getattr(cfg, "reward_stage1_assoc_centroid_weight_init", 0.0) or 0.0), 0.0),
+            max(float(getattr(cfg, "reward_stage1_assoc_centroid_weight_mid", 0.0) or 0.0), 0.0),
+            max(float(getattr(cfg, "reward_stage1_assoc_centroid_weight_floor", 0.0) or 0.0), 0.0),
+            float(getattr(cfg, "reward_stage1_assoc_centroid_hold_ratio", 0.30) or 0.30),
+            float(getattr(cfg, "reward_stage1_assoc_centroid_mid_ratio", 0.70) or 0.70),
+        )
+        stage1_term = -stage1_weight * stage1_metric
+
+    stage3_weight = 0.0
+    stage3_metric = float(parts.get("sat_overlap_eval", 0.0))
+    stage3_term = 0.0
+    if bool(getattr(cfg, "reward_stage3_sat_overlap_enabled", False)):
+        stage3_weight = _scheduled_three_phase_weight(
+            update_idx,
+            total_updates,
+            max(float(getattr(cfg, "reward_stage3_sat_overlap_weight_init", 0.0) or 0.0), 0.0),
+            max(float(getattr(cfg, "reward_stage3_sat_overlap_weight_mid", 0.0) or 0.0), 0.0),
+            max(float(getattr(cfg, "reward_stage3_sat_overlap_weight_floor", 0.0) or 0.0), 0.0),
+            float(getattr(cfg, "reward_stage3_sat_overlap_hold_ratio", 0.40) or 0.40),
+            float(getattr(cfg, "reward_stage3_sat_overlap_mid_ratio", 0.80) or 0.80),
+        )
+        stage3_term = -stage3_weight * stage3_metric
+
+    reward_aux = stage1_term + stage3_term
+    return reward_aux, {
+        "reward_aux": reward_aux,
+        "stage1_assoc_centroid_dist_norm_mean": stage1_metric,
+        "stage1_assoc_centroid_dist_norm_uav": stage1_metric_uav,
+        "stage1_assoc_centroid_weight": stage1_weight,
+        "stage1_assoc_centroid_term": stage1_term,
+        "stage3_sat_overlap_eval": stage3_metric,
+        "stage3_sat_overlap_uav": stage3_metric_uav,
+        "stage3_sat_overlap_weight": stage3_weight,
+        "stage3_sat_overlap_term": stage3_term,
+    }
+
+
+def _checkpoint_eval_best_summary_from_state(state: Dict[str, float]) -> Dict[str, float] | None:
+    pre_backlog = float(state.get("best_pre_backlog_steps_eval", float("inf")))
+    if not np.isfinite(pre_backlog):
+        return None
+    return {
+        "reward_sum": float(state.get("best_model_reward_sum", -float("inf"))),
+        "processed_ratio_eval": float(state.get("best_processed_ratio_eval", -float("inf"))),
+        "drop_ratio_eval": float(state.get("best_drop_ratio_eval", float("inf"))),
+        "pre_backlog_steps_eval": pre_backlog,
+        "collision_episode_fraction": float(state.get("best_collision_episode_fraction", float("inf"))),
+        "sat_overlap_eval": float(state.get("best_sat_overlap_eval", float("inf"))),
+    }
+
+
+def _checkpoint_eval_model_better(
+    summary: Dict[str, float],
+    best_summary: Dict[str, float] | None,
+    cfg,
+) -> bool:
+    if best_summary is None:
+        return True
+
+    model_collision_threshold = max(
+        float(getattr(cfg, "checkpoint_eval_model_collision_threshold", 0.0) or 0.0),
+        0.0,
+    )
+    reward_tie_rel_tol = max(
+        float(getattr(cfg, "checkpoint_eval_reward_tie_rel_tol", 0.05) or 0.0),
+        0.0,
+    )
+    use_sat_overlap = bool(getattr(cfg, "checkpoint_eval_use_sat_overlap", False))
+
+    current_collision = float(summary["collision_episode_fraction"])
+    best_collision = float(best_summary["collision_episode_fraction"])
+    current_collision_pass = current_collision <= model_collision_threshold
+    best_collision_pass = best_collision <= model_collision_threshold
+    if current_collision_pass != best_collision_pass:
+        return current_collision_pass
+    if not current_collision_pass:
+        if current_collision < best_collision - 1e-12:
+            return True
+        if current_collision > best_collision + 1e-12:
+            return False
+
+    current_pre = float(summary["pre_backlog_steps_eval"])
+    best_pre = float(best_summary["pre_backlog_steps_eval"])
+    tie_band = reward_tie_rel_tol * max(abs(best_pre), 1.0)
+    if current_pre < best_pre - tie_band:
+        return True
+    if current_pre > best_pre + tie_band:
+        return False
+
+    current_processed = float(summary["processed_ratio_eval"])
+    best_processed = float(best_summary["processed_ratio_eval"])
+    current_reward = float(summary["reward_sum"])
+    best_reward = float(best_summary["reward_sum"])
+    if use_sat_overlap:
+        if current_processed > best_processed + 1e-12:
+            return True
+        if current_processed < best_processed - 1e-12:
+            return False
+        current_overlap = float(summary.get("sat_overlap_eval", 0.0))
+        best_overlap = float(best_summary.get("sat_overlap_eval", float("inf")))
+        if current_overlap < best_overlap - 1e-12:
+            return True
+        if current_overlap > best_overlap + 1e-12:
+            return False
+        return current_reward > best_reward + 1e-12
+
+    if current_reward > best_reward + 1e-12:
+        return True
+    if current_reward < best_reward - 1e-12:
+        return False
+    return current_processed > best_processed + 1e-12
+
+
 def _sum_selected_parts(parts: Dict[str, torch.Tensor], train_heads: Dict[str, bool]) -> torch.Tensor:
     order = ("accel", "bw", "sat")
     selected: List[torch.Tensor] = []
@@ -146,6 +572,36 @@ def _sum_selected_parts(parts: Dict[str, torch.Tensor], train_heads: Dict[str, b
     for item in selected[1:]:
         out = out + item
     return out
+
+
+def _selected_train_head_names(train_heads: Dict[str, bool]) -> Tuple[str, ...]:
+    return tuple(head for head in ("accel", "bw", "sat") if bool(train_heads.get(head, False)))
+
+
+def _exec_source_head_names(
+    cfg,
+    exec_accel_source: str,
+    exec_bw_source: str,
+    exec_sat_source: str,
+    target_source: str,
+) -> Tuple[str, ...]:
+    heads: list[str] = []
+    if exec_accel_source == target_source:
+        heads.append("accel")
+    if bool(cfg.enable_bw_action) and exec_bw_source == target_source:
+        heads.append("bw")
+    if not bool(cfg.fixed_satellite_strategy) and exec_sat_source == target_source:
+        heads.append("sat")
+    return tuple(heads)
+
+
+def _merge_head_names(*head_groups: Tuple[str, ...]) -> Tuple[str, ...]:
+    order = ("accel", "bw", "sat")
+    merged: list[str] = []
+    for head in order:
+        if any(head in group for group in head_groups):
+            merged.append(head)
+    return tuple(merged)
 
 
 def _normalize_exec_source(raw: str | None) -> str:
@@ -398,6 +854,20 @@ def _checkpoint_eval_summary(
         eval_cfg = replace(cfg, fixed_satellite_strategy=True, train_sat=False)
 
     eval_env = SaginParallelEnv(eval_cfg)
+    policy_exec_heads = _exec_source_head_names(
+        eval_cfg,
+        exec_accel_source,
+        exec_bw_source,
+        exec_sat_source,
+        "policy",
+    )
+    teacher_exec_heads = _exec_source_head_names(
+        eval_cfg,
+        exec_accel_source,
+        exec_bw_source,
+        exec_sat_source,
+        "teacher",
+    )
     try:
         reward_sum_total = 0.0
         processed_ratio_total = 0.0
@@ -408,6 +878,7 @@ def _checkpoint_eval_summary(
         x_rel_total = 0.0
         g_pre_total = 0.0
         d_pre_total = 0.0
+        sat_overlap_total = 0.0
         collision_total = 0.0
 
         for ep in range(max(int(episodes), 1)):
@@ -423,6 +894,7 @@ def _checkpoint_eval_summary(
             x_rel_sum = 0.0
             g_pre_sum = 0.0
             d_pre_sum = 0.0
+            sat_overlap_sum = 0.0
             sat_processed_sum_ep = 0.0
             collision_any = 0.0
 
@@ -446,7 +918,12 @@ def _checkpoint_eval_summary(
                         obs_batch = batch_flatten_obs(obs_list, cfg)
                         obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
                         with torch.inference_mode():
-                            teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
+                            teacher_out = teacher_actor.act(
+                                obs_tensor,
+                                deterministic=teacher_deterministic,
+                                required_heads=("accel",),
+                                compute_logprob=False,
+                            )
                         _, heur_bw, heur_sat = queue_aware_policy(obs_list, eval_cfg)
                         actions = assemble_actions(
                             eval_cfg,
@@ -463,13 +940,27 @@ def _checkpoint_eval_summary(
                         obs_batch = batch_flatten_obs(obs_list, eval_cfg)
                         obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
                         with torch.inference_mode():
-                            policy_out = actor.act(obs_tensor, deterministic=True)
+                            policy_out = actor.act(
+                                obs_tensor,
+                                deterministic=True,
+                                required_heads=policy_exec_heads,
+                                compute_logprob=False,
+                            )
                         teacher_accel = None
                         teacher_bw = None
-                        if teacher_actor is not None:
+                        if teacher_actor is not None and teacher_exec_heads:
                             with torch.inference_mode():
-                                teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
-                            teacher_accel = teacher_out.accel.cpu().numpy()
+                                teacher_out = teacher_actor.act(
+                                    obs_tensor,
+                                    deterministic=teacher_deterministic,
+                                    required_heads=teacher_exec_heads,
+                                    compute_logprob=False,
+                                )
+                            teacher_accel = (
+                                teacher_out.accel.cpu().numpy()
+                                if teacher_out.accel is not None
+                                else None
+                            )
                             teacher_bw = (
                                 teacher_out.bw_action.cpu().numpy()
                                 if teacher_out.bw_action is not None
@@ -481,7 +972,7 @@ def _checkpoint_eval_summary(
                             heur_accel, heur_bw, _ = queue_aware_policy(obs_list, eval_cfg)
                         accel_actions = _select_exec_values(
                             exec_accel_source,
-                            policy_out.accel.cpu().numpy(),
+                            policy_out.accel.cpu().numpy() if policy_out.accel is not None else None,
                             teacher_accel,
                             heur_accel,
                             (len(eval_env.agents), 2),
@@ -513,14 +1004,28 @@ def _checkpoint_eval_summary(
                     obs_batch = batch_flatten_obs(obs_list, cfg)
                     obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=device)
                     with torch.inference_mode():
-                        policy_out = actor.act(obs_tensor, deterministic=True)
+                        policy_out = actor.act(
+                            obs_tensor,
+                            deterministic=True,
+                            required_heads=policy_exec_heads,
+                            compute_logprob=False,
+                        )
                     teacher_accel = None
                     teacher_bw = None
                     teacher_sat = None
-                    if teacher_actor is not None:
+                    if teacher_actor is not None and teacher_exec_heads:
                         with torch.inference_mode():
-                            teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
-                        teacher_accel = teacher_out.accel.cpu().numpy()
+                            teacher_out = teacher_actor.act(
+                                obs_tensor,
+                                deterministic=teacher_deterministic,
+                                required_heads=teacher_exec_heads,
+                                compute_logprob=False,
+                            )
+                        teacher_accel = (
+                            teacher_out.accel.cpu().numpy()
+                            if teacher_out.accel is not None
+                            else None
+                        )
                         teacher_bw = (
                             teacher_out.bw_action.cpu().numpy() if teacher_out.bw_action is not None else None
                         )
@@ -536,7 +1041,7 @@ def _checkpoint_eval_summary(
                         heur_accel, heur_bw, heur_sat = queue_aware_policy(obs_list, cfg)
                     accel_actions = _select_exec_values(
                         exec_accel_source,
-                        policy_out.accel.cpu().numpy(),
+                        policy_out.accel.cpu().numpy() if policy_out.accel is not None else None,
                         teacher_accel,
                         heur_accel,
                         (len(eval_env.agents), 2),
@@ -588,6 +1093,7 @@ def _checkpoint_eval_summary(
                 x_rel_sum += float(parts.get('x_rel', 0.0))
                 g_pre_sum += float(parts.get('g_pre', 0.0))
                 d_pre_sum += float(parts.get('d_pre', 0.0))
+                sat_overlap_sum += float(parts.get('sat_overlap_eval', 0.0))
                 sat_processed_sum_ep += float(parts.get('sat_processed_sum', 0.0))
                 collision_any = max(collision_any, float(parts.get('collision_event', 0.0)))
 
@@ -600,6 +1106,7 @@ def _checkpoint_eval_summary(
             x_rel_total += x_rel_sum / float(steps)
             g_pre_total += g_pre_sum / float(steps)
             d_pre_total += d_pre_sum / float(steps)
+            sat_overlap_total += sat_overlap_sum / float(steps)
             d_sys_total += (
                 float(np.sum(eval_env.gu_queue) + np.sum(eval_env.uav_queue) + np.sum(eval_env.sat_queue))
                 / max(sat_processed_sum_ep, 1e-9)
@@ -618,6 +1125,7 @@ def _checkpoint_eval_summary(
             'x_rel_mean': x_rel_total / denom,
             'g_pre_mean': g_pre_total / denom,
             'd_pre_mean': d_pre_total / denom,
+            'sat_overlap_eval': sat_overlap_total / denom,
             'collision_episode_fraction': collision_total / denom,
         }
     finally:
@@ -640,6 +1148,7 @@ def _checkpoint_eval_fieldnames() -> List[str]:
         'x_rel_mean',
         'g_pre_mean',
         'd_pre_mean',
+        'sat_overlap_eval',
         'collision_episode_fraction',
         'fixed_reward_sum',
         'fixed_processed_ratio_eval',
@@ -650,6 +1159,7 @@ def _checkpoint_eval_fieldnames() -> List[str]:
         'fixed_x_rel_mean',
         'fixed_g_pre_mean',
         'fixed_d_pre_mean',
+        'fixed_sat_overlap_eval',
         'fixed_collision_episode_fraction',
         'processed_improved',
         'drop_improved',
@@ -716,9 +1226,8 @@ def _update_checkpoint_eval_state(
         (not np.isfinite(best_pre_backlog_prev))
         or pre_backlog < best_pre_backlog_prev * (1.0 - rel_tol)
     )
-    current_key = (processed, -drop_ratio, -pre_backlog)
-    best_key = (best_processed_prev, -best_drop_prev, -best_pre_backlog_prev)
-    model_improved = (not np.isfinite(best_processed_prev)) or current_key > best_key
+    best_summary_prev = _checkpoint_eval_best_summary_from_state(state)
+    model_improved = _checkpoint_eval_model_better(summary, best_summary_prev, cfg)
     quality_worsened = (
         prev_processed is not None
         and prev_drop is not None
@@ -734,6 +1243,9 @@ def _update_checkpoint_eval_state(
         state["best_processed_ratio_eval"] = processed
         state["best_drop_ratio_eval"] = drop_ratio
         state["best_pre_backlog_steps_eval"] = pre_backlog
+        state["best_model_reward_sum"] = reward_sum
+        state["best_collision_episode_fraction"] = collision_frac
+        state["best_sat_overlap_eval"] = float(summary.get("sat_overlap_eval", 0.0))
     if (not np.isfinite(best_reward_prev)) or reward_sum > best_reward_prev:
         state["best_reward_sum"] = reward_sum
 
@@ -847,17 +1359,11 @@ def train(
     }
     if not any(train_heads.values()):
         raise ValueError("At least one of train_accel/train_bw/train_sat must be true.")
+    train_head_names = _selected_train_head_names(train_heads)
 
     train_shared_backbone = bool(getattr(cfg, "train_shared_backbone", True))
-    _set_module_requires_grad(actor.mu_head, train_heads["accel"])
-    actor.log_std.requires_grad = train_heads["accel"]
-    _set_module_requires_grad(getattr(actor, "bw_user_encoder", None), train_heads["bw"])
-    _set_module_requires_grad(getattr(actor, "bw_scorer", None), train_heads["bw"])
-    _set_module_requires_grad(getattr(actor, "sat_action_encoder", None), train_heads["sat"])
-    _set_module_requires_grad(getattr(actor, "sat_scorer", None), train_heads["sat"])
-    if not train_shared_backbone:
-        for module in actor.backbone_modules():
-            _set_module_requires_grad(module, False)
+    _configure_actor_trainability(actor, cfg, train_heads)
+    cache_actor_ctx = actor.backbone_is_frozen()
 
     actor_params = [p for p in actor.parameters() if p.requires_grad]
     if not actor_params:
@@ -882,6 +1388,7 @@ def train(
         saved_planned_total_updates = int(resume_payload.get("planned_total_updates", 0) or 0)
         if saved_planned_total_updates > 0:
             planned_total_updates = saved_planned_total_updates
+    aux_schedule_total_updates = _estimate_aux_schedule_total_updates(cfg, planned_total_updates)
 
     lr_decay_enabled = bool(getattr(cfg, "lr_decay_enabled", False))
     lr_final_factor = float(getattr(cfg, "lr_final_factor", 0.1) or 0.1)
@@ -928,6 +1435,8 @@ def train(
         "episode_length_mean",
         "completed_episode_count",
         "rollout_reward_per_step",
+        "reward_raw",
+        "reward_aux",
         "x_acc",
         "x_rel",
         "g_pre",
@@ -935,6 +1444,12 @@ def train(
         "processed_ratio_eval",
         "drop_ratio_eval",
         "pre_backlog_steps_eval",
+        "assoc_centroid_dist_norm_mean",
+        "stage1_assoc_centroid_weight",
+        "stage1_assoc_centroid_term",
+        "sat_overlap_eval",
+        "stage3_sat_overlap_weight",
+        "stage3_sat_overlap_term",
         "D_sys_report",
         "episode_term_throughput_access",
         "episode_term_throughput_backhaul",
@@ -974,6 +1489,15 @@ def train(
         "update_time_sec",
         "rollout_time_sec",
         "optim_time_sec",
+        "dynamics_time_sec",
+        "orbit_visible_time_sec",
+        "assoc_access_time_sec",
+        "backhaul_queue_time_sec",
+        "reward_time_sec",
+        "obs_time_sec",
+        "state_time_sec",
+        "global_state_time_sec",
+        "step_total_time_sec",
         "env_steps_per_sec",
         "update_steps_per_sec",
         "total_env_steps",
@@ -982,6 +1506,8 @@ def train(
     tb_fields = [
         "episode_reward",
         "rollout_reward_per_step",
+        "reward_raw",
+        "reward_aux",
         "x_acc",
         "x_rel",
         "g_pre",
@@ -989,6 +1515,8 @@ def train(
         "processed_ratio_eval",
         "drop_ratio_eval",
         "pre_backlog_steps_eval",
+        "assoc_centroid_dist_norm_mean",
+        "sat_overlap_eval",
         "episode_term_throughput_access",
         "episode_term_throughput_backhaul",
         "episode_term_queue_gu_arrival",
@@ -1013,6 +1541,8 @@ def train(
     env_step_fields = [
         "episode_reward",
         "rollout_reward_per_step",
+        "reward_raw",
+        "reward_aux",
         "x_acc",
         "x_rel",
         "g_pre",
@@ -1020,6 +1550,8 @@ def train(
         "processed_ratio_eval",
         "drop_ratio_eval",
         "pre_backlog_steps_eval",
+        "assoc_centroid_dist_norm_mean",
+        "sat_overlap_eval",
         "episode_term_throughput_access",
         "episode_term_throughput_backhaul",
         "episode_term_queue_gu_arrival",
@@ -1031,6 +1563,11 @@ def train(
         "queue_total_active",
         "collision_rate",
     ]
+    stage1_agent_metric_names = [f"stage1_aux_agent{i}" for i in range(num_agents)]
+    stage3_agent_metric_names = [f"stage3_overlap_agent{i}" for i in range(num_agents)]
+    metric_fields.extend(stage1_agent_metric_names + stage3_agent_metric_names)
+    tb_fields.extend(stage1_agent_metric_names + stage3_agent_metric_names)
+    env_step_fields.extend(stage1_agent_metric_names + stage3_agent_metric_names)
     logger = MetricLogger(
         log_dir,
         fieldnames=metric_fields,
@@ -1079,10 +1616,10 @@ def train(
     danger_imitation_enabled = bool(getattr(cfg, "danger_imitation_enabled", False)) and danger_imitation_coef > 0.0
     if danger_imitation_enabled and not train_heads["accel"]:
         raise ValueError("danger_imitation_enabled=true requires train_accel=true")
+    teacher_deterministic = bool(getattr(cfg, "exec_teacher_deterministic", True))
     exec_accel_source = _normalize_exec_source(getattr(cfg, "exec_accel_source", "policy"))
     exec_bw_source = _normalize_exec_source(getattr(cfg, "exec_bw_source", "policy"))
     exec_sat_source = _normalize_exec_source(getattr(cfg, "exec_sat_source", "policy"))
-    teacher_deterministic = bool(getattr(cfg, "exec_teacher_deterministic", True))
     need_teacher_exec = "teacher" in {exec_accel_source, exec_bw_source, exec_sat_source}
     need_heuristic_exec = any(
         _source_needs_heuristic(src) for src in (exec_accel_source, exec_bw_source, exec_sat_source)
@@ -1102,13 +1639,58 @@ def train(
         teacher_actor.eval()
         for p in teacher_actor.parameters():
             p.requires_grad = False
+        (
+            exec_accel_source,
+            exec_bw_source,
+            exec_sat_source,
+            resolved_teacher_heads,
+            kept_teacher_heads,
+        ) = _resolve_frozen_teacher_exec_sources(
+            actor,
+            teacher_actor,
+            train_heads,
+            exec_accel_source,
+            exec_bw_source,
+            exec_sat_source,
+        )
+        if resolved_teacher_heads:
+            print(
+                "Resolved frozen teacher exec heads to current actor: "
+                + ", ".join(resolved_teacher_heads)
+            )
+        if kept_teacher_heads:
+            print(
+                "Keeping runtime teacher exec for heads: "
+                + ", ".join(kept_teacher_heads)
+            )
+    policy_exec_heads = _exec_source_head_names(
+        cfg,
+        exec_accel_source,
+        exec_bw_source,
+        exec_sat_source,
+        "policy",
+    )
+    teacher_exec_heads = _exec_source_head_names(
+        cfg,
+        exec_accel_source,
+        exec_bw_source,
+        exec_sat_source,
+        "teacher",
+    )
+    rollout_policy_heads = _merge_head_names(policy_exec_heads, train_head_names)
     print(
         "Train heads: "
         f"accel={train_heads['accel']}, bw={train_heads['bw']}, sat={train_heads['sat']} | "
+        f"train_shared_backbone={train_shared_backbone}, "
+        f"train_fusion={bool(getattr(cfg, 'train_fusion', False))}, "
+        f"train_fusion_last_layer={bool(getattr(cfg, 'train_fusion_last_layer', False))} | "
+        f"backbone_ctx_cache={cache_actor_ctx} | "
+        f"aux_schedule_total_updates={aux_schedule_total_updates} | "
         f"danger_imitation={danger_imitation_enabled} | "
         "Exec sources: "
         f"accel={exec_accel_source}, bw={exec_bw_source}, sat={exec_sat_source}"
     )
+    print(_format_actor_trainability_report(actor))
 
     obs_env = list(obs_sample_env) if num_envs > 1 else [obs_sample_raw]
     checkpoint_eval_interval = max(int(getattr(cfg, "checkpoint_eval_interval_updates", 0) or 0), 0)
@@ -1135,6 +1717,10 @@ def train(
         else None
     )
     checkpoint_eval_early_stop_enabled = bool(getattr(cfg, "checkpoint_eval_early_stop_enabled", True))
+    best_checkpoint_saved = (
+        os.path.exists(os.path.join(log_dir, "actor_best.pt"))
+        and os.path.exists(os.path.join(log_dir, "critic_best.pt"))
+    )
     if checkpoint_eval_enabled:
         if resume_meta is None and os.path.exists(checkpoint_eval_csv_path):
             os.remove(checkpoint_eval_csv_path)
@@ -1160,6 +1746,7 @@ def train(
                 f"processed={checkpoint_eval_fixed_summary['processed_ratio_eval']:.4f}, "
                 f"drop={checkpoint_eval_fixed_summary['drop_ratio_eval']:.4f}, "
                 f"pre_backlog={checkpoint_eval_fixed_summary['pre_backlog_steps_eval']:.4f}, "
+                f"sat_overlap={checkpoint_eval_fixed_summary['sat_overlap_eval']:.4f}, "
                 f"collision={checkpoint_eval_fixed_summary['collision_episode_fraction']:.4f}"
             )
         else:
@@ -1169,6 +1756,7 @@ def train(
                 f"processed={checkpoint_eval_fixed_summary['processed_ratio_eval']:.4f}, "
                 f"drop={checkpoint_eval_fixed_summary['drop_ratio_eval']:.4f}, "
                 f"pre_backlog={checkpoint_eval_fixed_summary['pre_backlog_steps_eval']:.4f}, "
+                f"sat_overlap={checkpoint_eval_fixed_summary['sat_overlap_eval']:.4f}, "
                 f"collision={checkpoint_eval_fixed_summary['collision_episode_fraction']:.4f}"
             )
 
@@ -1208,6 +1796,8 @@ def train(
     recent_episode_term_throughput_backhaul: deque[float] = deque(maxlen=episode_stat_window)
     recent_episode_term_queue_gu_arrival: deque[float] = deque(maxlen=episode_stat_window)
     recent_episode_collisions: deque[float] = deque(maxlen=episode_stat_window)
+    debug_first_minibatch_ratio = bool(getattr(cfg, "debug_first_minibatch_ratio", False))
+    debug_first_minibatch_ratio_printed = False
     for local_update in range(total_updates):
         update = resume_update + local_update
         imitation_coef_curr = _imitation_coef_at(update)
@@ -1284,6 +1874,7 @@ def train(
         danger_imitation_loss_sum = 0.0
         residual_reg_loss_sum = 0.0
         reward_raw_sum = 0.0
+        reward_aux_sum = 0.0
         x_acc_sum = 0.0
         x_rel_sum = 0.0
         g_pre_sum = 0.0
@@ -1291,6 +1882,14 @@ def train(
         processed_ratio_eval_sum = 0.0
         drop_ratio_eval_sum = 0.0
         pre_backlog_steps_eval_sum = 0.0
+        assoc_centroid_dist_norm_sum = 0.0
+        stage1_assoc_centroid_weight_sum = 0.0
+        stage1_assoc_centroid_term_sum = 0.0
+        sat_overlap_eval_sum = 0.0
+        stage3_sat_overlap_weight_sum = 0.0
+        stage3_sat_overlap_term_sum = 0.0
+        stage1_aux_agent_sum = np.zeros((num_agents,), dtype=np.float64)
+        stage3_overlap_agent_sum = np.zeros((num_agents,), dtype=np.float64)
         d_sys_report_sum = 0.0
         arrival_sum_sum = 0.0
         outflow_sum_sum = 0.0
@@ -1364,6 +1963,9 @@ def train(
         q_norm_tail_hit_count = 0
         q_norm_active_max = 0.0
         queue_total_active_max = 0.0
+        rollout_logprob_part_accel: list[np.ndarray] = []
+        rollout_logprob_part_bw: list[np.ndarray] = []
+        rollout_logprob_part_sat: list[np.ndarray] = []
 
         rollout_start = time.perf_counter()
         state_fetch_time = 0.0
@@ -1391,18 +1993,32 @@ def train(
 
             policy_forward_start = time.perf_counter()
             with torch.inference_mode():
-                policy_out = actor.act(obs_tensor)
+                policy_out = actor.act(
+                    obs_tensor,
+                    required_heads=rollout_policy_heads,
+                    compute_logprob=False,
+                )
                 value = critic(torch.from_numpy(curr_state_batch_np).to(device))
-            if not torch.isfinite(policy_out.dist_out["mu"]).all():
-                print(f"NaN/Inf detected in actor mu at update={update}, step={step}")
-                raise ValueError("actor mu contains NaN/Inf")
+            for key, value_tensor in (policy_out.dist_out or {}).items():
+                if torch.is_tensor(value_tensor) and not torch.isfinite(value_tensor).all():
+                    print(f"NaN/Inf detected in actor dist_out['{key}'] at update={update}, step={step}")
+                    raise ValueError(f"actor dist_out['{key}'] contains NaN/Inf")
             teacher_accel_all = None
             teacher_bw_all = None
             teacher_sat_all = None
-            if teacher_actor is not None:
+            if teacher_actor is not None and teacher_exec_heads:
                 with torch.inference_mode():
-                    teacher_out = teacher_actor.act(obs_tensor, deterministic=teacher_deterministic)
-                teacher_accel_all = teacher_out.accel.cpu().numpy()
+                    teacher_out = teacher_actor.act(
+                        obs_tensor,
+                        deterministic=teacher_deterministic,
+                        required_heads=teacher_exec_heads,
+                        compute_logprob=False,
+                    )
+                teacher_accel_all = (
+                    teacher_out.accel.cpu().numpy()
+                    if teacher_out.accel is not None
+                    else None
+                )
                 teacher_bw_all = teacher_out.bw_action.cpu().numpy() if teacher_out.bw_action is not None else None
                 teacher_sat_all = (
                     teacher_out.sat_select_mask.cpu().numpy()
@@ -1412,13 +2028,25 @@ def train(
             policy_forward_time += time.perf_counter() - policy_forward_start
 
             action_pack_start = time.perf_counter()
-            accel_actions = policy_out.accel.cpu().numpy()
+            accel_actions = policy_out.accel.cpu().numpy() if policy_out.accel is not None else None
             bw_logits_all = policy_out.bw_action.cpu().numpy() if policy_out.bw_action is not None else None
             sat_logits_all = (
                 policy_out.sat_select_mask.cpu().numpy()
                 if policy_out.sat_select_mask is not None
                 else None
             )
+            if exec_accel_source == "policy" and accel_actions is None:
+                raise ValueError("exec_accel_source='policy' requires accel head output from actor.act().")
+            if cfg.enable_bw_action and exec_bw_source == "policy" and bw_logits_all is None:
+                raise ValueError("exec_bw_source='policy' requires bw head output from actor.act().")
+            if not cfg.fixed_satellite_strategy and exec_sat_source == "policy" and sat_logits_all is None:
+                raise ValueError("exec_sat_source='policy' requires sat head output from actor.act().")
+            if exec_accel_source == "teacher" and teacher_accel_all is None:
+                raise ValueError("exec_accel_source='teacher' requires accel head output from teacher actor.")
+            if cfg.enable_bw_action and exec_bw_source == "teacher" and teacher_bw_all is None:
+                raise ValueError("exec_bw_source='teacher' requires bw head output from teacher actor.")
+            if not cfg.fixed_satellite_strategy and exec_sat_source == "teacher" and teacher_sat_all is None:
+                raise ValueError("exec_sat_source='teacher' requires sat head output from teacher actor.")
 
             action_dicts = []
             accel_cmd_list: List[np.ndarray] = []
@@ -1427,7 +2055,7 @@ def train(
             for env_idx in range(num_envs):
                 sl = slice(env_idx * num_agents, (env_idx + 1) * num_agents)
                 obs_list = per_env_obs_lists[env_idx]
-                accel_policy_env = accel_actions[sl]
+                accel_policy_env = accel_actions[sl] if accel_actions is not None else None
                 bw_policy_env = bw_logits_all[sl] if bw_logits_all is not None else None
                 sat_policy_env = sat_logits_all[sl] if sat_logits_all is not None else None
                 accel_teacher_env = teacher_accel_all[sl] if teacher_accel_all is not None else None
@@ -1568,7 +2196,15 @@ def train(
                     action_vec_exec_t,
                     sat_indices=sat_indices_exec_t,
                     out=policy_out.dist_out,
+                    heads=train_head_names,
+                    need_entropy=False,
                 )
+                if debug_first_minibatch_ratio and not debug_first_minibatch_ratio_printed:
+                    rollout_logprob_part_accel.append(logprob_parts["accel"].detach().cpu().numpy().reshape(-1))
+                    if "bw" in logprob_parts:
+                        rollout_logprob_part_bw.append(logprob_parts["bw"].detach().cpu().numpy().reshape(-1))
+                    if "sat" in logprob_parts:
+                        rollout_logprob_part_sat.append(logprob_parts["sat"].detach().cpu().numpy().reshape(-1))
                 logprobs_all = _sum_selected_parts(logprob_parts, train_heads).detach().cpu().numpy()
 
             for env_idx in range(num_envs):
@@ -1576,18 +2212,51 @@ def train(
                 rewards = rewards_env[env_idx]
                 terms = terms_env[env_idx]
                 truncs = truncs_env[env_idx]
+                stats = step_stats[env_idx] if step_stats[env_idx] is not None else {}
+                reward_aux, reward_aux_info = _compute_train_reward_adjustment(
+                    stats,
+                    cfg,
+                    update,
+                    aux_schedule_total_updates,
+                )
 
-                reward_scalar = list(rewards.values())[0]
+                reward_scalar = float(list(rewards.values())[0]) + reward_aux
                 terminated_scalar = bool(list(terms.values())[0])
                 truncated_scalar = bool(list(truncs.values())[0])
                 done_scalar = terminated_scalar or truncated_scalar
                 ep_reward += reward_scalar
                 episode_return_env[env_idx] += float(reward_scalar)
+                reward_aux_sum += reward_aux
+                assoc_centroid_dist_norm_sum += reward_aux_info["stage1_assoc_centroid_dist_norm_mean"]
+                stage1_assoc_centroid_weight_sum += reward_aux_info["stage1_assoc_centroid_weight"]
+                stage1_assoc_centroid_term_sum += reward_aux_info["stage1_assoc_centroid_term"]
+                sat_overlap_eval_sum += reward_aux_info["stage3_sat_overlap_eval"]
+                stage3_sat_overlap_weight_sum += reward_aux_info["stage3_sat_overlap_weight"]
+                stage3_sat_overlap_term_sum += reward_aux_info["stage3_sat_overlap_term"]
+                stage1_aux_agent_vals = np.asarray(
+                    reward_aux_info["stage1_assoc_centroid_dist_norm_uav"],
+                    dtype=np.float32,
+                ).reshape(-1)
+                stage3_overlap_agent_vals = np.asarray(
+                    reward_aux_info["stage3_sat_overlap_uav"],
+                    dtype=np.float32,
+                ).reshape(-1)
+                if stage1_aux_agent_vals.size < num_agents:
+                    stage1_aux_agent_vals = np.pad(
+                        stage1_aux_agent_vals,
+                        (0, num_agents - stage1_aux_agent_vals.size),
+                    )
+                if stage3_overlap_agent_vals.size < num_agents:
+                    stage3_overlap_agent_vals = np.pad(
+                        stage3_overlap_agent_vals,
+                        (0, num_agents - stage3_overlap_agent_vals.size),
+                    )
+                stage1_aux_agent_sum += stage1_aux_agent_vals[:num_agents]
+                stage3_overlap_agent_sum += stage3_overlap_agent_vals[:num_agents]
                 steps_count += 1
                 total_env_steps += 1
                 episode_step_counts_env[env_idx] += 1
 
-                stats = step_stats[env_idx] if step_stats[env_idx] is not None else {}
                 gu_queue_sum += float(stats.get("gu_queue_mean", 0.0))
                 uav_queue_sum += float(stats.get("uav_queue_mean", 0.0))
                 sat_queue_sum += float(stats.get("sat_queue_mean", 0.0))
@@ -1933,6 +2602,29 @@ def train(
         danger_imitation_target_flat_t = torch.from_numpy(danger_imitation_target_flat).to(device)
         danger_imitation_mask_flat_t = torch.from_numpy(danger_imitation_mask_flat).to(device)
         sat_indices_flat_t = torch.from_numpy(sat_indices_flat).to(device)
+        cached_ctx_flat_t = None
+        if cache_actor_ctx:
+            with torch.no_grad():
+                cached_ctx_flat_t = actor.encode_ctx(obs_flat_t).detach()
+            if not torch.isfinite(cached_ctx_flat_t).all():
+                print(f"NaN/Inf detected in cached_ctx_flat_t at update={update}")
+                raise ValueError("cached_ctx_flat_t contains NaN/Inf")
+        logp_accel_flat_t = None
+        logp_bw_flat_t = None
+        logp_sat_flat_t = None
+        if debug_first_minibatch_ratio and not debug_first_minibatch_ratio_printed:
+            if rollout_logprob_part_accel:
+                logp_accel_flat_t = torch.from_numpy(
+                    np.concatenate(rollout_logprob_part_accel, axis=0).astype(np.float32, copy=False)
+                ).to(device)
+            if rollout_logprob_part_bw:
+                logp_bw_flat_t = torch.from_numpy(
+                    np.concatenate(rollout_logprob_part_bw, axis=0).astype(np.float32, copy=False)
+                ).to(device)
+            if rollout_logprob_part_sat:
+                logp_sat_flat_t = torch.from_numpy(
+                    np.concatenate(rollout_logprob_part_sat, axis=0).astype(np.float32, copy=False)
+                ).to(device)
         if not torch.isfinite(obs_flat_t).all():
             print(f"NaN/Inf detected in obs_flat_t at update={update}")
             raise ValueError("obs_flat_t contains NaN/Inf")
@@ -1988,7 +2680,7 @@ def train(
 
         optim_start = time.perf_counter()
         stop_early = False
-        for _ in range(cfg.ppo_epochs):
+        for epoch_idx in range(cfg.ppo_epochs):
             np.random.shuffle(indices)
             for start in range(0, batch_size, minibatch_size):
                 mb_idx = indices[start : start + minibatch_size]
@@ -1998,12 +2690,14 @@ def train(
                 if not torch.isfinite(act_flat_t[mb_idx]).all():
                     print(f"NaN/Inf detected in act minibatch at update={update}")
                     raise ValueError("act minibatch contains NaN/Inf")
-                out = actor.forward(obs_flat_t[mb_idx])
+                ctx_mb = cached_ctx_flat_t[mb_idx] if cached_ctx_flat_t is not None else None
+                out = actor.forward(obs_flat_t[mb_idx], required_heads=train_head_names, ctx=ctx_mb)
                 logprob_parts, entropy_parts = actor.evaluate_actions_parts(
                     obs_flat_t[mb_idx],
                     act_flat_t[mb_idx],
                     sat_indices=sat_indices_flat_t[mb_idx],
                     out=out,
+                    heads=train_head_names,
                 )
                 new_logp = _sum_selected_parts(logprob_parts, train_heads)
                 entropy = _sum_selected_parts(entropy_parts, train_heads)
@@ -2014,6 +2708,45 @@ def train(
                 log_ratio = new_logp - logp_flat_t[mb_idx]
                 log_ratio = torch.clamp(log_ratio, -8.0, 8.0)
                 ratio = torch.exp(log_ratio)
+                if (
+                    debug_first_minibatch_ratio
+                    and not debug_first_minibatch_ratio_printed
+                    and epoch_idx == 0
+                    and start == 0
+                ):
+                    ratio_np = ratio.detach().cpu().numpy().reshape(-1)
+                    lines = [
+                        (
+                            f"[debug_first_minibatch_ratio] update={update} epoch=0 minibatch=0 "
+                            f"ratio_mean={float(np.mean(ratio_np)):.6f} "
+                            f"ratio_min={float(np.min(ratio_np)):.6f} "
+                            f"ratio_max={float(np.max(ratio_np)):.6f}"
+                        )
+                    ]
+                    for part_name, old_part_t in (
+                        ("accel", logp_accel_flat_t),
+                        ("bw", logp_bw_flat_t),
+                        ("sat", logp_sat_flat_t),
+                    ):
+                        if part_name not in logprob_parts or old_part_t is None:
+                            continue
+                        old_np = old_part_t[mb_idx].detach().cpu().numpy().reshape(-1)
+                        new_np = logprob_parts[part_name].detach().cpu().numpy().reshape(-1)
+                        diff_np = new_np - old_np
+                        lines.append(
+                            f"  {part_name}_logprob_old mean/min/max="
+                            f"{float(np.mean(old_np)):.6f}/{float(np.min(old_np)):.6f}/{float(np.max(old_np)):.6f}"
+                        )
+                        lines.append(
+                            f"  {part_name}_logprob_new mean/min/max="
+                            f"{float(np.mean(new_np)):.6f}/{float(np.min(new_np)):.6f}/{float(np.max(new_np)):.6f}"
+                        )
+                        lines.append(
+                            f"  {part_name}_logprob_delta mean/min/max="
+                            f"{float(np.mean(diff_np)):.6f}/{float(np.min(diff_np)):.6f}/{float(np.max(diff_np)):.6f}"
+                        )
+                    print("\n".join(lines))
+                    debug_first_minibatch_ratio_printed = True
                 surr1 = ratio * adv_flat_t[mb_idx]
                 surr2 = torch.clamp(ratio, 1.0 - cfg.clip_ratio, 1.0 + cfg.clip_ratio) * adv_flat_t[mb_idx]
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -2029,7 +2762,12 @@ def train(
 
                 imitation_loss = torch.tensor(0.0, device=device)
                 if imitation_enabled_curr and imitation_mask is not None and imitation_mask_sum > 0:
-                    pred_action = actor.act(obs_flat_t[mb_idx], deterministic=True).action
+                    pred_action = actor.act(
+                        obs_flat_t[mb_idx],
+                        deterministic=True,
+                        compute_logprob=False,
+                        ctx=ctx_mb,
+                    ).action
                     target_action = imitation_flat_t[mb_idx]
                     diff = (pred_action - target_action) * imitation_mask
                     imitation_loss = (diff.pow(2).sum(-1) / (imitation_mask_sum + 1e-9)).mean()
@@ -2166,6 +2904,8 @@ def train(
             "episode_length_mean": episode_length_mean,
             "completed_episode_count": float(completed_episode_count),
             "rollout_reward_per_step": rollout_reward_per_step,
+            "reward_raw": reward_raw_sum / steps_count,
+            "reward_aux": reward_aux_sum / steps_count,
             "x_acc": x_acc_sum / steps_count,
             "x_rel": x_rel_sum / steps_count,
             "g_pre": g_pre_sum / steps_count,
@@ -2173,6 +2913,12 @@ def train(
             "processed_ratio_eval": processed_ratio_eval_sum / steps_count,
             "drop_ratio_eval": drop_ratio_eval_sum / steps_count,
             "pre_backlog_steps_eval": pre_backlog_steps_eval_sum / steps_count,
+            "assoc_centroid_dist_norm_mean": assoc_centroid_dist_norm_sum / steps_count,
+            "stage1_assoc_centroid_weight": stage1_assoc_centroid_weight_sum / steps_count,
+            "stage1_assoc_centroid_term": stage1_assoc_centroid_term_sum / steps_count,
+            "sat_overlap_eval": sat_overlap_eval_sum / steps_count,
+            "stage3_sat_overlap_weight": stage3_sat_overlap_weight_sum / steps_count,
+            "stage3_sat_overlap_term": stage3_sat_overlap_term_sum / steps_count,
             "D_sys_report": d_sys_report_sum / steps_count,
             "episode_term_throughput_access": episode_term_throughput_access,
             "episode_term_throughput_backhaul": episode_term_throughput_backhaul,
@@ -2212,11 +2958,23 @@ def train(
             "update_time_sec": update_time,
             "rollout_time_sec": rollout_time,
             "optim_time_sec": optim_time,
+            "dynamics_time_sec": dynamics_time_sum / steps_count,
+            "orbit_visible_time_sec": orbit_visible_time_sum / steps_count,
+            "assoc_access_time_sec": assoc_access_time_sum / steps_count,
+            "backhaul_queue_time_sec": backhaul_queue_time_sum / steps_count,
+            "reward_time_sec": reward_time_sum / steps_count,
+            "obs_time_sec": obs_time_sum / steps_count,
+            "state_time_sec": state_time_sum / steps_count,
+            "global_state_time_sec": state_time_sum / steps_count,
+            "step_total_time_sec": step_total_time_sum / steps_count,
             "env_steps_per_sec": steps_count / max(1e-9, rollout_time),
             "update_steps_per_sec": steps_count / max(1e-9, update_time),
             "total_env_steps": float(total_env_steps),
             "total_time_sec": time.perf_counter() - training_start,
         }
+        for agent_idx in range(num_agents):
+            metrics[f"stage1_aux_agent{agent_idx}"] = float(stage1_aux_agent_sum[agent_idx] / steps_count)
+            metrics[f"stage3_overlap_agent{agent_idx}"] = float(stage3_overlap_agent_sum[agent_idx] / steps_count)
 
         logger.log(
             update,
@@ -2312,6 +3070,7 @@ def train(
                 "x_rel_mean": checkpoint_eval_summary["x_rel_mean"],
                 "g_pre_mean": checkpoint_eval_summary["g_pre_mean"],
                 "d_pre_mean": checkpoint_eval_summary["d_pre_mean"],
+                "sat_overlap_eval": checkpoint_eval_summary["sat_overlap_eval"],
                 "collision_episode_fraction": checkpoint_eval_summary["collision_episode_fraction"],
                 "fixed_reward_sum": checkpoint_eval_fixed_summary["reward_sum"],
                 "fixed_processed_ratio_eval": checkpoint_eval_fixed_summary["processed_ratio_eval"],
@@ -2322,10 +3081,34 @@ def train(
                 "fixed_x_rel_mean": checkpoint_eval_fixed_summary["x_rel_mean"],
                 "fixed_g_pre_mean": checkpoint_eval_fixed_summary["g_pre_mean"],
                 "fixed_d_pre_mean": checkpoint_eval_fixed_summary["d_pre_mean"],
+                "fixed_sat_overlap_eval": checkpoint_eval_fixed_summary["sat_overlap_eval"],
                 "fixed_collision_episode_fraction": checkpoint_eval_fixed_summary["collision_episode_fraction"],
             }
             checkpoint_eval_row.update(checkpoint_eval_flags)
             _append_checkpoint_eval_row(checkpoint_eval_csv_path, checkpoint_eval_row)
+            if checkpoint_eval_flags["model_improved"] > 0.5:
+                _save_checkpoints(log_dir, actor, critic, suffix="best")
+                _save_train_state(
+                    log_dir,
+                    actor,
+                    critic,
+                    actor_optim,
+                    critic_optim,
+                    actor_sched,
+                    critic_sched,
+                    reward_rms,
+                    update=update + 1,
+                    planned_total_updates=planned_total_updates,
+                    total_env_steps=total_env_steps,
+                    reward_history=reward_history,
+                    best_ma=best_ma,
+                    no_improve=no_improve,
+                    checkpoint_eval_state=checkpoint_eval_state,
+                    checkpoint_eval_fixed_summary=checkpoint_eval_fixed_summary,
+                    total_time_sec=time.perf_counter() - training_start,
+                    suffix="best",
+                )
+                best_checkpoint_saved = True
             print(
                 "Checkpoint eval "
                 f"{checkpoint_suffix}: "
@@ -2337,6 +3120,8 @@ def train(
                 f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['drop_ratio_eval']:.4f}), "
                 f"pre_backlog={checkpoint_eval_summary['pre_backlog_steps_eval']:.4f} "
                 f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['pre_backlog_steps_eval']:.4f}), "
+                f"sat_overlap={checkpoint_eval_summary['sat_overlap_eval']:.4f} "
+                f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['sat_overlap_eval']:.4f}), "
                 f"collision={checkpoint_eval_summary['collision_episode_fraction']:.4f} "
                 f"({checkpoint_eval_fixed_policy} ref {checkpoint_eval_fixed_summary['collision_episode_fraction']:.4f}), "
                 f"model_improved={int(checkpoint_eval_flags['model_improved'])}, "
@@ -2372,6 +3157,29 @@ def train(
                         f"moving average={ma:.6f}, best={best_ma:.6f}"
                     )
                     break
+
+    if checkpoint_eval_enabled and not best_checkpoint_saved:
+        _save_checkpoints(log_dir, actor, critic, suffix="best")
+        _save_train_state(
+            log_dir,
+            actor,
+            critic,
+            actor_optim,
+            critic_optim,
+            actor_sched,
+            critic_sched,
+            reward_rms,
+            update=completed_updates,
+            planned_total_updates=planned_total_updates,
+            total_env_steps=total_env_steps,
+            reward_history=reward_history,
+            best_ma=best_ma,
+            no_improve=no_improve,
+            checkpoint_eval_state=checkpoint_eval_state,
+            checkpoint_eval_fixed_summary=checkpoint_eval_fixed_summary,
+            total_time_sec=time.perf_counter() - training_start,
+            suffix="best",
+        )
 
     _save_checkpoints(log_dir, actor, critic)
     _save_train_state(

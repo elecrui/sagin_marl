@@ -41,12 +41,13 @@ class SaginParallelEnv(ParallelEnv):
             * cfg.uav_tx_gain
             * cfg.sat_rx_gain
         )
+        self._orbit_pos_table, self._orbit_vel_table = self._precompute_orbit_lookup()
 
         self.agents = [f"uav_{i}" for i in range(cfg.num_uav)]
         self.possible_agents = list(self.agents)
 
         # Dimensions
-        self.own_dim = 7
+        self.own_dim = 10
         self.user_dim = 5
         self.sat_dim = 12
         self.nbr_dim = 4
@@ -66,6 +67,17 @@ class SaginParallelEnv(ParallelEnv):
         self._episode_step_count = 0
         self._init_state()
 
+    def _precompute_orbit_lookup(self) -> Tuple[np.ndarray, np.ndarray]:
+        cfg = self.cfg
+        num_steps = max(int(cfg.T_steps), 0) + 1
+        pos_table = np.zeros((num_steps, cfg.num_sat, 3), dtype=np.float32)
+        vel_table = np.zeros((num_steps, cfg.num_sat, 3), dtype=np.float32)
+        for t_idx in range(num_steps):
+            pos_t, vel_t = self.orbit.get_states(float(t_idx) * cfg.tau0)
+            pos_table[t_idx] = pos_t
+            vel_table[t_idx] = vel_t
+        return pos_table, vel_table
+
     def _compute_centroid_stats(self) -> Tuple[float, float]:
         cfg = self.cfg
         centroid_reward = 0.0
@@ -84,6 +96,69 @@ class SaginParallelEnv(ParallelEnv):
             scale = max(float(getattr(cfg, "centroid_dist_scale", 1.0) or 1.0), 1e-6)
             centroid_reward = float(np.mean(np.exp(-dists / scale))) if dists.size else 0.0
         return centroid_reward, centroid_dist_mean
+
+    def _assoc_centroid_summary(
+        self,
+        assoc: np.ndarray | None = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+        cfg = self.cfg
+        assoc_arr = None if assoc is None else np.asarray(assoc, dtype=np.int32)
+        if assoc_arr is None or assoc_arr.shape != (cfg.num_gu,):
+            cached_assoc = getattr(self, "_cached_assoc", None)
+            assoc_arr = np.asarray(cached_assoc, dtype=np.int32) if cached_assoc is not None else None
+        if assoc_arr is None or assoc_arr.shape != (cfg.num_gu,):
+            assoc_arr = self._associate_users()
+
+        counts = np.zeros((cfg.num_uav,), dtype=np.float32)
+        rel_centroids = np.zeros((cfg.num_uav, 2), dtype=np.float32)
+        dist_norms = np.zeros((cfg.num_uav,), dtype=np.float32)
+        map_scale = max(float(cfg.map_size), 1e-9)
+        for u in range(cfg.num_uav):
+            idx = np.nonzero(assoc_arr == u)[0]
+            if idx.size <= 0:
+                continue
+            counts[u] = float(idx.size)
+            centroid = np.mean(self.gu_pos[idx], axis=0)
+            rel = (centroid - self.uav_pos[u]) / map_scale
+            rel_centroids[u] = rel.astype(np.float32, copy=False)
+            dist_norms[u] = float(np.linalg.norm(centroid - self.uav_pos[u]) / map_scale)
+
+        valid_mask = counts > 0.0
+        valid_count = float(np.count_nonzero(valid_mask))
+        valid_frac = valid_count / max(float(cfg.num_uav), 1.0)
+        mean_dist_norm = float(np.mean(dist_norms[valid_mask])) if np.any(valid_mask) else 0.0
+        return counts, rel_centroids, dist_norms, valid_count, valid_frac, mean_dist_norm
+
+    def _sat_overlap_summary(self) -> Tuple[np.ndarray, float]:
+        cfg = self.cfg
+        if cfg.num_uav <= 1:
+            return np.zeros((cfg.num_uav,), dtype=np.float32), 0.0
+        selections = getattr(self, "last_sat_selection", None)
+        if not isinstance(selections, list) or len(selections) != cfg.num_uav:
+            return np.zeros((cfg.num_uav,), dtype=np.float32), 0.0
+        denom = max(float(cfg.num_uav - 1), 1.0)
+        counts = np.zeros((cfg.num_sat,), dtype=np.float32)
+        unique_selections: List[np.ndarray] = []
+        for sel in selections:
+            sel_arr = np.asarray(sel, dtype=np.int32).reshape(-1)
+            if sel_arr.size <= 0:
+                unique_selections.append(np.zeros((0,), dtype=np.int32))
+                continue
+            sel_unique = np.unique(sel_arr[(sel_arr >= 0) & (sel_arr < cfg.num_sat)])
+            unique_selections.append(sel_unique.astype(np.int32, copy=False))
+            if sel_unique.size > 0:
+                counts[sel_unique] += 1.0
+        overlap_u = np.zeros((cfg.num_uav,), dtype=np.float32)
+        for u, sel_arr in enumerate(unique_selections):
+            if sel_arr.size <= 0:
+                continue
+            overlap_u[u] = float(np.mean((counts[sel_arr] - 1.0) / denom))
+        overlap_mean = float(np.mean(overlap_u)) if overlap_u.size > 0 else 0.0
+        return overlap_u.astype(np.float32, copy=False), overlap_mean
+
+    def _compute_sat_overlap_eval(self) -> float:
+        _, overlap_mean = self._sat_overlap_summary()
+        return overlap_mean
 
     def _queue_arrival_scale(self, arrival_sum: float) -> float:
         cfg = self.cfg
@@ -502,10 +577,13 @@ class SaginParallelEnv(ParallelEnv):
         self.last_pairwise_fallback_count = 0.0
         self.last_pairwise_candidate_infeasible_count = 0.0
         self.last_step_profile = self._empty_step_profile()
+        self.last_assoc_centroid_dist_norms = np.zeros((cfg.num_uav,), dtype=np.float32)
+        self.last_sat_overlap_uav = np.zeros((cfg.num_uav,), dtype=np.float32)
         self.last_reward_parts = {
             "service_ratio": 0.0,
             "drop_ratio": 0.0,
             "arrival_ref": self._arrival_ref(),
+            "b_pre_steps": 0.0,
             "x_acc": 0.0,
             "x_rel": 0.0,
             "g_pre": 0.0,
@@ -513,6 +591,10 @@ class SaginParallelEnv(ParallelEnv):
             "processed_ratio_eval": 0.0,
             "drop_ratio_eval": 0.0,
             "pre_backlog_steps_eval": 0.0,
+            "sat_overlap_eval": 0.0,
+            "assoc_centroid_dist_norm_mean": 0.0,
+            "assoc_centroid_valid_uav_count": 0.0,
+            "assoc_centroid_valid_uav_frac": 0.0,
             "D_sys_report": 0.0,
             "drop_sum": 0.0,
             "drop_sum_active": 0.0,
@@ -594,16 +676,20 @@ class SaginParallelEnv(ParallelEnv):
             "pairwise_candidate_infeasible_count": 0.0,
             "term_service": 0.0,
             "term_drop": 0.0,
+            "term_pre_drop": 0.0,
             "term_drop_gu": 0.0,
             "term_drop_uav": 0.0,
             "term_drop_sat": 0.0,
             "term_drop_step": 0.0,
             "term_queue": 0.0,
+            "term_pre_backlog": 0.0,
             "term_topk": 0.0,
             "term_assoc": 0.0,
             "term_q_delta": 0.0,
             "term_throughput_access": 0.0,
             "term_throughput_backhaul": 0.0,
+            "term_access": 0.0,
+            "term_relay": 0.0,
             "term_queue_gu_arrival": 0.0,
             "term_centroid": 0.0,
             "term_bw_align": 0.0,
@@ -705,7 +791,6 @@ class SaginParallelEnv(ParallelEnv):
         # Satellite states
         profile_start = time.perf_counter()
         sat_pos, sat_vel = self._get_orbit_states()
-        visible = self._visible_sats_sorted(sat_pos)
         step_profile["orbit_visible_time_sec"] = time.perf_counter() - profile_start
 
         # Compute associations and rates
@@ -1452,7 +1537,12 @@ class SaginParallelEnv(ParallelEnv):
 
     def _get_orbit_states(self) -> Tuple[np.ndarray, np.ndarray]:
         if self._cached_orbit_t != self.t or self._cached_orbit_pos is None:
-            self._cached_orbit_pos, self._cached_orbit_vel = self.orbit.get_states(self.t * self.cfg.tau0)
+            t_idx = int(self.t)
+            if 0 <= t_idx < self._orbit_pos_table.shape[0]:
+                self._cached_orbit_pos = self._orbit_pos_table[t_idx]
+                self._cached_orbit_vel = self._orbit_vel_table[t_idx]
+            else:
+                self._cached_orbit_pos, self._cached_orbit_vel = self.orbit.get_states(self.t * self.cfg.tau0)
             self._cached_orbit_t = self.t
         return self._cached_orbit_pos, self._cached_orbit_vel
 
@@ -1993,7 +2083,19 @@ class SaginParallelEnv(ParallelEnv):
         processed_ratio_eval = sat_processed_sum / arrival_ref
         drop_ratio_eval = drop_sum / arrival_ref
         pre_backlog_steps_eval = q_total_active / arrival_ref
+        b_pre_steps = pre_backlog_steps_eval
         D_sys_report = q_total / max(sat_processed_sum, 1e-9)
+        (
+            _assoc_centroid_counts,
+            _assoc_centroid_rel,
+            assoc_centroid_dist_norms,
+            assoc_centroid_valid_uav_count,
+            assoc_centroid_valid_uav_frac,
+            assoc_centroid_dist_norm_mean,
+        ) = self._assoc_centroid_summary()
+        sat_overlap_uav, sat_overlap_eval = self._sat_overlap_summary()
+        self.last_assoc_centroid_dist_norms = assoc_centroid_dist_norms.astype(np.float32, copy=False)
+        self.last_sat_overlap_uav = sat_overlap_uav.astype(np.float32, copy=False)
 
         queue_norm_scale = self._queue_arrival_scale(arrival_sum)
         q_norm_active = float(np.clip(q_total_active / queue_norm_scale, 0.0, 1.0))
@@ -2189,7 +2291,7 @@ class SaginParallelEnv(ParallelEnv):
             term_drop_sat = 0.0
             term_drop_step = 0.0
             term_drop = -float(getattr(cfg, "reward_w_pre_drop", 1.0) or 0.0) * d_pre
-            term_queue = -float(getattr(cfg, "reward_w_pre_growth", 0.2) or 0.0) * max(g_pre, 0.0)
+            term_queue = -float(getattr(cfg, "reward_w_pre_backlog", 0.08) or 0.0) * math.log1p(b_pre_steps)
             term_q_delta = 0.0
             term_centroid = 0.0
             term_accel = 0.0
@@ -2281,6 +2383,15 @@ class SaginParallelEnv(ParallelEnv):
                 + term_energy
             )
 
+        term_access = term_throughput_access
+        term_relay = term_throughput_backhaul
+        if reward_mode == "controllable_flow":
+            term_pre_backlog = term_queue
+            term_pre_drop = term_drop
+        else:
+            term_pre_backlog = 0.0
+            term_pre_drop = 0.0
+
         collision_now = self._check_collision()
         if reward_mode in {"throughput_only", "controllable_flow"}:
             collision_penalty = 0.0
@@ -2309,6 +2420,7 @@ class SaginParallelEnv(ParallelEnv):
             "service_ratio": service_ratio,
             "drop_ratio": drop_ratio,
             "arrival_ref": arrival_ref,
+            "b_pre_steps": b_pre_steps,
             "x_acc": x_acc,
             "x_rel": x_rel,
             "g_pre": g_pre,
@@ -2316,6 +2428,10 @@ class SaginParallelEnv(ParallelEnv):
             "processed_ratio_eval": processed_ratio_eval,
             "drop_ratio_eval": drop_ratio_eval,
             "pre_backlog_steps_eval": pre_backlog_steps_eval,
+            "sat_overlap_eval": sat_overlap_eval,
+            "assoc_centroid_dist_norm_mean": assoc_centroid_dist_norm_mean,
+            "assoc_centroid_valid_uav_count": assoc_centroid_valid_uav_count,
+            "assoc_centroid_valid_uav_frac": assoc_centroid_valid_uav_frac,
             "D_sys_report": D_sys_report,
             "drop_sum": drop_sum,
             "drop_sum_active": drop_sum_active,
@@ -2402,16 +2518,20 @@ class SaginParallelEnv(ParallelEnv):
             ),
             "term_service": term_service,
             "term_drop": term_drop,
+            "term_pre_drop": term_pre_drop,
             "term_drop_gu": term_drop_gu,
             "term_drop_uav": term_drop_uav,
             "term_drop_sat": term_drop_sat,
             "term_drop_step": term_drop_step,
             "term_queue": term_queue,
+            "term_pre_backlog": term_pre_backlog,
             "term_topk": term_topk,
             "term_assoc": term_assoc,
             "term_q_delta": term_q_delta,
             "term_throughput_access": term_throughput_access,
             "term_throughput_backhaul": term_throughput_backhaul,
+            "term_access": term_access,
+            "term_relay": term_relay,
             "term_queue_gu_arrival": term_queue_gu_arrival,
             "term_dist": term_dist,
             "term_dist_delta": term_dist_delta,
@@ -2606,6 +2726,57 @@ class SaginParallelEnv(ParallelEnv):
             return np.zeros_like(vals, dtype=np.float32)
         return ((vals - v_min) / (v_max - v_min)).astype(np.float32, copy=False)
 
+    @staticmethod
+    def _topk_descending_stable(values: np.ndarray, k: int) -> np.ndarray:
+        vals = np.asarray(values, dtype=np.float64).reshape(-1)
+        if vals.size == 0 or k <= 0:
+            return np.zeros((0,), dtype=np.int64)
+        if k >= vals.size:
+            return np.argsort(-vals, kind="stable").astype(np.int64, copy=False)
+        kth = float(np.partition(vals, vals.size - k)[vals.size - k])
+        greater = np.flatnonzero(vals > kth)
+        greater = greater[np.argsort(-vals[greater], kind="stable")]
+        need = k - int(greater.size)
+        if need <= 0:
+            return greater[:k].astype(np.int64, copy=False)
+        equal = np.flatnonzero(vals == kth)
+        return np.concatenate((greater, equal[:need]), axis=0).astype(np.int64, copy=False)
+
+    @staticmethod
+    def _slice_rank_data(rank_data: Dict[str, np.ndarray], indices: np.ndarray) -> Dict[str, np.ndarray]:
+        idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+        return {
+            key: np.asarray(value, dtype=np.float32)[idx].astype(np.float32, copy=False)
+            for key, value in rank_data.items()
+        }
+
+    def _sat_candidate_order_data(
+        self,
+        u: int,
+        sat_indices: np.ndarray,
+        sat_pos: np.ndarray,
+        elev_values: np.ndarray | None = None,
+    ) -> Dict[str, np.ndarray]:
+        mode = str(getattr(self.cfg, "sat_candidate_mode", "elevation") or "elevation").strip().lower()
+        if mode not in {"elevation", "score"}:
+            raise ValueError(f"Unsupported sat_candidate_mode='{self.cfg.sat_candidate_mode}'")
+        if mode == "score":
+            return self._sat_candidate_rank_data(u, sat_indices, sat_pos, elev_values=elev_values)
+
+        sat_idx = np.asarray(sat_indices, dtype=np.int32)
+        if sat_idx.size == 0:
+            empty_f = np.zeros((0,), dtype=np.float32)
+            return {"elevation": empty_f, "rank_value": empty_f}
+        if elev_values is None:
+            elev_matrix = self._get_elevation_matrix(sat_pos)
+            elev = np.asarray(elev_matrix[u, sat_idx], dtype=np.float32)
+        else:
+            elev = np.asarray(elev_values, dtype=np.float32)
+        return {
+            "elevation": elev,
+            "rank_value": elev.astype(np.float32, copy=False),
+        }
+
     def _sat_candidate_rank_data(
         self,
         u: int,
@@ -2670,6 +2841,35 @@ class SaginParallelEnv(ParallelEnv):
             return np.zeros((0,), dtype=np.int64)
         return np.lexsort((-elev.astype(np.float64), -rank_value.astype(np.float64)))
 
+    def _sat_candidate_topk_order(self, rank_data: Dict[str, np.ndarray], k: int) -> np.ndarray:
+        rank_value = np.asarray(rank_data["rank_value"], dtype=np.float32)
+        elev = np.asarray(rank_data["elevation"], dtype=np.float32)
+        if rank_value.size == 0 or k <= 0:
+            return np.zeros((0,), dtype=np.int64)
+        if k >= rank_value.size:
+            return self._sat_candidate_order(rank_data)
+
+        threshold = float(np.partition(rank_value.astype(np.float64), rank_value.size - k)[rank_value.size - k])
+        greater = np.flatnonzero(rank_value > threshold)
+        need = k - int(greater.size)
+        if greater.size > 0:
+            greater_order = np.lexsort(
+                (-elev[greater].astype(np.float64), -rank_value[greater].astype(np.float64))
+            )
+            greater = greater[greater_order]
+        if need <= 0:
+            return greater[:k].astype(np.int64, copy=False)
+
+        tied = np.flatnonzero(rank_value == threshold)
+        if tied.size > 0:
+            tied_order = self._topk_descending_stable(elev[tied], need)
+            tied = tied[tied_order]
+        selected = np.concatenate((greater, tied[:need]), axis=0)
+        selected_order = np.lexsort(
+            (-elev[selected].astype(np.float64), -rank_value[selected].astype(np.float64))
+        )
+        return selected[selected_order].astype(np.int64, copy=False)
+
     def _summarize_visible_counts(self, name: str, counts: np.ndarray, out: Dict[str, float | str]) -> None:
         vals = np.asarray(counts, dtype=np.float32)
         if vals.size == 0:
@@ -2703,6 +2903,9 @@ class SaginParallelEnv(ParallelEnv):
     def _visible_sats_sorted(self, sat_pos: np.ndarray) -> List[List[int]]:
         cfg = self.cfg
         elev_matrix = self._get_elevation_matrix(sat_pos)
+        mode = str(getattr(cfg, "sat_candidate_mode", "elevation") or "elevation").strip().lower()
+        if mode not in {"elevation", "score"}:
+            raise ValueError(f"Unsupported sat_candidate_mode='{cfg.sat_candidate_mode}'")
         visible: List[List[int]] = [[] for _ in range(cfg.num_uav)]
         raw_candidates: List[List[int]] = [[] for _ in range(cfg.num_uav)]
         kept_rank_values: List[List[float]] = [[] for _ in range(cfg.num_uav)]
@@ -2722,24 +2925,31 @@ class SaginParallelEnv(ParallelEnv):
             elev_u = elev_matrix[u]
             above = np.nonzero(elev_u >= cfg.theta_min_rad)[0].astype(np.int32, copy=False)
             raw_counts[u] = int(above.size)
-            above_data = self._sat_candidate_rank_data(u, above, sat_pos, elev_values=elev_u[above])
-            above_order = self._sat_candidate_order(above_data)
+            raw_keep = min(max_keep, int(above.size))
+            above_data = self._sat_candidate_order_data(u, above, sat_pos, elev_values=elev_u[above])
+            above_order = self._sat_candidate_topk_order(above_data, raw_keep)
             above_sorted = above[above_order]
             raw_candidates[u] = above_sorted.tolist()
             selected = above_sorted
-            if min_keep is not None and above.size < min_keep:
-                needed = min_keep - int(above.size)
+            keep_target = max_keep if min_keep is None else min(max_keep, max(int(min_keep), 0))
+            used_extra = False
+            if keep_target > int(above.size):
+                needed = keep_target - int(above.size)
                 extra = np.nonzero(elev_u < cfg.theta_min_rad)[0].astype(np.int32, copy=False)
-                extra_data = self._sat_candidate_rank_data(u, extra, sat_pos, elev_values=elev_u[extra])
-                extra_order = self._sat_candidate_order(extra_data)
-                extra = extra[extra_order][:needed]
+                extra_data = self._sat_candidate_order_data(u, extra, sat_pos, elev_values=elev_u[extra])
+                extra_order = self._sat_candidate_topk_order(extra_data, needed)
+                extra = extra[extra_order]
                 if extra.size > 0:
                     selected = np.concatenate((selected, extra), axis=0)
+                    used_extra = True
 
             kept = selected[:max_keep]
             kept_counts[u] = int(kept.size)
             visible[u] = kept.tolist()
-            kept_data = self._sat_candidate_rank_data(u, kept, sat_pos, elev_values=elev_u[kept])
+            if mode == "score" and kept.size > 0 and not used_extra:
+                kept_data = self._slice_rank_data(above_data, above_order[: kept.size])
+            else:
+                kept_data = self._sat_candidate_rank_data(u, kept, sat_pos, elev_values=elev_u[kept])
             kept_rank_values[u] = kept_data["rank_value"].astype(np.float32, copy=False).tolist()
             kept_scores[u] = kept_data["score"].astype(np.float32, copy=False).tolist()
             if kept.size >= 2:
@@ -2764,7 +2974,7 @@ class SaginParallelEnv(ParallelEnv):
         self.last_visible_candidate_se_std = se_std
         self.last_visible_candidate_queue_std = queue_std
         stats: Dict[str, float | str] = {
-            "candidate_mode": str(getattr(cfg, "sat_candidate_mode", "elevation") or "elevation").strip().lower(),
+            "candidate_mode": mode,
             "visible_truncation_fraction": float(np.mean(raw_counts > kept_counts)) if raw_counts.size else 0.0,
             "candidate_dist_std_mean": float(np.mean(dist_std)) if dist_std.size else 0.0,
             "candidate_elevation_std_mean": float(np.mean(elev_std)) if elev_std.size else 0.0,
@@ -2934,6 +3144,9 @@ class SaginParallelEnv(ParallelEnv):
 
     def _get_obs(self, u: int) -> Dict[str, np.ndarray]:
         cfg = self.cfg
+        assoc_counts, assoc_rel_centroids, _, _, _, _ = self._assoc_centroid_summary()
+        assoc_count_norm = assoc_counts[u] / max(float(cfg.num_gu), 1.0)
+        assoc_centroid_rel = assoc_rel_centroids[u]
         # own features
         own = np.array(
             [
@@ -2944,6 +3157,9 @@ class SaginParallelEnv(ParallelEnv):
                 self.uav_energy[u] / max(cfg.uav_energy_init, 1e-9),
                 self.uav_queue[u] / cfg.queue_max_uav,
                 self.t / max(cfg.T_steps, 1),
+                assoc_count_norm,
+                assoc_centroid_rel[0],
+                assoc_centroid_rel[1],
             ],
             dtype=np.float32,
         )
@@ -3007,7 +3223,7 @@ class SaginParallelEnv(ParallelEnv):
         if cfg.sat_state_max is not None and cfg.sat_state_max < cfg.num_sat:
             elev_matrix = self._get_elevation_matrix(sat_pos)
             scores = np.max(elev_matrix, axis=0)
-            sat_idx = np.argsort(-scores, kind="stable")[: cfg.sat_state_max]
+            sat_idx = self._topk_descending_stable(scores, int(cfg.sat_state_max))
             sat_pos = sat_pos[sat_idx]
             sat_vel = sat_vel[sat_idx]
             sat_queue = self.sat_queue[sat_idx]

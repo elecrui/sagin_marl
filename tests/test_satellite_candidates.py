@@ -5,13 +5,13 @@ import torch
 
 from sagin_marl.env.config import SaginConfig
 from sagin_marl.env.sagin_env import SaginParallelEnv
-from sagin_marl.rl.policy import ActorNet, SAT_OBS_DIM, batch_flatten_obs
+from sagin_marl.rl.policy import ActorNet, OWN_OBS_DIM, SAT_OBS_DIM, batch_flatten_obs
 from sagin_marl.utils.checkpoint import load_state_dict_forgiving
 
 
 def _make_policy_obs(cfg: SaginConfig) -> dict[str, np.ndarray]:
     return {
-        "own": np.zeros((7,), dtype=np.float32),
+        "own": np.zeros((OWN_OBS_DIM,), dtype=np.float32),
         "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
         "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
         "sats": np.zeros((cfg.sats_obs_max, SAT_OBS_DIM), dtype=np.float32),
@@ -59,7 +59,7 @@ def test_visible_sats_score_mode_tracks_raw_and_kept_candidates():
     assert visible == [[1, 2]]
     assert env.last_visible_raw_counts.tolist() == [3]
     assert env.last_visible_kept_counts.tolist() == [2]
-    assert env.last_visible_raw_candidates[0] == [1, 2, 0]
+    assert env.last_visible_raw_candidates[0] == [1, 2]
     assert env.last_visible_candidates[0] == [1, 2]
     assert np.isclose(env.last_visible_candidate_rank_gap_top1_top2[0], 0.25)
     assert np.isclose(env.last_visible_candidate_score_gap_top1_top2[0], 0.25)
