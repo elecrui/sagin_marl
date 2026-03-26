@@ -141,7 +141,7 @@ c_u = \frac{\sum_{k\in\mathcal{G}*u} \sqrt{q_k+\epsilon},p_k}{\sum*{k\in\mathcal
 那不是对你当前代码事实的描述，
 而是我后面给你的一个**可选修改方案**：
 
-* 先做一个短的 `stage3a`：只训 sat 头
+* 先做一个短的 sat-only 预热段：只训 sat 头
 * 再做主训练 `stage3b`：恢复 accel+bw+sat 三头联合
 
 这个是为了降低 stage3 一上来三头一起动带来的扰动。
@@ -614,7 +614,7 @@ A_3 = - \frac{1}{N_{\text{uav}}}\sum_u \text{overlap}_u
 
 这是我更推荐的版本。
 
-##### Stage 3a：sat-only 预热
+##### sat-only 预热段
 
 从 Stage 2 best checkpoint 开始，先跑一个短阶段：
 
@@ -635,7 +635,7 @@ R_{\text{base}} + \lambda_3 A_3
 
 ##### Stage 3b：恢复正式三头联合
 
-然后从 Stage 3a best checkpoint 开始：
+然后从这个预热段的 best checkpoint 开始：
 
 * `train_accel: true`
 * `train_bw: true`
@@ -732,7 +732,7 @@ R_{\text{base}}
 
 优先用两段式：
 
-* `stage3a` sat-only 预热：`80~120 updates`
+* sat-only 预热段：`80~120 updates`
 * `stage3b` 三头联合微调
 
 reward 用：

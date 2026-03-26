@@ -261,27 +261,27 @@ def main() -> None:
         PolicySpec(
             name="stage1_best",
             label="Stage 1 best",
-            config_path="runs/phase1_actions/stage1_accel_subproc12_t2_fixed_20260324/config_source.yaml",
-            checkpoint_path="runs/phase1_actions/stage1_accel_subproc12_t2_fixed_20260324/actor_best.pt",
+            config_path="runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage1_accel/config_source.yaml",
+            checkpoint_path="runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage1_accel/actor_best.pt",
         ),
         PolicySpec(
             name="stage2_best",
             label="Stage 2 best",
-            config_path="runs/phase1_actions/stage2_bw_from_stage1best_20260325/config_source.yaml",
-            checkpoint_path="runs/phase1_actions/stage2_bw_from_stage1best_20260325/actor_best.pt",
+            config_path="runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage2_bw/config_source.yaml",
+            checkpoint_path="runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage2_bw/actor_best.pt",
         ),
         PolicySpec(
             name="stage2_plus_queue_aware_sat",
             label="Stage 2 + queue_aware_sat",
-            config_path="runs/phase1_actions/stage3_sat_joint_from_stage3a_20260325/config_source.yaml",
-            checkpoint_path="runs/phase1_actions/stage2_bw_from_stage1best_20260325/actor_best.pt",
+            config_path="runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage3_sat/config_source.yaml",
+            checkpoint_path="runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage2_bw/actor_best.pt",
             hybrid_bw_sat="queue_aware_sat",
         ),
         PolicySpec(
             name="stage3_best",
             label="Stage 3 best",
-            config_path="runs/phase1_actions/stage3_sat_joint_from_stage3a_20260325/config_source.yaml",
-            checkpoint_path="runs/phase1_actions/stage3_sat_joint_from_stage3a_20260325/actor_best.pt",
+            config_path="runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage3_sat/config_source.yaml",
+            checkpoint_path="runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage3_sat/actor_best.pt",
         ),
     ]
     requested_policies = [item.strip() for item in str(args.policies).split(",") if item.strip()]

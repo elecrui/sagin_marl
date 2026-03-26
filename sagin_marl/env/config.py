@@ -115,6 +115,9 @@ class SaginConfig:
     queue_max_gu: float = 5e6
     queue_max_uav: float = 1e7
     queue_max_sat: float = 5e7
+    queue_max_gu_steps: float | None = None
+    queue_max_uav_steps: float | None = None
+    queue_max_sat_steps: float | None = None
     queue_init_frac: float = 0.0
     queue_init_uav_frac: float = 0.0
     queue_init_sat_frac: float = 0.0
@@ -124,6 +127,10 @@ class SaginConfig:
     queue_init_gu_steps: float | None = None
     queue_init_uav_steps: float | None = None
     queue_init_sat_steps: float | None = None
+    queue_ref_gu_per_step: float | None = None
+    queue_ref_uav_per_step: float | None = None
+    queue_ref_sat_per_step: float | None = None
+    queue_ref_sat_active_count: float | None = None
 
     # Task arrivals
     task_arrival_rate: float = 2e5  # bits per slot (mean)
@@ -447,6 +454,7 @@ def update_config(cfg: SaginConfig, updates: Dict[str, Any]) -> SaginConfig:
     if not isinstance(updates, dict):
         raise TypeError("Config updates must be a mapping.")
     _apply_updates(cfg, updates)
+    _finalize_config(cfg)
     return cfg
 
 
@@ -500,3 +508,48 @@ def _coerce_scalar(value: Any, current: Any) -> Any:
             return value
 
     return value
+
+
+def _traffic_level_ratio(cfg: SaginConfig) -> float:
+    raw_level = getattr(cfg, "traffic_level", 2)
+    level = int(2 if raw_level is None else raw_level)
+    if level <= 0:
+        ratio = float(getattr(cfg, "traffic_level_nav_ratio", 0.08) or 0.08)
+    elif level == 1:
+        ratio = float(getattr(cfg, "traffic_level_easy_ratio", 0.5) or 0.5)
+    else:
+        ratio = float(getattr(cfg, "traffic_level_hard_ratio", 1.0) or 1.0)
+    return min(max(ratio, 0.0), 1.0)
+
+
+def _default_queue_ref_per_step(cfg: SaginConfig) -> float:
+    base_rate = max(float(getattr(cfg, "task_arrival_rate", 0.0) or 0.0), 0.0)
+    return base_rate * _traffic_level_ratio(cfg) * float(cfg.num_gu) * float(cfg.tau0)
+
+
+def _queue_ref_per_step(cfg: SaginConfig, layer: str) -> float:
+    ref_value = getattr(cfg, f"queue_ref_{layer}_per_step", None)
+    if ref_value is not None:
+        return max(float(ref_value), 0.0)
+    return _default_queue_ref_per_step(cfg)
+
+
+def _queue_ref_entities(cfg: SaginConfig, layer: str) -> float:
+    if layer == "gu":
+        return max(float(cfg.num_gu), 1.0)
+    if layer == "uav":
+        return max(float(cfg.num_uav), 1.0)
+    active_count = getattr(cfg, "queue_ref_sat_active_count", None)
+    if active_count is not None:
+        return max(float(active_count), 1.0)
+    return max(float(cfg.num_sat), 1.0)
+
+
+def _finalize_config(cfg: SaginConfig) -> None:
+    for layer in ("gu", "uav", "sat"):
+        steps_value = getattr(cfg, f"queue_max_{layer}_steps", None)
+        if steps_value is None:
+            continue
+        total_cap = max(float(steps_value), 0.0) * _queue_ref_per_step(cfg, layer)
+        per_entity_cap = total_cap / _queue_ref_entities(cfg, layer)
+        setattr(cfg, f"queue_max_{layer}", per_entity_cap)

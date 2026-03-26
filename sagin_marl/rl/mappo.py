@@ -133,6 +133,12 @@ def _get_state_batch(env) -> np.ndarray:
     return np.expand_dims(np.asarray(env.get_global_state(), dtype=np.float32), axis=0)
 
 
+def _flatten_obs_env_batch(obs_env, cfg) -> Tuple[List[list], np.ndarray]:
+    obs_lists_env = [list(obs_e.values()) for obs_e in obs_env]
+    obs_step_batch = np.stack([batch_flatten_obs(obs_list, cfg) for obs_list in obs_lists_env], axis=0)
+    return obs_lists_env, obs_step_batch.astype(np.float32, copy=False)
+
+
 def _set_module_requires_grad(module, enabled: bool) -> None:
     if module is None:
         return
@@ -797,9 +803,15 @@ def _load_train_state(
     actor_optim_state = payload.get("actor_optimizer_state_dict")
     critic_optim_state = payload.get("critic_optimizer_state_dict")
     if actor_optim_state is not None:
-        actor_optim.load_state_dict(actor_optim_state)
+        try:
+            actor_optim.load_state_dict(actor_optim_state)
+        except ValueError as exc:
+            print(f"Warning: failed to load actor optimizer state from {path}: {exc}")
     if critic_optim_state is not None:
-        critic_optim.load_state_dict(critic_optim_state)
+        try:
+            critic_optim.load_state_dict(critic_optim_state)
+        except ValueError as exc:
+            print(f"Warning: failed to load critic optimizer state from {path}: {exc}")
 
     actor_sched_state = payload.get("actor_scheduler_state_dict")
     critic_sched_state = payload.get("critic_scheduler_state_dict")
@@ -1314,15 +1326,16 @@ def train(
         obs_sample_env = obs_sample_raw
     else:
         obs_sample_env = [obs_sample_raw]
+    obs_sample_lists_env, obs_sample_step_batch_np = _flatten_obs_env_batch(obs_sample_env, cfg)
 
     num_agents = len(env.agents)
-    obs_dim = batch_flatten_obs(list(obs_sample_env[0].values()), cfg).shape[1]
+    obs_dim = obs_sample_step_batch_np.shape[2]
     state_batch_np = _get_state_batch(env)
     global_state = state_batch_np[0]
     state_dim = global_state.shape[0]
 
     actor = ActorNet(obs_dim, cfg).to(device)
-    critic = CriticNet(state_dim, cfg).to(device)
+    critic = CriticNet(state_dim, obs_dim, num_agents, cfg).to(device)
     if resume_state_path and (init_actor_path or init_critic_path):
         raise ValueError("--resume_state cannot be combined with --init_actor/--init_critic.")
     if init_actor_path:
@@ -1692,7 +1705,8 @@ def train(
     )
     print(_format_actor_trainability_report(actor))
 
-    obs_env = list(obs_sample_env) if num_envs > 1 else [obs_sample_raw]
+    obs_lists_env = [list(obs_list) for obs_list in obs_sample_lists_env]
+    obs_step_batch_np = np.asarray(obs_sample_step_batch_np, dtype=np.float32)
     checkpoint_eval_interval = max(int(getattr(cfg, "checkpoint_eval_interval_updates", 0) or 0), 0)
     checkpoint_eval_enabled = (
         bool(getattr(cfg, "checkpoint_eval_enabled", False))
@@ -1982,13 +1996,18 @@ def train(
             state_fetch_time += time.perf_counter() - state_fetch_start
 
             action_pack_start = time.perf_counter()
-            per_env_obs_lists = [list(obs_e.values()) for obs_e in obs_env]
-            per_env_obs_batch = [batch_flatten_obs(obs_list, cfg) for obs_list in per_env_obs_lists]
-            obs_batch = np.concatenate(per_env_obs_batch, axis=0)
+            per_env_obs_lists = obs_lists_env
+            curr_obs_step_batch_np = np.asarray(obs_step_batch_np, dtype=np.float32)
+            if curr_obs_step_batch_np.shape != (num_envs, num_agents, obs_dim):
+                raise ValueError(
+                    f"Expected obs_step batch shape {(num_envs, num_agents, obs_dim)}, got {tuple(curr_obs_step_batch_np.shape)}"
+                )
+            obs_batch = curr_obs_step_batch_np.reshape(num_envs * num_agents, obs_dim)
             if not np.isfinite(obs_batch).all():
                 print(f"NaN/Inf detected in obs_batch at update={update}, step={step}")
                 raise ValueError("obs_batch contains NaN/Inf")
             obs_tensor = torch.from_numpy(obs_batch).to(device)
+            obs_step_tensor = torch.from_numpy(curr_obs_step_batch_np).to(device)
             action_pack_time += time.perf_counter() - action_pack_start
 
             policy_forward_start = time.perf_counter()
@@ -1998,7 +2017,7 @@ def train(
                     required_heads=rollout_policy_heads,
                     compute_logprob=False,
                 )
-                value = critic(torch.from_numpy(curr_state_batch_np).to(device))
+                value = critic(torch.from_numpy(curr_state_batch_np).to(device), obs_step_tensor)
             for key, value_tensor in (policy_out.dist_out or {}).items():
                 if torch.is_tensor(value_tensor) and not torch.isfinite(value_tensor).all():
                     print(f"NaN/Inf detected in actor dist_out['{key}'] at update={update}, step={step}")
@@ -2147,6 +2166,11 @@ def train(
                     f"Expected {num_envs} next states from env, got {next_state_batch_np.shape[0]}"
                 )
             state_fetch_time += time.perf_counter() - state_fetch_start
+
+            action_pack_start = time.perf_counter()
+            next_obs_env = list(next_obs_env)
+            next_obs_lists_env, next_obs_step_batch_np = _flatten_obs_env_batch(next_obs_env, cfg)
+            action_pack_time += time.perf_counter() - action_pack_start
 
             value_np = value.detach().cpu().numpy().reshape(num_envs)
 
@@ -2469,7 +2493,7 @@ def train(
                     dtype=np.float32,
                 )
                 buffers[env_idx].add(
-                    per_env_obs_batch[env_idx],
+                    curr_obs_step_batch_np[env_idx],
                     action_vec_exec_env[env_idx],
                     logprobs_all[sl],
                     reward_scalar,
@@ -2478,19 +2502,21 @@ def train(
                     truncated_scalar,
                     curr_state_batch_np[env_idx],
                     post_step_state,
+                    next_obs_step_batch_np[env_idx],
                     _build_imitation_target(per_env_obs_lists[env_idx]),
                     danger_target_env,
                     danger_mask_env,
                     sat_indices_exec_env[env_idx],
                 )
 
-            obs_env = list(next_obs_env)
+            obs_lists_env = next_obs_lists_env
+            obs_step_batch_np = next_obs_step_batch_np
             state_batch_np = next_state_batch_np
         rollout_time = time.perf_counter() - rollout_start
 
         # Prepare batches
         buffer_data = [buf.as_arrays() for buf in buffers]
-        all_rewards = np.concatenate([data[3] for data in buffer_data], axis=0)
+        all_rewards = np.concatenate([data[4] for data in buffer_data], axis=0)
         if getattr(cfg, "reward_norm_enabled", False) and reward_rms is not None:
             reward_rms.update(all_rewards)
 
@@ -2509,6 +2535,7 @@ def train(
         reward_clip_total = 0
         for (
             obs_arr_e,
+            next_obs_arr_e,
             act_arr_e,
             logp_arr_e,
             rewards_e,
@@ -2531,7 +2558,8 @@ def train(
                     rewards_proc = np.clip(rewards_proc, -clip_val, clip_val)
             with torch.inference_mode():
                 next_state_t_e = torch.from_numpy(next_state_arr_e).to(device)
-                bootstrap_values_e = critic(next_state_t_e).detach().cpu().numpy().reshape(-1)
+                next_obs_t_e = torch.from_numpy(next_obs_arr_e).to(device)
+                bootstrap_values_e = critic(next_state_t_e, next_obs_t_e).detach().cpu().numpy().reshape(-1)
             bootstrap_values_e = np.asarray(bootstrap_values_e, dtype=np.float32)
             bootstrap_values_e = np.where(terminated_e > 0.5, 0.0, bootstrap_values_e)
             episode_boundaries_e = np.logical_or(terminated_e > 0.5, truncated_e > 0.5)
@@ -2592,6 +2620,7 @@ def train(
         adv_flat = np.repeat(adv, N)
 
         # Convert to torch
+        obs_step_t = torch.from_numpy(obs_arr).to(device)
         obs_flat_t = torch.from_numpy(obs_flat).to(device)
         act_flat_t = torch.from_numpy(act_flat).to(device)
         logp_flat_t = torch.from_numpy(logp_flat).to(device)
@@ -2825,7 +2854,7 @@ def train(
                 break
 
             # critic update (full batch for simplicity)
-            value_pred = critic(state_t)
+            value_pred = critic(state_t, obs_step_t)
             value_loss = F.mse_loss(value_pred, ret_t)
             critic_optim.zero_grad()
             (cfg.value_coef * value_loss).backward()
@@ -2884,7 +2913,7 @@ def train(
         ret_p95 = float(np.percentile(returns_np, 95.0)) if returns_np.size else 0.0
         if returns_np.size > 1:
             with torch.inference_mode():
-                value_pred_eval = critic(state_t).detach().cpu().numpy().reshape(-1)
+                value_pred_eval = critic(state_t, obs_step_t).detach().cpu().numpy().reshape(-1)
             returns_var = float(np.var(returns_np))
             if returns_var > 1e-8:
                 explained_variance = 1.0 - float(np.var(returns_np - value_pred_eval)) / returns_var

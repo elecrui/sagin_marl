@@ -47,6 +47,30 @@ def test_queue_init_steps_use_arrival_reference():
     np.testing.assert_allclose(float(np.sum(env.sat_queue)), 2.0 * arrival_ref, atol=1e-6)
 
 
+def test_queue_init_steps_use_layer_inflow_references_when_provided():
+    cfg = SaginConfig(
+        num_uav=2,
+        num_gu=4,
+        num_sat=3,
+        users_obs_max=4,
+        sats_obs_max=3,
+        nbrs_obs_max=1,
+        task_arrival_rate=10.0,
+        queue_init_gu_steps=3.0,
+        queue_init_uav_steps=1.0,
+        queue_init_sat_steps=2.0,
+        queue_ref_gu_per_step=100.0,
+        queue_ref_uav_per_step=250.0,
+        queue_ref_sat_per_step=400.0,
+    )
+    env = SaginParallelEnv(cfg)
+    env._init_state()
+
+    np.testing.assert_allclose(float(np.sum(env.gu_queue)), 300.0, atol=1e-6)
+    np.testing.assert_allclose(float(np.sum(env.uav_queue)), 250.0, atol=1e-6)
+    np.testing.assert_allclose(float(np.sum(env.sat_queue)), 800.0, atol=1e-6)
+
+
 def test_queue_init_abs_overrides_fraction_and_clips_to_cap():
     cfg = SaginConfig(
         num_uav=2,

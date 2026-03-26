@@ -5,6 +5,7 @@ import numpy as np
 from sagin_marl.env.config import SaginConfig
 from sagin_marl.rl.baselines import (
     cluster_center_accel_policy,
+    cluster_center_queue_aware_policy,
     centroid_accel_policy,
     queue_aware_policy,
     random_accel_policy,
@@ -223,3 +224,48 @@ def test_queue_aware_sat_prefers_current_sat_within_switch_margin():
 
     _, _, sat_select_mask = queue_aware_policy([obs], cfg)
     assert sat_select_mask[0, 0] > sat_select_mask[0, 1]
+
+
+def test_cluster_center_queue_aware_policy_combines_accel_bw_and_sat_heads():
+    cfg = SaginConfig(num_uav=1, map_size=1000.0, sats_obs_max=2)
+    cfg.enable_bw_action = True
+    cfg.fixed_satellite_strategy = False
+
+    obs = {
+        "own": np.array([0.10, 0.10, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        "users": np.zeros((cfg.users_obs_max, 5), dtype=np.float32),
+        "users_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
+        "bw_valid_mask": np.zeros((cfg.users_obs_max,), dtype=np.float32),
+        "sats": np.zeros((cfg.sats_obs_max, SAT_OBS_DIM), dtype=np.float32),
+        "sats_mask": np.zeros((cfg.sats_obs_max,), dtype=np.float32),
+        "sat_valid_mask": np.zeros((cfg.sats_obs_max,), dtype=np.float32),
+        "nbrs": np.zeros((cfg.nbrs_obs_max, 4), dtype=np.float32),
+        "nbrs_mask": np.zeros((cfg.nbrs_obs_max,), dtype=np.float32),
+    }
+    obs["users_mask"][0] = 1.0
+    obs["bw_valid_mask"][0] = 1.0
+    obs["users"][0, 0:2] = np.array([0.4, 0.0], dtype=np.float32)
+    obs["users"][0, 2] = 1.0
+    obs["users"][0, 3] = 1.5
+    obs["users"][0, 4] = 1.0
+    obs["sats_mask"][:] = 1.0
+    obs["sat_valid_mask"][:] = 1.0
+    obs["sats"][0, 7] = 3.0
+    obs["sats"][0, 8] = 0.2
+    obs["sats"][0, 9] = 0.3
+    obs["sats"][0, 10] = 0.8
+    obs["sats"][1, 7] = 1.0
+    obs["sats"][1, 8] = 0.8
+    obs["sats"][1, 9] = 0.9
+    obs["sats"][1, 10] = 0.2
+
+    centers = np.array([[900.0, 100.0]], dtype=np.float32)
+    counts = np.array([5], dtype=np.int32)
+
+    accel_ref = cluster_center_accel_policy([obs], cfg, centers, counts)
+    _, bw_ref, sat_ref = queue_aware_policy([obs], cfg)
+    accel, bw_alloc, sat_select_mask = cluster_center_queue_aware_policy([obs], cfg, centers, counts)
+
+    np.testing.assert_allclose(accel, accel_ref, atol=1e-6)
+    np.testing.assert_allclose(bw_alloc, bw_ref, atol=1e-6)
+    np.testing.assert_allclose(sat_select_mask, sat_ref, atol=1e-6)

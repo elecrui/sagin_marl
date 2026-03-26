@@ -351,6 +351,17 @@ def queue_aware_policy(
 
     return accel, bw_alloc, sat_select_mask
 
+
+def cluster_center_queue_aware_policy(
+    obs_list: List[Dict[str, np.ndarray]],
+    cfg,
+    cluster_centers: np.ndarray | None,
+    cluster_counts: np.ndarray | None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    accel = cluster_center_accel_policy(obs_list, cfg, cluster_centers, cluster_counts)
+    _, bw_alloc, sat_select_mask = queue_aware_policy(obs_list, cfg)
+    return accel, bw_alloc, sat_select_mask
+
 def queue_aware_bw_policy(
     obs_list: List[Dict[str, np.ndarray]],
     cfg,

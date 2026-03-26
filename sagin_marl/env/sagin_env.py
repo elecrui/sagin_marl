@@ -442,11 +442,19 @@ class SaginParallelEnv(ParallelEnv):
             * float(cfg.tau0)
         )
 
+    def _queue_init_layer_ref(self, layer: str) -> float:
+        cfg = self.cfg
+        ref_value = getattr(cfg, f"queue_ref_{layer}_per_step", None)
+        if ref_value is not None:
+            return max(float(ref_value), 0.0)
+        return self._queue_init_arrival_ref()
+
     def _resolve_queue_init_total(
         self,
         abs_attr: str,
         steps_attr: str,
         frac_attr: str,
+        layer: str,
         total_cap: float,
     ) -> float:
         cfg = self.cfg
@@ -456,7 +464,7 @@ class SaginParallelEnv(ParallelEnv):
 
         steps_value = getattr(cfg, steps_attr, None)
         if steps_value is not None:
-            total = max(float(steps_value), 0.0) * self._queue_init_arrival_ref()
+            total = max(float(steps_value), 0.0) * self._queue_init_layer_ref(layer)
             return min(total, total_cap)
 
         frac_value = max(float(getattr(cfg, frac_attr, 0.0) or 0.0), 0.0)
@@ -468,18 +476,21 @@ class SaginParallelEnv(ParallelEnv):
             "queue_init_gu_abs",
             "queue_init_gu_steps",
             "queue_init_frac",
+            "gu",
             float(cfg.num_gu) * float(cfg.queue_max_gu),
         )
         uav_total = self._resolve_queue_init_total(
             "queue_init_uav_abs",
             "queue_init_uav_steps",
             "queue_init_uav_frac",
+            "uav",
             float(cfg.num_uav) * float(cfg.queue_max_uav),
         )
         sat_total = self._resolve_queue_init_total(
             "queue_init_sat_abs",
             "queue_init_sat_steps",
             "queue_init_sat_frac",
+            "sat",
             float(cfg.num_sat) * float(cfg.queue_max_sat),
         )
 

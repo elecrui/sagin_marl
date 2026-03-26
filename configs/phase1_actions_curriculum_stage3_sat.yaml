@@ -1,8 +1,8 @@
-# Stage 3: sat unlock on top of the trained stage2 accel+bw policy.
+# Stage 3: sat-only training that starts directly from the Stage 2 checkpoint.
 # Notes:
 #   - Keeps the last stable set-pool / KL-stop / checkpoint-eval settings that still matter.
+#   - Continues to freeze accel/bw and only updates the sat head.
 #   - Uses the current policy-side masked categorical sat action instead of legacy env-side sampling.
-#   - Uses a stage2-style fixed-sat reference during checkpoint eval to isolate sat gains.
 seed: 42
 map_size: 1500.0
 tau0: 1.0
@@ -43,7 +43,7 @@ uav_init_boundary_margin_steps: 3.0
 uav_init_speed_frac: 0.2
 uav_init_min_spacing: 20.0
 
-task_arrival_rate: 1.3e5
+task_arrival_rate: 1.2e6
 task_arrival_poisson: true
 traffic_level: 2
 traffic_level_nav_ratio: 0.08
@@ -52,21 +52,30 @@ traffic_level_hard_ratio: 1.0
 arrival_ramp_steps: 0
 arrival_ramp_start: 0.0
 arrival_ramp_use_global: false
-queue_max_gu: 3.0e7
-queue_max_uav: 1.0e9
-queue_max_sat: 2.0e9
+# Queue refs are fixed offline rollout estimates (bits/step).
+# SAT max-queue sizing uses calibrated active satellites, not all 144 sats.
+queue_max_gu_steps: 50.0
+queue_max_uav_steps: 100.0
+queue_max_sat_steps: 150.0
+queue_max_gu: 6.0e7
+queue_max_uav: 8.0e8
+queue_max_sat: 1.18e9
 queue_init_frac: 0.0
 queue_init_uav_frac: 0.0
 queue_init_sat_frac: 0.0
-queue_init_gu_steps: 16.0
-queue_init_uav_steps: 40.0
-queue_init_sat_steps: 32.0
+queue_init_gu_steps: 4.0
+queue_init_uav_steps: 8.0
+queue_init_sat_steps: 12.0
+queue_ref_gu_per_step: 2.40e7
+queue_ref_uav_per_step: 2.40e7
+queue_ref_sat_per_step: 2.36e7
+queue_ref_sat_active_count: 3.0
 
 gu_tx_power: 0.18
-uav_tx_gain: 300.0
-sat_rx_gain: 300.0
-b_acc: 2.2e6
-b_sat_total: 8.75e5
+uav_tx_gain: 63.1
+sat_rx_gain: 63.1
+b_acc: 1.0e7
+b_sat_total: 1.5e7
 sat_cpu_freq: 1.8e10
 noise_density: 4.0e-21
 pathloss_mode: prob_los
@@ -90,8 +99,8 @@ bw_alpha_floor: 0.2
 sat_policy: masked_categorical
 sat_num_select: 2
 
-train_accel: true
-train_bw: true
+train_accel: false
+train_bw: false
 train_sat: true
 train_shared_backbone: false
 exec_accel_source: policy

@@ -12,6 +12,7 @@ class RolloutBuffer:
         self._idx = 0
 
         self._obs: Optional[np.ndarray] = None
+        self._next_obs: Optional[np.ndarray] = None
         self._actions: Optional[np.ndarray] = None
         self._logprobs: Optional[np.ndarray] = None
         self._rewards: Optional[np.ndarray] = None
@@ -27,6 +28,7 @@ class RolloutBuffer:
 
         if self._use_list:
             self.obs: List[np.ndarray] = []
+            self.next_obs: List[np.ndarray] = []
             self.actions: List[np.ndarray] = []
             self.logprobs: List[np.ndarray] = []
             self.rewards: List[float] = []
@@ -43,6 +45,7 @@ class RolloutBuffer:
     def _allocate(
         self,
         obs: np.ndarray,
+        next_obs: np.ndarray,
         actions: np.ndarray,
         logprobs: np.ndarray,
         global_state: np.ndarray,
@@ -56,6 +59,7 @@ class RolloutBuffer:
             return
         cap = self.capacity
         self._obs = np.empty((cap,) + obs.shape, dtype=np.float32)
+        self._next_obs = np.empty((cap,) + next_obs.shape, dtype=np.float32)
         self._actions = np.empty((cap,) + actions.shape, dtype=np.float32)
         self._logprobs = np.empty((cap,) + logprobs.shape, dtype=np.float32)
         self._rewards = np.empty((cap,), dtype=np.float32)
@@ -80,6 +84,7 @@ class RolloutBuffer:
         truncated: bool,
         global_state: np.ndarray,
         next_global_state: np.ndarray,
+        next_obs: np.ndarray,
         imitation: np.ndarray | None = None,
         danger_imitation_target: np.ndarray | None = None,
         danger_imitation_mask: np.ndarray | None = None,
@@ -95,6 +100,7 @@ class RolloutBuffer:
             sat_indices = np.full((actions.shape[0], 0), -1, dtype=np.int64)
         if self._use_list:
             self.obs.append(obs)
+            self.next_obs.append(next_obs)
             self.actions.append(actions)
             self.logprobs.append(logprobs)
             self.rewards.append(float(reward))
@@ -112,6 +118,7 @@ class RolloutBuffer:
         if self._obs is None:
             self._allocate(
                 obs,
+                next_obs,
                 actions,
                 logprobs,
                 global_state,
@@ -126,6 +133,7 @@ class RolloutBuffer:
             raise IndexError('RolloutBuffer capacity exceeded.')
 
         self._obs[self._idx] = obs
+        self._next_obs[self._idx] = next_obs
         self._actions[self._idx] = actions
         self._logprobs[self._idx] = logprobs
         self._rewards[self._idx] = float(reward)
@@ -144,6 +152,7 @@ class RolloutBuffer:
         if self._use_list:
             return (
                 np.stack(self.obs, axis=0),
+                np.stack(self.next_obs, axis=0),
                 np.stack(self.actions, axis=0),
                 np.stack(self.logprobs, axis=0),
                 np.array(self.rewards, dtype=np.float32),
@@ -160,6 +169,7 @@ class RolloutBuffer:
         end = self._idx
         return (
             self._obs[:end],
+            self._next_obs[:end],
             self._actions[:end],
             self._logprobs[:end],
             self._rewards[:end],

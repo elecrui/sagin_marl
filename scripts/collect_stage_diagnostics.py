@@ -24,10 +24,9 @@ from sagin_marl.rl.policy import ActorNet, batch_flatten_obs
 
 
 DEFAULT_RUNS = [
-    "runs/phase1_actions/stage1_accel_subproc12_t2_fixed_20260324",
-    "runs/phase1_actions/stage2_bw_from_stage1best_20260325",
-    "runs/phase1_actions/stage3a_sat_warmup_from_stage2best_20260325",
-    "runs/phase1_actions/stage3_sat_joint_from_stage3a_20260325",
+    "runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage1_accel",
+    "runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage2_bw",
+    "runs/phase1_actions/curriculum_formal_u1500_subproc12_t2/stage3_sat",
 ]
 
 
@@ -148,7 +147,7 @@ def _inspect_run(run_dir: Path) -> dict[str, Any]:
         "sat": bool(getattr(cfg, "train_sat", not bool(getattr(cfg, "fixed_satellite_strategy", False)))),
     }
     _configure_actor_trainability(actor, cfg, train_heads)
-    critic = CriticNet(state_dim, cfg)
+    critic = CriticNet(state_dim, obs_dim, len(obs_list), cfg)
 
     actor_modules: list[dict[str, Any]] = []
     for name, module in _module_entries(actor):

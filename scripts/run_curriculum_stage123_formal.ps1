@@ -8,8 +8,7 @@ $env:PYTHONUNBUFFERED = "1"
 
 $updatesStage1 = 1500
 $updatesStage2 = 1500
-$updatesStage3a = 100
-$updatesStage3 = 1500
+$updatesStage3 = 1600
 $numEnvs = 12
 $vecBackend = "subproc"
 $torchThreads = 2
@@ -18,7 +17,6 @@ $evalEpisodes = 20
 $runRoot = "runs/phase1_actions/curriculum_formal_u1500_subproc12_t2"
 $stage1Dir = Join-Path $runRoot "stage1_accel"
 $stage2Dir = Join-Path $runRoot "stage2_bw"
-$stage3aDir = Join-Path $runRoot "stage3a_sat_warmup"
 $stage3Dir = Join-Path $runRoot "stage3_sat"
 
 New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
@@ -132,18 +130,11 @@ Invoke-FinalEval `
     -EpisodeSeedBase 72000
 
 Invoke-TrainingStage `
-    -Config "configs/phase1_actions_curriculum_stage3a_sat_warmup.yaml" `
-    -RunDir $stage3aDir `
-    -Updates $updatesStage3a `
-    -InitActor (Resolve-CheckpointPath -RunDir $stage2Dir -Stem "actor") `
-    -InitCritic (Resolve-CheckpointPath -RunDir $stage2Dir -Stem "critic")
-
-Invoke-TrainingStage `
     -Config "configs/phase1_actions_curriculum_stage3_sat.yaml" `
     -RunDir $stage3Dir `
     -Updates $updatesStage3 `
-    -InitActor (Resolve-CheckpointPath -RunDir $stage3aDir -Stem "actor") `
-    -InitCritic (Resolve-CheckpointPath -RunDir $stage3aDir -Stem "critic")
+    -InitActor (Resolve-CheckpointPath -RunDir $stage2Dir -Stem "actor") `
+    -InitCritic (Resolve-CheckpointPath -RunDir $stage2Dir -Stem "critic")
 Invoke-FinalEval `
     -Config "configs/phase1_actions_curriculum_stage3_sat.yaml" `
     -RunDir $stage3Dir `

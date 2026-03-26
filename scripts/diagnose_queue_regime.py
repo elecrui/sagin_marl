@@ -20,6 +20,7 @@ from sagin_marl.env.sagin_env import SaginParallelEnv
 from sagin_marl.rl.action_assembler import assemble_actions
 from sagin_marl.rl.baselines import (
     cluster_center_accel_policy,
+    cluster_center_queue_aware_policy,
     centroid_accel_policy,
     queue_aware_policy,
     random_accel_policy,
@@ -46,6 +47,10 @@ def _baseline_actions(
         centers = None if env is None else getattr(env, "gu_cluster_centers", None)
         counts = None if env is None else getattr(env, "gu_cluster_counts", None)
         return cluster_center_accel_policy(obs_list, cfg, centers, counts), None, None
+    if baseline == "cluster_center_queue_aware":
+        centers = None if env is None else getattr(env, "gu_cluster_centers", None)
+        counts = None if env is None else getattr(env, "gu_cluster_counts", None)
+        return cluster_center_queue_aware_policy(obs_list, cfg, centers, counts)
     if baseline == "centroid":
         gain = float(getattr(cfg, "baseline_centroid_gain", 2.0) or 2.0)
         queue_weighted = bool(getattr(cfg, "baseline_centroid_queue_weighted", True))
@@ -1107,7 +1112,7 @@ def main() -> None:
         "--baseline",
         type=str,
         default="fixed",
-        choices=["fixed", "zero_accel", "random_accel", "cluster_center", "centroid", "queue_aware"],
+        choices=["fixed", "zero_accel", "random_accel", "cluster_center", "cluster_center_queue_aware", "centroid", "queue_aware"],
     )
     parser.add_argument("--episodes", type=int, default=50)
     parser.add_argument("--episode_seed_base", type=int, default=None)

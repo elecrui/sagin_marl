@@ -33,7 +33,7 @@ python -m pip install -r requirements.txt
 **当前推荐配置**
 - Stage 1（加速度）：`configs/phase1_actions_curriculum_stage1_accel.yaml`
 - Stage 2（带宽）：`configs/phase1_actions_curriculum_stage2_bw.yaml`
-- Stage 3（卫星选择）：`configs/phase1_actions_curriculum_stage3_sat.yaml`
+- Stage 3（卫星）：`configs/phase1_actions_curriculum_stage3_sat.yaml`
 
 这三份正式 YAML 当前共享以下设定：
 - `actor_encoder_type: set_pool`
@@ -98,10 +98,10 @@ python scripts/render_episode.py --config configs/phase1_actions_curriculum_stag
 ```powershell
 python scripts/train.py --config configs/phase1_actions_curriculum_stage1_accel.yaml --updates 1500 --log_dir runs/phase1_actions --run_id stage1_accel --num_envs 12 --vec_backend subproc --torch_threads 2
 python scripts/train.py --config configs/phase1_actions_curriculum_stage2_bw.yaml --updates 1500 --log_dir runs/phase1_actions --run_id stage2_bw --num_envs 12 --vec_backend subproc --torch_threads 2 --init_actor runs/phase1_actions/stage1_accel/actor.pt --init_critic runs/phase1_actions/stage1_accel/critic.pt
-python scripts/train.py --config configs/phase1_actions_curriculum_stage3_sat.yaml --updates 1500 --log_dir runs/phase1_actions --run_id stage3_sat --num_envs 12 --vec_backend subproc --torch_threads 2 --init_actor runs/phase1_actions/stage2_bw/actor.pt --init_critic runs/phase1_actions/stage2_bw/critic.pt
+python scripts/train.py --config configs/phase1_actions_curriculum_stage3_sat.yaml --updates 1600 --log_dir runs/phase1_actions --run_id stage3_sat --num_envs 12 --vec_backend subproc --torch_threads 2 --init_actor runs/phase1_actions/stage2_bw/actor.pt --init_critic runs/phase1_actions/stage2_bw/critic.pt
 ```
 
-一键顺序执行正式三阶段：
+一键顺序执行正式课程训练：
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/run_curriculum_stage123_formal.ps1
 ```
